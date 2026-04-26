@@ -1,4 +1,4 @@
--- Test script to verify review submission functionality
+﻿-- Test script to verify review submission functionality
 -- Run this in your Supabase SQL editor to test the reviews table
 
 -- 1. Check if the reviews table exists and its structure
@@ -27,10 +27,10 @@ SELECT
 FROM pg_policies 
 WHERE tablename = 'reviews';
 
--- 4. Test inserting a sample review (replace with actual property ID)
--- INSERT INTO reviews (property_id, client_email, client_name, rating, review_text, is_verified)
+-- 4. Test inserting a sample review (replace with actual vehicle ID)
+-- INSERT INTO reviews (vehicle_id, client_email, client_name, rating, review_text, is_verified)
 -- VALUES (
---   'your-property-id-here', 
+--   'your-vehicle-id-here', 
 --   'test@example.com', 
 --   'Test User', 
 --   5, 
@@ -43,10 +43,10 @@ WHERE tablename = 'reviews';
 SELECT 
   'Test data validation' as test_type,
   CASE 
-    WHEN EXISTS (SELECT 1 FROM properties WHERE id = 'your-property-id-here') 
-    THEN 'Property exists - OK'
-    ELSE 'Property does not exist - ERROR'
-  END as property_check,
+    WHEN EXISTS (SELECT 1 FROM Vehicles WHERE id = 'your-vehicle-id-here') 
+    THEN 'vehicle exists - OK'
+    ELSE 'vehicle does not exist - ERROR'
+  END as vehicle_check,
   CASE 
     WHEN 'test@example.com' ~ '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'
     THEN 'Email format valid - OK'
@@ -71,3 +71,4 @@ SELECT
   rowsecurity as rls_enabled
 FROM pg_tables 
 WHERE tablename = 'reviews';
+

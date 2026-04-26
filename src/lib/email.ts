@@ -1,4 +1,4 @@
-import emailjs from '@emailjs/browser';
+﻿import emailjs from '@emailjs/browser';
 
 const SERVICE_ID = 'service_fx31fw8';
 const TENANT_TEMPLATE_ID = 'template_ikoy26j';
@@ -39,7 +39,7 @@ async function send(templateId: string, params: Record<string, any>): Promise<Em
 export async function sendTenantDecisionEmail(args: {
   toEmail: string;
   clientName?: string;
-  propertyTitle?: string;
+  vehicleTitle?: string;
   decision: 'approved' | 'rejected';
   ownerName?: string;
 }): Promise<EmailResult> {
@@ -48,20 +48,20 @@ export async function sendTenantDecisionEmail(args: {
     email: args.toEmail,           // Fallback if template uses {{email}}
     recipient_email: args.toEmail, // Fallback if template uses {{recipient_email}}
     client_email: args.toEmail,    // Fallback if template uses {{client_email}}
-    to_name: args.clientName || 'Tenant',
-    property_title: args.propertyTitle || 'Boarding Property',
+    to_name: args.clientName || 'Client',
+    vehicle_title: args.vehicleTitle || 'Vehicle',
     decision: args.decision,
-    owner_name: args.ownerName || 'Landlord',
-    app_name: 'BoardingHub',
+    owner_name: args.ownerName || 'Owner',
+    app_name: 'RideHub',
     timestamp: new Date().toLocaleString(),
   };
   return await send(TENANT_TEMPLATE_ID, params);
 }
 
-export async function sendLandlordBookingEmail(args: {
+export async function sendLandlordRentalEmail(args: {
   toEmail: string;
   ownerName?: string;
-  propertyTitle?: string;
+  vehicleTitle?: string;
   clientName: string;
   clientEmail: string;
   message?: string;
@@ -71,14 +71,25 @@ export async function sendLandlordBookingEmail(args: {
     email: args.toEmail,           // Fallback if template uses {{email}}
     owner_email: args.toEmail,     // Fallback if template uses {{owner_email}}
     recipient_email: args.toEmail, // Fallback if template uses {{recipient_email}}
-    owner_name: args.ownerName || 'Landlord',
-    property_title: args.propertyTitle || 'Boarding Property',
+    owner_name: args.ownerName || 'Owner',
+    vehicle_title: args.vehicleTitle || 'Vehicle',
     client_name: args.clientName,
     client_email: args.clientEmail,
     message: args.message || '',
-    app_name: 'BoardingHub',
+    app_name: 'RideHub',
     timestamp: new Date().toLocaleString(),
   };
   return await send(LANDLORD_TEMPLATE_ID, params);
+}
+
+export async function sendOwnerRentalEmail(args: {
+  toEmail: string;
+  ownerName?: string;
+  vehicleTitle?: string;
+  clientName: string;
+  clientEmail: string;
+  message?: string;
+}): Promise<EmailResult> {
+  return sendLandlordRentalEmail(args);
 }
 

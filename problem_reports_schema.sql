@@ -1,4 +1,4 @@
--- Problem Reports Table Schema
+﻿-- Problem Reports Table Schema
 -- This table stores problem reports submitted by tenants and landlords
 
 -- Create problem_reports table
@@ -7,8 +7,8 @@ CREATE TABLE IF NOT EXISTS problem_reports (
     user_id UUID NOT NULL, -- References auth.users(id)
     user_email VARCHAR(255) NOT NULL,
     user_type VARCHAR(20) NOT NULL CHECK (user_type IN ('client', 'owner')), -- 'client' for tenant, 'owner' for landlord
-    property_id UUID REFERENCES properties(id) ON DELETE SET NULL, -- Optional: if problem is related to a specific property
-    problem_type VARCHAR(50) NOT NULL CHECK (problem_type IN ('technical', 'payment', 'property', 'booking', 'account', 'other')),
+    vehicle_id UUID REFERENCES Vehicles(id) ON DELETE SET NULL, -- Optional: if problem is related to a specific vehicle
+    problem_type VARCHAR(50) NOT NULL CHECK (problem_type IN ('technical', 'payment', 'vehicle', 'rental', 'account', 'other')),
     description TEXT NOT NULL,
     status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'in_progress', 'resolved', 'closed')),
     admin_notes TEXT, -- Admin can add notes when reviewing/resolving
@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS problem_reports (
 CREATE INDEX IF NOT EXISTS idx_problem_reports_user_id ON problem_reports(user_id);
 CREATE INDEX IF NOT EXISTS idx_problem_reports_user_email ON problem_reports(user_email);
 CREATE INDEX IF NOT EXISTS idx_problem_reports_status ON problem_reports(status);
-CREATE INDEX IF NOT EXISTS idx_problem_reports_property_id ON problem_reports(property_id);
+CREATE INDEX IF NOT EXISTS idx_problem_reports_vehicle_id ON problem_reports(vehicle_id);
 CREATE INDEX IF NOT EXISTS idx_problem_reports_created_at ON problem_reports(created_at DESC);
 
 -- Create updated_at trigger function (if not exists)
@@ -94,8 +94,9 @@ COMMENT ON TABLE problem_reports IS 'Stores problem reports submitted by tenants
 
 -- Add comments to columns
 COMMENT ON COLUMN problem_reports.user_type IS 'Type of user: client (tenant) or owner (landlord)';
-COMMENT ON COLUMN problem_reports.problem_type IS 'Type of problem: technical, payment, property, booking, account, or other';
+COMMENT ON COLUMN problem_reports.problem_type IS 'Type of problem: technical, payment, vehicle, rental, account, or other';
 COMMENT ON COLUMN problem_reports.status IS 'Status of the report: pending, in_progress, resolved, or closed';
 COMMENT ON COLUMN problem_reports.admin_notes IS 'Notes added by admin when reviewing or resolving the problem';
+
 
 

@@ -1,15 +1,15 @@
-import React, { useState } from 'react';
+﻿import React, { useState } from 'react';
 import supabase from '../lib/supabase';
 
 interface ReportProblemProps {
   userEmail: string;
   userId: string;
   userType: 'client' | 'owner';
-  propertyId?: string;
+  vehicleId?: string;
   onClose: () => void;
 }
 
-export default function ReportProblem({ userEmail, userId, userType, propertyId, onClose }: ReportProblemProps) {
+export default function ReportProblem({ userEmail, userId, userType, vehicleId, onClose }: ReportProblemProps) {
   const [problemType, setProblemType] = useState<string>('');
   const [description, setDescription] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -51,9 +51,9 @@ export default function ReportProblem({ userEmail, userId, userType, propertyId,
         const notificationData = {
           recipient_email: adminEmail,
           title: `Problem Report: ${problemType}`,
-          body: `Reported by ${userType === 'client' ? 'Tenant' : 'Landlord'}: ${userEmail}\n\nType: ${problemType}\nDescription: ${description.trim()}`,
+          body: `Reported by ${userType === 'client' ? 'Renter' : 'Vehicle Owner'}: ${userEmail}\n\nType: ${problemType}\nDescription: ${description.trim()}`,
           type: 'problem_report',
-          property_id: propertyId || null,
+          vehicle_id: vehicleId || null,
           created_at: new Date().toISOString()
         };
 
@@ -79,7 +79,7 @@ export default function ReportProblem({ userEmail, userId, userType, propertyId,
             user_id: userId,
             user_email: userEmail,
             user_type: userType,
-            property_id: propertyId || null,
+            vehicle_id: vehicleId || null,
             problem_type: problemType,
             description: description.trim(),
             status: 'pending',
@@ -144,8 +144,8 @@ export default function ReportProblem({ userEmail, userId, userType, propertyId,
               <option value="">Select problem type</option>
               <option value="technical">Technical Issue</option>
               <option value="payment">Payment Issue</option>
-              <option value="property">Property Issue</option>
-              <option value="booking">Booking Issue</option>
+              <option value="vehicle">vehicle Issue</option>
+              <option value="rental">rental Issue</option>
               <option value="account">Account Issue</option>
               <option value="other">Other</option>
             </select>
@@ -188,5 +188,6 @@ export default function ReportProblem({ userEmail, userId, userType, propertyId,
     </div>
   );
 }
+
 
 

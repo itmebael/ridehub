@@ -1,4 +1,4 @@
--- Create permissive RLS policies for reviews table
+﻿-- Create permissive RLS policies for reviews table
 -- This is a more permissive version that should definitely work
 -- Run this in your Supabase SQL Editor
 
@@ -11,7 +11,7 @@ AND table_name = 'reviews';
 -- If the table doesn't exist, create it first
 CREATE TABLE IF NOT EXISTS public.reviews (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    property_id UUID REFERENCES properties(id) ON DELETE CASCADE,
+    vehicle_id UUID REFERENCES Vehicles(id) ON DELETE CASCADE,
     client_email VARCHAR(255) NOT NULL,
     client_name VARCHAR(255) NOT NULL,
     rating INTEGER CHECK (rating >= 1 AND rating <= 5) NOT NULL,
@@ -27,7 +27,7 @@ DROP POLICY IF EXISTS "Allow everyone to insert reviews" ON reviews;
 DROP POLICY IF EXISTS "Allow everyone to update reviews" ON reviews;
 DROP POLICY IF EXISTS "Allow everyone to delete reviews" ON reviews;
 DROP POLICY IF EXISTS "Reviews are viewable by everyone" ON reviews;
-DROP POLICY IF EXISTS "Property owners can see all reviews" ON reviews;
+DROP POLICY IF EXISTS "vehicle owners can see all reviews" ON reviews;
 DROP POLICY IF EXISTS "Anyone can insert reviews" ON reviews;
 DROP POLICY IF EXISTS "Users can update their own reviews" ON reviews;
 DROP POLICY IF EXISTS "Users can delete their own reviews" ON reviews;
@@ -49,9 +49,9 @@ SELECT 'Testing table access...' as status;
 SELECT COUNT(*) as review_count FROM reviews;
 
 -- Try to insert a test record
-INSERT INTO reviews (property_id, client_email, client_name, rating, review_text, is_verified)
+INSERT INTO reviews (vehicle_id, client_email, client_name, rating, review_text, is_verified)
 VALUES (
-    (SELECT id FROM properties LIMIT 1),
+    (SELECT id FROM Vehicles LIMIT 1),
     'test@example.com',
     'Test User',
     5,
@@ -81,4 +81,5 @@ SELECT
     cmd
 FROM pg_policies 
 WHERE tablename = 'reviews';
+
 

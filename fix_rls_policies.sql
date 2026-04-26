@@ -1,4 +1,4 @@
--- Fix RLS policies for reviews table
+﻿-- Fix RLS policies for reviews table
 -- Run this in your Supabase SQL Editor
 
 -- First, let's check the current RLS status and policies
@@ -25,7 +25,7 @@ WHERE tablename = 'reviews';
 
 -- Drop existing policies to start fresh
 DROP POLICY IF EXISTS "Reviews are viewable by everyone" ON reviews;
-DROP POLICY IF EXISTS "Property owners can see all reviews" ON reviews;
+DROP POLICY IF EXISTS "vehicle owners can see all reviews" ON reviews;
 DROP POLICY IF EXISTS "Anyone can insert reviews" ON reviews;
 DROP POLICY IF EXISTS "Users can update their own reviews" ON reviews;
 DROP POLICY IF EXISTS "Users can delete their own reviews" ON reviews;
@@ -74,4 +74,5 @@ SELECT
 FROM pg_policies 
 WHERE tablename = 'reviews'
 ORDER BY policyname;
+
 

@@ -8,18 +8,18 @@ module.exports = {
   theme: {
     extend: {
       colors: {
-        // Modern Orange/Peach Palette
+        // Secure Mobility palette
         primary: {
-          50: '#FFF5E6',   // Pale Peach
-          100: '#FFE5CC',  // Light Peach
-          200: '#FFD4B3',  // Soft Peach
-          300: '#FFC299',  // Warm Peach
-          400: '#FFB84D',  // Medium Orange/Tangerine
-          500: '#FF8C42',  // Vibrant Orange
-          600: '#FF6B35',  // Deep Orange
-          700: '#E55A2B',  // Dark Orange
-          800: '#CC4A21',  // Darker Orange
-          900: '#B33A17',  // Deepest Orange
+          50: '#ECFDF7',
+          100: '#D1FAEC',
+          200: '#A7F3DB',
+          300: '#6EE7C7',
+          400: '#34D3B1',
+          500: '#14B89F',
+          600: '#0D9488',
+          700: '#0F766E',
+          800: '#115E59',
+          900: '#134E4A',
         },
         // Keep blue for secondary actions
         blue: {
@@ -59,8 +59,8 @@ module.exports = {
         '3xl': '1.5rem',
       },
       backgroundImage: {
-        'gradient-modern': 'linear-gradient(135deg, #FFF5E6 0%, #FFE5CC 50%, #FF8C42 100%)',
-        'gradient-orange': 'linear-gradient(135deg, #FFB84D 0%, #FF6B35 100%)',
+        'gradient-modern': 'linear-gradient(135deg, #ECFDF7 0%, #E0F2FE 50%, #14B89F 100%)',
+        'gradient-orange': 'linear-gradient(135deg, #14B89F 0%, #0D9488 100%)',
       }
     },
   },

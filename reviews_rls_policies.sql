@@ -1,10 +1,10 @@
--- RLS (Row Level Security) Policies for Reviews Table
+﻿-- RLS (Row Level Security) Policies for Reviews Table
 -- Run this in your Supabase SQL Editor
 
 -- First, ensure the reviews table exists
 CREATE TABLE IF NOT EXISTS public.reviews (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    property_id UUID REFERENCES properties(id) ON DELETE CASCADE,
+    vehicle_id UUID REFERENCES Vehicles(id) ON DELETE CASCADE,
     client_email VARCHAR(255) NOT NULL,
     client_name VARCHAR(255) NOT NULL,
     rating INTEGER CHECK (rating >= 1 AND rating <= 5) NOT NULL,
@@ -23,7 +23,7 @@ DROP POLICY IF EXISTS "Allow everyone to insert reviews" ON reviews;
 DROP POLICY IF EXISTS "Allow everyone to update reviews" ON reviews;
 DROP POLICY IF EXISTS "Allow everyone to delete reviews" ON reviews;
 DROP POLICY IF EXISTS "Reviews are viewable by everyone" ON reviews;
-DROP POLICY IF EXISTS "Property owners can see all reviews" ON reviews;
+DROP POLICY IF EXISTS "vehicle owners can see all reviews" ON reviews;
 DROP POLICY IF EXISTS "Anyone can insert reviews" ON reviews;
 DROP POLICY IF EXISTS "Users can update their own reviews" ON reviews;
 DROP POLICY IF EXISTS "Users can delete their own reviews" ON reviews;
@@ -38,13 +38,13 @@ DROP POLICY IF EXISTS "Allow all operations on reviews" ON reviews;
 CREATE POLICY "Anyone can read verified reviews" ON reviews
     FOR SELECT USING (is_verified = true);
 
--- Allow property owners to see all reviews for their properties
-CREATE POLICY "Property owners can see all their reviews" ON reviews
+-- Allow vehicle owners to see all reviews for their Vehicles
+CREATE POLICY "vehicle owners can see all their reviews" ON reviews
     FOR SELECT USING (
         EXISTS (
-            SELECT 1 FROM properties 
-            WHERE properties.id = reviews.property_id 
-            AND properties.owner_email = auth.jwt() ->> 'email'
+            SELECT 1 FROM Vehicles 
+            WHERE Vehicles.id = reviews.vehicle_id 
+            AND Vehicles.owner_email = auth.jwt() ->> 'email'
         )
     );
 
@@ -63,13 +63,13 @@ CREATE POLICY "Users can update their own reviews" ON reviews
     FOR UPDATE USING (client_email = auth.jwt() ->> 'email')
     WITH CHECK (client_email = auth.jwt() ->> 'email');
 
--- Allow property owners to update reviews for their properties (for admin purposes)
-CREATE POLICY "Property owners can update their reviews" ON reviews
+-- Allow vehicle owners to update reviews for their Vehicles (for admin purposes)
+CREATE POLICY "vehicle owners can update their reviews" ON reviews
     FOR UPDATE USING (
         EXISTS (
-            SELECT 1 FROM properties 
-            WHERE properties.id = reviews.property_id 
-            AND properties.owner_email = auth.jwt() ->> 'email'
+            SELECT 1 FROM Vehicles 
+            WHERE Vehicles.id = reviews.vehicle_id 
+            AND Vehicles.owner_email = auth.jwt() ->> 'email'
         )
     );
 
@@ -78,13 +78,13 @@ CREATE POLICY "Property owners can update their reviews" ON reviews
 CREATE POLICY "Users can delete their own reviews" ON reviews
     FOR DELETE USING (client_email = auth.jwt() ->> 'email');
 
--- Allow property owners to delete reviews for their properties
-CREATE POLICY "Property owners can delete their reviews" ON reviews
+-- Allow vehicle owners to delete reviews for their Vehicles
+CREATE POLICY "vehicle owners can delete their reviews" ON reviews
     FOR DELETE USING (
         EXISTS (
-            SELECT 1 FROM properties 
-            WHERE properties.id = reviews.property_id 
-            AND properties.owner_email = auth.jwt() ->> 'email'
+            SELECT 1 FROM Vehicles 
+            WHERE Vehicles.id = reviews.vehicle_id 
+            AND Vehicles.owner_email = auth.jwt() ->> 'email'
         )
     );
 
@@ -140,4 +140,5 @@ FROM information_schema.columns
 WHERE table_name = 'reviews' 
 AND table_schema = 'public'
 ORDER BY ordinal_position;
+
 

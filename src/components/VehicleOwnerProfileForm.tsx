@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import supabase from '../lib/supabase';
 
-interface LandlordProfileFormProps {
+interface VehicleOwnerProfileFormProps {
   userEmail: string;
   userId: string;
   onComplete: () => void;
@@ -14,7 +14,7 @@ interface LandlordProfileFormProps {
   };
 }
 
-export default function LandlordProfileForm({ userEmail, userId, onComplete, onCancel, initialData }: LandlordProfileFormProps) {
+export default function VehicleOwnerProfileForm({ userEmail, userId, onComplete, onCancel, initialData }: VehicleOwnerProfileFormProps) {
   const [formData, setFormData] = useState({
     fullName: initialData?.fullName || '',
     phone: initialData?.phone || '',
@@ -35,9 +35,9 @@ export default function LandlordProfileForm({ userEmail, userId, onComplete, onC
 
     setSubmitting(true);
     try {
-      // First check if landlord profile already exists
+      // First check if vehicle owner profile already exists
       const { data: existingProfile } = await supabase
-        .from('landlord_profiles')
+        .from('vehicle_owner_profiles')
         .select('id')
         .eq('email', userEmail)
         .maybeSingle();
@@ -45,7 +45,7 @@ export default function LandlordProfileForm({ userEmail, userId, onComplete, onC
       if (existingProfile) {
         // Profile already exists, just update it
         const { error: updateError } = await supabase
-          .from('landlord_profiles')
+          .from('vehicle_owner_profiles')
           .update({
             full_name: formData.fullName.trim(),
             phone: formData.phone.trim() || null,
@@ -56,9 +56,9 @@ export default function LandlordProfileForm({ userEmail, userId, onComplete, onC
 
         if (updateError) throw updateError;
       } else {
-        // Create new landlord profile using upsert to handle duplicates gracefully
+        // Create new vehicle owner profile using upsert to handle duplicates gracefully
         const { data, error: insertError } = await supabase
-          .from('landlord_profiles')
+          .from('vehicle_owner_profiles')
           .upsert({
             user_id: userId,
             email: userEmail,
@@ -77,7 +77,7 @@ export default function LandlordProfileForm({ userEmail, userId, onComplete, onC
           // If it's a duplicate key error, try to update instead
           if (insertError.code === '23505' || insertError.message?.includes('duplicate')) {
             const { error: updateError } = await supabase
-              .from('landlord_profiles')
+              .from('vehicle_owner_profiles')
               .update({
                 full_name: formData.fullName.trim(),
                 phone: formData.phone.trim() || null,
@@ -88,8 +88,8 @@ export default function LandlordProfileForm({ userEmail, userId, onComplete, onC
 
             if (updateError) throw updateError;
           } else {
-            // Try fallback to user_profiles if landlord_profiles doesn't exist
-            console.warn('Landlord profile insert failed, trying user_profiles:', insertError);
+            // Try fallback to user_profiles if vehicle_owner_profiles doesn't exist
+            console.warn('Owner profile insert failed, trying user_profiles:', insertError);
             const { error: fallbackError } = await supabase
               .from('user_profiles')
               .upsert({
@@ -113,7 +113,7 @@ export default function LandlordProfileForm({ userEmail, userId, onComplete, onC
         .upsert({
           user_id: userId,
           email: userEmail,
-          role: 'landlord',
+          role: 'owner',
           is_active: true
         }, { onConflict: 'user_id,role' });
 
@@ -123,7 +123,7 @@ export default function LandlordProfileForm({ userEmail, userId, onComplete, onC
 
       onComplete();
     } catch (err: any) {
-      console.error('Failed to create landlord profile:', err);
+      console.error('Failed to create owner profile:', err);
       setError(err?.message || 'Failed to create profile. Please try again.');
     } finally {
       setSubmitting(false);
@@ -139,8 +139,8 @@ export default function LandlordProfileForm({ userEmail, userId, onComplete, onC
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
             </svg>
           </div>
-          <h3 className="text-2xl font-bold text-gray-900 mb-2">{initialData ? 'Edit' : 'Create'} Landlord Profile</h3>
-          <p className="text-gray-600">{initialData ? 'Update your profile information' : 'Complete your profile to start listing boarding houses'}</p>
+          <h3 className="text-2xl font-bold text-gray-900 mb-2">{initialData ? 'Edit' : 'Create'} Owner Profile</h3>
+          <p className="text-gray-600">{initialData ? 'Update your profile information' : 'Complete your profile to start listing vehicles'}</p>
         </div>
 
         {error && (
@@ -220,4 +220,3 @@ export default function LandlordProfileForm({ userEmail, userId, onComplete, onC
     </div>
   );
 }
-

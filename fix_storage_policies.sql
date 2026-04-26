@@ -1,4 +1,4 @@
--- =============================================
+﻿-- =============================================
 -- COMPLETE STORAGE POLICY FIX FOR ALL BUCKETS
 -- =============================================
 -- Run this SQL in your Supabase Dashboard → SQL Editor
@@ -80,6 +80,36 @@ FOR SELECT
 TO public
 USING (bucket_id = 'profile-images');
 
+DROP POLICY IF EXISTS "Users can upload to vehicle-images" ON storage.objects;
+DROP POLICY IF EXISTS "Users can update in vehicle-images" ON storage.objects;
+DROP POLICY IF EXISTS "Users can delete from vehicle-images" ON storage.objects;
+DROP POLICY IF EXISTS "Public can view vehicle-images" ON storage.objects;
+
+CREATE POLICY "Users can upload to vehicle-images"
+ON storage.objects
+FOR INSERT
+TO authenticated
+WITH CHECK (bucket_id = 'vehicle-images');
+
+CREATE POLICY "Users can update in vehicle-images"
+ON storage.objects
+FOR UPDATE
+TO authenticated
+USING (bucket_id = 'vehicle-images')
+WITH CHECK (bucket_id = 'vehicle-images');
+
+CREATE POLICY "Users can delete from vehicle-images"
+ON storage.objects
+FOR DELETE
+TO authenticated
+USING (bucket_id = 'vehicle-images');
+
+CREATE POLICY "Public can view vehicle-images"
+ON storage.objects
+FOR SELECT
+TO public
+USING (bucket_id = 'vehicle-images');
+
 -- =============================================
 -- ID-DOCUMENTS BUCKET POLICIES (ADDITIONAL)
 -- =============================================
@@ -130,3 +160,4 @@ ORDER BY policyname;
 
 -- Show message when done
 SELECT 'Storage policies created successfully! Profile image uploads should now work.' as status;
+

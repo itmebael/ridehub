@@ -1,12 +1,51 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
+import type { User } from '@supabase/supabase-js';
 import GoogleMap from './GoogleMap';
 import supabase from '../lib/supabase';
-import { sendLandlordBookingEmail } from '../lib/email';
+import { mergeMessageById } from '../lib/mergeChatMessage';
+import { notifyChatRecipientNonBlocking } from '../lib/chatNotify';
+import { sendOwnerRentalEmail } from '../lib/email';
 import { ImageWithFallback } from './ImageWithFallback';
 import ImageCarousel from './ImageCarousel';
 import ReportProblem from './ReportProblem';
+import {
+  RENTAL_UNITS,
+  RENTAL_UNIT_LABELS,
+  RENTAL_UNIT_SUFFIXES,
+  buildRentalPlanNote,
+  computeFractionalHoursBetween,
+  computeHourlyBillableHours,
+  computeHourlyTotalAmount,
+  extractRentalUnitFromText,
+  getRentalRates,
+  type RentalRates,
+  getRentalRate
+} from '../lib/rentalPricing';
+import {
+  DEFAULT_MAP_CENTER,
+  buildSquareBoundary,
+  getBoundaryCenter,
+  getSquareArea,
+  getSquareBoundaryPath,
+  isPointWithinBoundary,
+  isValidLatLng,
+  normalizeBoundarySize,
+  type LatLng,
+  type SquareBoundary
+} from '../lib/vehicleBoundary';
+import {
+  formatYmdMedium,
+  getLocalDateYmd,
+  reservationRangesOverlap
+} from '../lib/rentalReservation';
+import {
+  MIN_PUSH_INTERVAL_MS,
+  pushRenterVehicleLocation,
+  rentalIsApprovedActiveForTracking,
+  renterTrackingRequestIsFresh
+} from '../lib/renterLiveTracking';
 
-interface Property {
+interface Vehicle {
   id: string;
   title: string;
   description: string;
@@ -14,18 +53,25 @@ interface Property {
   location: string;
   images: string[];
   owner: string;
-  amenities: string[];
-  coordinates: { lat: number; lng: number };
+  features: string[];
+  coordinates: LatLng;
+  currentCoordinates: LatLng;
+  rentalRates: RentalRates;
+  boundary: SquareBoundary;
+  boundarySizeMeters: number;
   isVerified: boolean;
+  status?: string;
   rating?: number;
   totalReviews?: number;
   isFeatured?: boolean;
-  totalBookings?: number;
+  totalRentals?: number;
+  /** Owner-defined PHP penalty if vehicle leaves allowed GPS zone during rental. */
+  outOfBoundaryPenaltyPhp: number;
 }
 
 interface Review {
   id: string;
-  propertyId: string;
+  vehicleId: string;
   clientName: string;
   rating: number;
   reviewText: string;
@@ -36,7 +82,7 @@ interface SearchFilters {
   minPrice: number;
   maxPrice: number;
   minRating: number;
-  amenities: string[];
+  features: string[];
   location: string;
 }
 
@@ -44,32 +90,274 @@ interface ClientDashboardProps {
   onBack: () => void;
 }
 
+type ChatMessageRow = {
+  id: string;
+  sender_email: string;
+  content: string;
+  created_at: string;
+};
+
+/** Identity on the rent form — loaded from client_profiles / app_users, not editable in the modal. */
+interface BookerRentalIdentity {
+  full_name: string;
+  email: string;
+  address: string;
+  barangay: string;
+  municipality_city: string;
+  gender: string;
+  age: string;
+  citizenship: string;
+  occupation_status: string;
+}
+
+const parseFiniteCoordinate = (value: unknown): number | null => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const parseOutOfBoundaryPenaltyPhp = (raw: unknown): number => {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return Math.min(Math.round(n), 999999999);
+};
+
+const mapVehicleRecord = (row: any): Vehicle => {
+  const lat = parseFiniteCoordinate(row?.lat);
+  const lng = parseFiniteCoordinate(row?.lng);
+  const coordinates = lat !== null && lng !== null ? { lat, lng } : { ...DEFAULT_MAP_CENTER };
+
+  const currentLat = parseFiniteCoordinate(row?.current_lat);
+  const currentLng = parseFiniteCoordinate(row?.current_lng);
+  const currentCoordinates =
+    currentLat !== null && currentLng !== null ? { lat: currentLat, lng: currentLng } : coordinates;
+
+  const boundarySizeMeters = normalizeBoundarySize(row?.boundary_size_meters);
+  const northLat = parseFiniteCoordinate(row?.boundary_north_lat);
+  const southLat = parseFiniteCoordinate(row?.boundary_south_lat);
+  const eastLng = parseFiniteCoordinate(row?.boundary_east_lng);
+  const westLng = parseFiniteCoordinate(row?.boundary_west_lng);
+
+  const boundary =
+    northLat !== null && southLat !== null && eastLng !== null && westLng !== null
+      ? {
+          northLat,
+          southLat,
+          eastLng,
+          westLng,
+          sizeMeters: boundarySizeMeters,
+        }
+      : buildSquareBoundary(coordinates, boundarySizeMeters);
+
+  const rentalRates = getRentalRates({
+    hour: row?.hourly_rate,
+    day: row?.daily_rate ?? row?.price,
+    week: row?.weekly_rate,
+    month: row?.monthly_rate,
+  });
+
+  return {
+    id: row.id,
+    title: row.title,
+    description: row.description,
+    price: rentalRates.day,
+    location: row.location,
+    images: Array.isArray(row.images)
+      ? row.images.filter((p: any) => p && String(p).trim() !== '')
+      : row.images && String(row.images).trim() !== ''
+        ? [String(row.images)]
+        : [],
+    owner: 'Vehicle Owner',
+    features: Array.isArray(row.amenities) ? row.amenities : [],
+    coordinates,
+    currentCoordinates,
+    rentalRates,
+    boundary,
+    boundarySizeMeters,
+    status: row.status || 'available',
+    rating: Number(row.rating) || 0,
+    totalReviews: Number(row.total_reviews) || 0,
+    isFeatured: Boolean(row.is_featured),
+    isVerified: Boolean(row.is_verified),
+    totalRentals: Number(row.total_Rentals) || 0,
+    outOfBoundaryPenaltyPhp: parseOutOfBoundaryPenaltyPhp(row?.out_of_boundary_penalty_php),
+  };
+};
+
+const buildVehicleTeaser = (vehicle: Vehicle, maxLength = 165): string => {
+  const fallbackCopy =
+    'Reliable local ride with clear pricing, quick owner response, and secure booking support.';
+  const source = (vehicle.description || '').replace(/\s+/g, ' ').trim() || fallbackCopy;
+  return source.length > maxLength ? `${source.slice(0, maxLength - 3).trim()}...` : source;
+};
+
+const buildVehicleHighlights = (vehicle: Vehicle, limit: number): string[] => {
+  const existingHighlights = vehicle.features
+    .filter((feature) => typeof feature === 'string' && feature.trim() !== '')
+    .slice(0, limit);
+
+  if (existingHighlights.length > 0) {
+    return existingHighlights;
+  }
+
+  const fallbackHighlights = vehicle.isFeatured
+    ? ['Top choice', 'Fast booking', 'Flexible rates']
+    : vehicle.isVerified
+      ? ['Verified owner', 'Secure rental', 'Tracked ride']
+      : ['Local support', 'Flexible pricing', 'Easy inquiry'];
+
+  return fallbackHighlights.slice(0, limit);
+};
+
+const PAYMENT_METHODS = ['Cash', 'GCash', 'Bank Transfer'] as const;
+const VEHICLE_FEATURE_FILTERS = [
+  'Air Conditioning',
+  'Automatic',
+  'Manual',
+  'Fuel Efficient',
+  'GPS Ready',
+  'Bluetooth',
+  'USB Charger',
+  'Large Trunk',
+] as const;
+
+const extractPaymentMethodFromText = (...sources: Array<string | null | undefined>): string | null => {
+  const combinedText = sources.filter(Boolean).join('\n');
+  const match = combinedText.match(/Payment Method:\s*([^\n]+)/i);
+  return match?.[1]?.trim() || null;
+};
+
+function RentalBoundaryRentCallout({
+  vehicle,
+  compact = false,
+  showMap = true
+}: {
+  vehicle: Vehicle;
+  compact?: boolean;
+  showMap?: boolean;
+}) {
+  const b = vehicle.boundary;
+  const areaM2 = getSquareArea(vehicle.boundarySizeMeters);
+  const fmt = (n: number) => (Number.isFinite(n) ? n.toFixed(5) : '—');
+  const center = getBoundaryCenter(b);
+  const mapHeight = compact ? 'h-36 sm:h-40' : 'h-44 sm:h-52';
+  const path = getSquareBoundaryPath(b);
+  const markers: Array<{
+    position: LatLng;
+    title: string;
+    info?: string;
+  }> = [
+    { position: vehicle.coordinates, title: vehicle.title, info: 'Listing' }
+  ];
+  if (
+    isValidLatLng(vehicle.currentCoordinates) &&
+    (vehicle.currentCoordinates.lat !== vehicle.coordinates.lat ||
+      vehicle.currentCoordinates.lng !== vehicle.coordinates.lng)
+  ) {
+    markers.push({
+      position: vehicle.currentCoordinates,
+      title: 'Last GPS',
+      info: 'Last reported position'
+    });
+  }
+
+  return (
+    <div className="rounded-2xl border border-sky-200 bg-sky-50/90 overflow-hidden shadow-sm">
+      <div className="px-4 py-3 space-y-2 text-sm text-slate-800 border-b border-sky-100/90">
+        <p className="font-semibold text-sky-950">Rental boundary limit</p>
+        <p className="text-slate-700 leading-relaxed">
+          Allowed GPS zone is about{' '}
+          <strong>
+            {vehicle.boundarySizeMeters.toLocaleString()} m × {vehicle.boundarySizeMeters.toLocaleString()} m
+          </strong>{' '}
+          (~{areaM2.toLocaleString()} m²). The vehicle is expected to stay inside this area when tracking is on;
+          leaving it may trigger owner or system alerts.
+        </p>
+        <p className="text-xs text-slate-600 font-mono leading-relaxed break-words">
+          N {fmt(b.northLat)}° · S {fmt(b.southLat)}° · E {fmt(b.eastLng)}° · W {fmt(b.westLng)}°
+        </p>
+        {(vehicle.outOfBoundaryPenaltyPhp ?? 0) > 0 && (
+          <p className="rounded-lg border border-amber-200/90 bg-amber-50/90 px-3 py-2 text-sm text-amber-950">
+            <strong>Out-of-boundary penalty:</strong> ₱{vehicle.outOfBoundaryPenaltyPhp.toLocaleString()} (set by
+            the owner if the vehicle leaves this zone during your rental—confirm details with the owner).
+          </p>
+        )}
+      </div>
+      {showMap && isValidLatLng(center) && path.length >= 4 && (
+        <div className={`${mapHeight} min-h-[9rem] relative bg-slate-200`}>
+          <GoogleMap
+            center={center}
+            zoom={15}
+            satellite={true}
+            preferLeaflet={true}
+            showTypeToggle={false}
+            markers={markers}
+            polygons={[
+              {
+                path,
+                strokeColor: '#0369a1',
+                strokeWeight: 2,
+                fillColor: '#38bdf8',
+                fillOpacity: 0.14
+              }
+            ]}
+            className="h-full w-full"
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Auth + profile emails that may appear as notifications.recipient_email (case / source mismatches). */
+function notificationRecipientEmailVariants(authEmail: string, profileEmail: string): string[] {
+  const set = new Set<string>();
+  for (const raw of [authEmail, profileEmail]) {
+    const t = (raw || '').trim();
+    if (!t) continue;
+    set.add(t);
+    const lower = t.toLowerCase();
+    if (lower !== t) set.add(lower);
+  }
+  return Array.from(set);
+}
+
 export default function ClientDashboard({ onBack }: ClientDashboardProps) {
   const [searchLocation, setSearchLocation] = useState('');
-  const [selectedProperty, setSelectedProperty] = useState<Property | null>(null);
-  const [showBookingForm, setShowBookingForm] = useState(false);
-  const [bookingMessage, setBookingMessage] = useState('');
-  const [bookingName, setBookingName] = useState('');
-  const [bookingEmail, setBookingEmail] = useState('');
-  // Enhanced booking form fields
-  const [bookingFullName, setBookingFullName] = useState('');
-  const [bookingAddress, setBookingAddress] = useState('');
-  const [bookingBarangay, setBookingBarangay] = useState('');
-  const [bookingMunicipalityCity, setBookingMunicipalityCity] = useState('');
-  const [bookingGender, setBookingGender] = useState('');
-  const [bookingAge, setBookingAge] = useState('');
-  const [bookingCitizenship, setBookingCitizenship] = useState('');
-  const [bookingOccupationStatus, setBookingOccupationStatus] = useState('');
-  const [selectedRoomId, setSelectedRoomId] = useState<string>('');
-  const [selectedBedId, setSelectedBedId] = useState<string>('');
-  const [availableRooms, setAvailableRooms] = useState<any[]>([]);
-  const [availableBeds, setAvailableBeds] = useState<any[]>([]);
-  const [loadingBeds, setLoadingBeds] = useState<boolean>(false);
+  const [selectedVehicle, setSelectedVehicle] = useState<Vehicle | null>(null);
+  const [showRentalOptions, setShowRentalOptions] = useState(false);
+  const [showRentalForm, setShowRentalForm] = useState(false);
+  const [selectedRentalUnit, setSelectedRentalUnit] = useState<'hour' | 'day' | 'week' | 'month'>('day');
+  const [rentalMessage, setRentalMessage] = useState('');
+  const [rentalPaymentMethod, setRentalPaymentMethod] = useState<(typeof PAYMENT_METHODS)[number]>('Cash');
+  const [rentalName, setRentalName] = useState('');
+  const [rentalEmail, setRentalEmail] = useState('');
+  // Enhanced rental form fields
+  const [rentalFullName, setRentalFullName] = useState('');
+  const [rentalAddress, setRentalAddress] = useState('');
+  const [rentalBarangay, setRentalBarangay] = useState('');
+  const [rentalMunicipalityCity, setRentalMunicipalityCity] = useState('');
+  const [rentalGender, setRentalGender] = useState('');
+  const [rentalAge, setRentalAge] = useState('');
+  const [rentalCitizenship, setRentalCitizenship] = useState('');
+  const [rentalOccupationStatus, setRentalOccupationStatus] = useState('');
+  const [rentalDriverLicense, setRentalDriverLicense] = useState('');
+  const [rentalCheckInDate, setRentalCheckInDate] = useState('');
+  const [rentalCheckOutDate, setRentalCheckOutDate] = useState('');
+  const [rentalPickUpTime, setRentalPickUpTime] = useState('09:00');
+  const [rentalReturnTime, setRentalReturnTime] = useState('17:00');
+  const [vehicleScheduleLoading, setVehicleScheduleLoading] = useState(false);
+  const [vehicleScheduleBlocks, setVehicleScheduleBlocks] = useState<
+    { id: string; check_in_date: string | null; check_out_date: string | null; status: string }[]
+  >([]);
+  const [selectedVehicleId, setSelectedVehicleId] = useState<string>('');
+  const [availableVehicles, setAvailableVehicles] = useState<any[]>([]);
+  const [loadingVehicles, setLoadingVehicles] = useState<boolean>(false);
   const [currentLocation, setCurrentLocation] = useState('Catbalogan City, Philippines');
   const [showMenu, setShowMenu] = useState(false);
   const [showMaps, setShowMaps] = useState(false);
+  const [mostRentedIndex, setMostRentedIndex] = useState(0);
 
-  const [infoTab, setInfoTab] = useState<'overview' | 'amenities' | 'photos'>('overview');
+  const [infoTab, setInfoTab] = useState<'overview' | 'features' | 'photos'>('overview');
   const [showFilters, setShowFilters] = useState(false);
   const [showReviewForm, setShowReviewForm] = useState(false);
   const [showReviewErrorModal, setShowReviewErrorModal] = useState(false);
@@ -77,21 +365,28 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
   const [reviewRating, setReviewRating] = useState(5);
   const [reviewText, setReviewText] = useState('');
 
-  const [properties, setProperties] = useState<Property[]>([]);
-  const [filteredProperties, setFilteredProperties] = useState<Property[]>([]);
+  const [vehicles, setVehicles] = useState<Vehicle[]>([]);
+  const [filteredVehicles, setFilteredVehicles] = useState<Vehicle[]>([]);
   const [loading, setLoading] = useState<boolean>(false);
   const [reviews, setReviews] = useState<Review[]>([]);
   const [user, setUser] = useState<any>(null);
+  const [isClientApproved, setIsClientApproved] = useState<boolean | null>(null);
   const [searchFilters, setSearchFilters] = useState<SearchFilters>({
     minPrice: 0,
     maxPrice: 50000,
     minRating: 0,
-    amenities: [],
+    features: [],
     location: ''
   });
 
-  // Tenant notifications + chat
+  // Room selection state for vehicle rentals
+  const [availableRooms, setAvailableRooms] = useState<any[]>([]);
+  const [selectedRoomId, setSelectedRoomId] = useState<string>('');
+
+  // Renter notifications + chat
   const [clientEmail, setClientEmail] = useState<string>('');
+  /** Distinct recipient_email values to query/subscribe (auth + profile, case variants). */
+  const [notificationRecipientEmails, setNotificationRecipientEmails] = useState<string[]>([]);
   const [notifications, setNotifications] = useState<any[]>([]);
   const [showNotif, setShowNotif] = useState(false);
   const [showReportProblem, setShowReportProblem] = useState(false);
@@ -107,7 +402,11 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
     city: '',
     profile_image_url: '',
     id_document_url: '',
-    email: ''
+    email: '',
+    gender: '',
+    age: '',
+    citizenship: '' as '' | 'Filipino' | 'Foreigner',
+    occupation_status: '' as '' | 'Student' | 'Worker'
   });
   const [viewProfileData, setViewProfileData] = useState<{
     full_name: string;
@@ -129,38 +428,264 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
     id_document_url: null
   });
 
-  // Tenant information preview before booking
-  const [showBookingPreview, setShowBookingPreview] = useState(false);
-  const [bookingPreviewData, setBookingPreviewData] = useState<any>(null);
+  const [bookerIdentity, setBookerIdentity] = useState<BookerRentalIdentity | null>(null);
+
+  // Tenant information preview before rental
+  const [showrentalPreview, setShowrentalPreview] = useState(false);
+  const [rentalPreviewData, setrentalPreviewData] = useState<any>(null);
+  const [rentalAgreementAccepted, setRentalAgreementAccepted] = useState(false);
   const [profileImageFile, setProfileImageFile] = useState<File | null>(null);
   const [profileImagePreview, setProfileImagePreview] = useState<string | null>(null);
   const [idDocumentFile, setIdDocumentFile] = useState<File | null>(null);
   const [idDocumentPreview, setIdDocumentPreview] = useState<string | null>(null);
   const [savingProfile, setSavingProfile] = useState(false);
   
-  // My Bookings
-  const [myBookings, setMyBookings] = useState<any[]>([]);
-  const [loadingBookings, setLoadingBookings] = useState(false);
-  const [activeView, setActiveView] = useState<'properties' | 'bookings'>('properties');
+  // My Rentals
+  const [myRentals, setMyRentals] = useState<any[]>([]);
+  const [loadingRentals, setLoadingRentals] = useState(false);
+  const [activeView, setActiveView] = useState<'Vehicles' | 'Rentals'>('Vehicles');
   
-  // Property Bookings (for selected property)
-  const [propertyBookings, setPropertyBookings] = useState<any[]>([]);
-  const [loadingPropertyBookings, setLoadingPropertyBookings] = useState(false);
+  // vehicle Rentals (for selected vehicle)
+  const [vehicleRentals, setvehicleRentals] = useState<any[]>([]);
+  const [loadingvehicleRentals, setLoadingvehicleRentals] = useState(false);
 
 
 
   const [chatOpen, setChatOpen] = useState(false);
   const [chatLoading, setChatLoading] = useState(false);
-  const [chatMessages, setChatMessages] = useState<{ id: string; sender_email: string; content: string; created_at: string; }[]>([]);
+  const [chatMessages, setChatMessages] = useState<ChatMessageRow[]>([]);
   const [chatInput, setChatInput] = useState('');
-  const [activeConversation, setActiveConversation] = useState<{ id: string; property_id: string; owner_email: string; client_email: string } | null>(null);
+  const [activeConversation, setActiveConversation] = useState<{ id: string; vehicle_id: string; owner_email: string; client_email: string } | null>(null);
   const [chatChannel, setChatChannel] = useState<any>(null);
   const messagesEndRef = React.useRef<HTMLDivElement | null>(null);
+  const renterTrackVehicleIdsRef = React.useRef<string[]>([]);
+  const renterGpsWatchIdRef = React.useRef<number | null>(null);
+  const renterGpsLastPushRef = React.useRef(0);
+  const [renterLiveGpsSharing, setRenterLiveGpsSharing] = useState(false);
   const scrollMessagesToBottom = () => { try { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }); } catch {} };
+  const selectedRentalPrice = selectedVehicle ? getRentalRate(selectedVehicle.rentalRates, selectedRentalUnit) : 0;
+
+  const hourlyRentalQuote = useMemo(() => {
+    if (!selectedVehicle || selectedRentalUnit !== 'hour') return null;
+    const hourlyRate = getRentalRate(selectedVehicle.rentalRates, 'hour');
+    if (!rentalCheckInDate || !rentalCheckOutDate) {
+      return {
+        hourlyRate,
+        fractionalHours: 0,
+        billableHours: 0,
+        totalAmount: 0,
+        valid: false as const
+      };
+    }
+    const fractionalHours = computeFractionalHoursBetween(
+      rentalCheckInDate,
+      rentalCheckOutDate,
+      rentalPickUpTime,
+      rentalReturnTime
+    );
+    const billableHours = computeHourlyBillableHours(
+      rentalCheckInDate,
+      rentalCheckOutDate,
+      rentalPickUpTime,
+      rentalReturnTime
+    );
+    const totalAmount = computeHourlyTotalAmount(
+      hourlyRate,
+      rentalCheckInDate,
+      rentalCheckOutDate,
+      rentalPickUpTime,
+      rentalReturnTime
+    );
+    return {
+      hourlyRate,
+      fractionalHours,
+      billableHours,
+      totalAmount,
+      valid: fractionalHours > 0
+    };
+  }, [
+    selectedVehicle,
+    selectedRentalUnit,
+    rentalCheckInDate,
+    rentalCheckOutDate,
+    rentalPickUpTime,
+    rentalReturnTime
+  ]);
+
+  const resetrentalWorkflow = () => {
+    setShowRentalForm(false);
+    setShowrentalPreview(false);
+    setShowRentalOptions(false);
+    setrentalPreviewData(null);
+    setRentalAgreementAccepted(false);
+    setRentalMessage('');
+    setRentalPaymentMethod('Cash');
+    setRentalName('');
+    setRentalEmail('');
+    setRentalFullName('');
+    setRentalAddress('');
+    setRentalBarangay('');
+    setRentalMunicipalityCity('');
+    setRentalGender('');
+    setRentalAge('');
+    setRentalCitizenship('');
+    setRentalOccupationStatus('');
+    setRentalDriverLicense('');
+    setRentalCheckInDate('');
+    setRentalCheckOutDate('');
+    setRentalPickUpTime('09:00');
+    setRentalReturnTime('17:00');
+    setSelectedRoomId('');
+    setAvailableRooms([]);
+    setSelectedRentalUnit('day');
+  };
+
+  const rentalFormLockedFieldClass =
+    'w-full px-4 py-3 border border-gray-200 rounded-xl bg-gray-100 text-gray-800 cursor-not-allowed';
 
   useEffect(() => {
-    // Guard: only allow tenant role
-    const enforceTenantRole = async () => {
+    if (!showRentalForm || !bookerIdentity) return;
+    setRentalFullName(bookerIdentity.full_name);
+    setRentalEmail(bookerIdentity.email);
+    setRentalAddress(bookerIdentity.address);
+    setRentalBarangay(bookerIdentity.barangay);
+    setRentalMunicipalityCity(bookerIdentity.municipality_city);
+    setRentalGender(bookerIdentity.gender);
+    setRentalAge(bookerIdentity.age);
+    setRentalCitizenship(bookerIdentity.citizenship);
+    setRentalOccupationStatus(bookerIdentity.occupation_status);
+    setRentalName(bookerIdentity.full_name);
+  }, [showRentalForm, bookerIdentity]);
+
+  useEffect(() => {
+    if (!showRentalForm || selectedRentalUnit !== 'hour' || !rentalCheckInDate) return;
+    if (!rentalCheckOutDate) {
+      setRentalCheckOutDate(rentalCheckInDate);
+    }
+  }, [showRentalForm, selectedRentalUnit, rentalCheckInDate, rentalCheckOutDate]);
+
+  const openRentalOptions = (vehicle: Vehicle, options?: { closeMaps?: boolean }) => {
+    if ((vehicle.status || 'available').toLowerCase() === 'rented') {
+      alert('This vehicle is currently rented. It will be available after the owner finishes the rent.');
+      return;
+    }
+
+    setSelectedVehicle(vehicle);
+    if (options?.closeMaps) {
+      setShowMaps(false);
+    }
+    setSelectedRentalUnit('day');
+    setShowRentalOptions(true);
+  };
+
+  const verifyVehicleStillAvailable = async (vehicleId: string): Promise<boolean> => {
+    const { data, error } = await supabase
+      .from('vehicles')
+      .select('status')
+      .eq('id', vehicleId)
+      .single();
+
+    if (error) {
+      console.error('Failed to verify vehicle availability:', error);
+      return true;
+    }
+
+    const status = String(data?.status || 'available').toLowerCase();
+    if (status === 'rented' || status === 'inactive' || status === 'pending') {
+      alert('This vehicle is already rented or unavailable. Please choose another vehicle.');
+      setVehicles((prev) => prev.filter((vehicle) => vehicle.id !== vehicleId));
+      setFilteredVehicles((prev) => prev.filter((vehicle) => vehicle.id !== vehicleId));
+      setSelectedVehicle(null);
+      resetrentalWorkflow();
+      return false;
+    }
+
+    return true;
+  };
+
+  const confirmRentalPlan = (unit: 'hour' | 'day' | 'week' | 'month') => {
+    setSelectedRentalUnit(unit);
+    setShowRentalOptions(false);
+    setShowRentalForm(true);
+  };
+
+  useEffect(() => {
+    if (!showRentalForm || !selectedVehicle?.id) {
+      setVehicleScheduleBlocks([]);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      setVehicleScheduleLoading(true);
+      try {
+        const { data, error } = await supabase
+          .from('rentals')
+          .select('id, check_in_date, check_out_date, status')
+          .eq('vehicle_id', selectedVehicle.id)
+          .in('status', ['approved', 'pending']);
+        if (!cancelled) {
+          if (error) {
+            console.warn('Could not load vehicle reservation schedule:', error);
+            setVehicleScheduleBlocks([]);
+          } else {
+            setVehicleScheduleBlocks(data || []);
+          }
+        }
+      } finally {
+        if (!cancelled) setVehicleScheduleLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [showRentalForm, selectedVehicle?.id]);
+
+  const reservationScheduleNotice = useMemo(() => {
+    if (!rentalCheckInDate || !rentalCheckOutDate) return null;
+    const withDates = vehicleScheduleBlocks.filter((b) => b.check_in_date && b.check_out_date);
+    const booked = withDates
+      .filter((b) => b.status === 'approved')
+      .find((b) =>
+        reservationRangesOverlap(
+          rentalCheckInDate,
+          rentalCheckOutDate,
+          b.check_in_date!,
+          b.check_out_date!
+        )
+      );
+    if (booked) {
+      return {
+        variant: 'unavailable' as const,
+        message: `These dates overlap an existing booking (${formatYmdMedium(booked.check_in_date!)} – ${formatYmdMedium(booked.check_out_date!)}). Choose different dates or another vehicle.`
+      };
+    }
+    const pendingOverlap = withDates
+      .filter((b) => b.status === 'pending')
+      .find((b) =>
+        reservationRangesOverlap(
+          rentalCheckInDate,
+          rentalCheckOutDate,
+          b.check_in_date!,
+          b.check_out_date!
+        )
+      );
+    if (pendingOverlap) {
+      return {
+        variant: 'pending' as const,
+        message: `Another request is pending for overlapping dates (${formatYmdMedium(pendingOverlap.check_in_date!)} – ${formatYmdMedium(pendingOverlap.check_out_date!)}). You can still submit, but the owner may not approve both.`
+      };
+    }
+    return null;
+  }, [rentalCheckInDate, rentalCheckOutDate, vehicleScheduleBlocks]);
+
+  const selectedVehicleOutsideBoundary = useMemo(() => {
+    if (!selectedVehicle || !isValidLatLng(selectedVehicle.currentCoordinates)) return false;
+    return !isPointWithinBoundary(selectedVehicle.currentCoordinates, selectedVehicle.boundary);
+  }, [selectedVehicle]);
+
+  useEffect(() => {
+    // Guard: only allow client role
+    const enforceRenterRole = async () => {
       try {
         // Get current user
         const { data: { user } } = await supabase.auth.getUser();
@@ -185,7 +710,7 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
           const userRole = meta.role || 'client';
           
           if (userRole !== 'client') {
-            alert('Access denied: Tenant role required.');
+            alert('Access denied: Client role required.');
             onBack();
           }
           return;
@@ -193,7 +718,7 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
         
         // Check if user has client role
         if (userData.role !== 'client') {
-          alert('Access denied: Tenant role required.');
+          alert('Access denied: Client role required.');
           onBack();
         }
         
@@ -203,145 +728,428 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
         console.warn('Role validation failed, allowing access for now');
       }
     };
-    enforceTenantRole();
+    enforceRenterRole();
   }, [onBack]);
 
   useEffect(() => {
-    // Get current user email and load notifications
-    const loadClientMeta = async () => {
+    let cancelled = false;
+
+    const loadClientMeta = async (authUser: User | null) => {
       try {
-        const { data: userData } = await supabase.auth.getUser();
-        const email = userData?.user?.email || '';
-        setUser(userData?.user);
+        const email = authUser?.email?.trim() || '';
+        setUser(authUser);
         setClientEmail(email);
-        if (email) {
+
+        const uid = authUser?.id;
+        const meta = (authUser?.user_metadata || {}) as Record<string, unknown>;
+        let profileEmailForNotifs = '';
+
+        if (uid) {
+          const authEmail = (email || '').trim();
+
+          const [appUserRes, cpRes, upRes] = await Promise.all([
+            supabase
+              .from('app_users')
+              .select('is_verified, full_name, email, phone, address, barangay, city')
+              .eq('user_id', uid)
+              .maybeSingle(),
+            supabase
+              .from('client_profiles')
+              .select(
+                'full_name, email, address, barangay, municipality_city, gender, age, citizenship, occupation_status'
+              )
+              .eq('user_id', uid)
+              .maybeSingle(),
+            authEmail
+              ? supabase
+                  .from('user_profiles')
+                  .select('user_email, full_name, phone, address, barangay, city')
+                  .eq('user_email', authEmail)
+                  .maybeSingle()
+              : Promise.resolve({ data: null, error: null as null }),
+          ]);
+
+          const appUserError = appUserRes.error;
+          const appUserData = appUserRes.data;
+
+          if (appUserError) {
+            console.warn('Failed to load app_users:', appUserError);
+            setIsClientApproved(null);
+          } else {
+            setIsClientApproved(Boolean(appUserData?.is_verified));
+          }
+
+          const cpRow = cpRes.data as Record<string, unknown> | null;
+          const au = appUserData as Record<string, unknown> | null;
+          const upRow = upRes.data as Record<string, unknown> | null;
+
+          const fullName = String(
+            upRow?.full_name || cpRow?.full_name || au?.full_name || meta.full_name || ''
+          ).trim();
+          const profileEmail = String(
+            authEmail || upRow?.user_email || cpRow?.email || au?.email || ''
+          ).trim();
+          profileEmailForNotifs = profileEmail;
+          const address = String(upRow?.address || cpRow?.address || au?.address || '').trim();
+          const barangay = String(upRow?.barangay || cpRow?.barangay || au?.barangay || '').trim();
+          const city = String(
+            upRow?.city || cpRow?.municipality_city || au?.city || ''
+          ).trim();
+          const phone = String(upRow?.phone || au?.phone || '').trim();
+
+          const ageFromMeta =
+            meta.age != null && meta.age !== '' ? String(meta.age as string | number) : '';
+          const ageStr =
+            cpRow?.age != null && cpRow.age !== ''
+              ? String(cpRow.age)
+              : ageFromMeta;
+
+          setBookerIdentity({
+            full_name: fullName,
+            email: profileEmail,
+            address,
+            barangay,
+            municipality_city: city,
+            gender: String(cpRow?.gender || meta.gender || '').trim(),
+            age: ageStr,
+            citizenship: String(cpRow?.citizenship || meta.citizenship || '').trim(),
+            occupation_status: String(
+              cpRow?.occupation_status || meta.occupation_status || meta.occupation || ''
+            ).trim(),
+          });
+
+          setProfileData((prev) => ({
+            ...prev,
+            full_name: fullName || prev.full_name,
+            phone: phone || prev.phone,
+            address: address || prev.address,
+            barangay: barangay || prev.barangay,
+            city: city || prev.city,
+            email: profileEmail || prev.email,
+            gender: String(cpRow?.gender || prev.gender || '').trim(),
+            age:
+              cpRow?.age != null && cpRow.age !== ''
+                ? String(cpRow.age)
+                : prev.age || ageStr || '',
+            citizenship: (String(cpRow?.citizenship || prev.citizenship || '').trim() ||
+              '') as typeof prev.citizenship,
+            occupation_status: (String(cpRow?.occupation_status || prev.occupation_status || '').trim() ||
+              '') as typeof prev.occupation_status
+          }));
+        } else {
+          setIsClientApproved(null);
+          profileEmailForNotifs = (email || '').trim();
+          setBookerIdentity({
+            full_name: String(meta.full_name || '').trim(),
+            email: profileEmailForNotifs,
+            address: '',
+            barangay: '',
+            municipality_city: '',
+            gender: '',
+            age: '',
+            citizenship: '',
+            occupation_status: '',
+          });
+        }
+
+        const recipientVariants = notificationRecipientEmailVariants(email, profileEmailForNotifs);
+        if (!cancelled) {
+          setNotificationRecipientEmails(recipientVariants);
+        }
+
+        if (recipientVariants.length > 0) {
           const { data: notifs, error: notifErr } = await supabase
             .from('notifications')
             .select('*')
-            .eq('recipient_email', email)
+            .in('recipient_email', recipientVariants)
             .order('created_at', { ascending: false });
-          if (!notifErr) setNotifications(notifs || []);
+          if (notifErr) {
+            console.error('Load tenant notifications failed', notifErr);
+          }
+          if (!cancelled && !notifErr) {
+            setNotifications(notifs || []);
+          }
+        } else if (!cancelled) {
+          setNotifications([]);
         }
       } catch (e) {
-        console.error('Load tenant notifications failed', e);
+        console.error('Load client meta / notifications failed', e);
       }
     };
-    loadClientMeta();
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      void loadClientMeta(session?.user ?? null);
+    });
+
+    void supabase.auth.getSession().then(({ data: { session } }) => {
+      void loadClientMeta(session?.user ?? null);
+    });
+
+    return () => {
+      cancelled = true;
+      subscription.unsubscribe();
+    };
   }, []);
 
-  // Load user bookings
-  const loadMyBookings = async () => {
+  useEffect(() => {
+    if (notificationRecipientEmails.length === 0) return;
+
+    const handleInsert = (payload: { new: Record<string, unknown> }) => {
+      const row = payload.new as {
+        id?: string;
+        title?: string;
+        body?: string;
+        type?: string;
+        recipient_email?: string;
+      };
+      if (!row?.id) return;
+      const rec = String(row.recipient_email || '').trim();
+      const allowed = new Set(notificationRecipientEmails.map((e) => e.toLowerCase()));
+      if (!allowed.has(rec.toLowerCase())) return;
+
+      setNotifications((prev) => {
+        if (prev.some((n: { id: string }) => n.id === row.id)) return prev;
+        return [row, ...prev] as typeof prev;
+      });
+      if (
+        row.type === 'vehicle_boundary_alert' &&
+        typeof window !== 'undefined' &&
+        'Notification' in window &&
+        Notification.permission === 'granted'
+      ) {
+        try {
+          new Notification(row.title || 'Vehicle zone alert', {
+            body: row.body || '',
+            icon: '/logo.png',
+          });
+        } catch {
+          /* ignore */
+        }
+      }
+    };
+
+    const channels = notificationRecipientEmails.map((em, idx) =>
+      supabase
+        .channel(`renter-notifications-${idx}-${encodeURIComponent(em).slice(0, 48)}`)
+        .on(
+          'postgres_changes',
+          {
+            event: 'INSERT',
+            schema: 'public',
+            table: 'notifications',
+            filter: `recipient_email=eq.${encodeURIComponent(em)}`,
+          },
+          handleInsert
+        )
+        .subscribe()
+    );
+
+    return () => {
+      channels.forEach((ch) => {
+        try {
+          void supabase.removeChannel(ch);
+        } catch {
+          /* ignore */
+        }
+      });
+    };
+  }, [notificationRecipientEmails.join('|')]);
+
+  // Load user Rentals
+  const loadMyRentals = async () => {
     if (!clientEmail) return;
     
-    setLoadingBookings(true);
+    setLoadingRentals(true);
     try {
-      // Try multiple queries to find bookings by different email fields
+      // Try multiple queries to find Rentals by current-schema email fields
       const queries = [
+        supabase.from('rentals').select('*').eq('tenant_email', clientEmail),
+        supabase.from('rentals').select('*').eq('client_email', clientEmail),
         supabase
-          .from('bookings')
+          .from('rentals')
           .select('*')
-          .eq('client_email', clientEmail),
-        supabase
-          .from('bookings')
-          .select('*')
-          .eq('tenant_email', clientEmail),
-        supabase
-          .from('bookings')
-          .select('*')
-          .eq('full_name', clientEmail) // Sometimes email might be in full_name field
+          .eq('full_name', clientEmail), // legacy mistaken mapping
       ];
 
       const results = await Promise.all(queries);
-      let allBookings: any[] = [];
-      const bookingIds = new Set<string>();
+      let allRentals: any[] = [];
+      const rentalIds = new Set<string>();
 
       // Combine results and remove duplicates
       results.forEach(({ data, error }) => {
         if (!error && data) {
-          data.forEach((booking: any) => {
-            if (!bookingIds.has(booking.id)) {
-              bookingIds.add(booking.id);
-              allBookings.push(booking);
+          data.forEach((rental: any) => {
+            if (!rentalIds.has(rental.id)) {
+              rentalIds.add(rental.id);
+              allRentals.push(rental);
             }
           });
         }
       });
 
-      // Now fetch property, room, and bed details for each booking
-      const bookingsWithDetails = await Promise.all(
-        allBookings.map(async (booking) => {
-          const propertyId = booking.property_id || booking.boarding_house_id;
-          let propertyData = null;
+      // Now fetch vehicle and room details for each rental
+      const RentalsWithDetails = await Promise.all(
+        allRentals.map(async (rental) => {
+          const vehicleId = rental.vehicle_id;
+          let vehicleData = null;
           let roomData = null;
-          let bedData = null;
 
-          // Fetch property details
-          if (propertyId) {
+          // Fetch vehicle details
+          if (vehicleId) {
             const { data: propData } = await supabase
-              .from('properties')
+              .from('vehicles')
               .select('id, title, location, price, images')
-              .eq('id', propertyId)
+              .eq('id', vehicleId)
               .single();
-            propertyData = propData;
+            vehicleData = propData;
           }
 
           // Fetch room details
-          if (booking.room_id) {
+          if (rental.room_id) {
             const { data: room } = await supabase
               .from('rooms')
               .select('id, room_number, room_name, max_beds, price_per_bed')
-              .eq('id', booking.room_id)
+              .eq('id', rental.room_id)
               .single();
             roomData = room;
           }
 
-          // Fetch bed details
-          if (booking.bed_id) {
-            const { data: bed } = await supabase
-              .from('beds')
-              .select('id, bed_number, bed_type, deck_position, status, price')
-              .eq('id', booking.bed_id)
-              .single();
-            bedData = bed;
-          }
-          
           return {
-            ...booking,
-            properties: propertyData,
-            room: roomData,
-            bed: bedData
+            ...rental,
+            Vehicles: vehicleData,
+            room: roomData
           };
         })
       );
 
-      // Sort by created_at descending
-      bookingsWithDetails.sort((a, b) => 
-        new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-      );
+      const statusRank = (s: string | undefined) =>
+        s === 'approved' ? 0 : s === 'pending' ? 1 : s === 'rejected' ? 2 : 3;
+      RentalsWithDetails.sort((a, b) => {
+        const byStatus = statusRank(a.status) - statusRank(b.status);
+        if (byStatus !== 0) return byStatus;
+        return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+      });
 
-      setMyBookings(bookingsWithDetails);
+      setMyRentals(RentalsWithDetails);
     } catch (e) {
-      console.error('Failed to load bookings:', e);
+      console.error('Failed to load Rentals:', e);
     } finally {
-      setLoadingBookings(false);
+      setLoadingRentals(false);
     }
   };
 
   useEffect(() => {
     if (clientEmail) {
-      loadMyBookings();
+      loadMyRentals();
     }
   }, [clientEmail]);
 
-  // Load bookings for selected property
-  const loadPropertyBookings = async (propertyId: string) => {
-    if (!propertyId) return;
+  /** When owner taps "Track on map", poll for renter_tracking_requested_at and push device GPS via RPC. */
+  React.useEffect(() => {
+    if (!clientEmail) {
+      setRenterLiveGpsSharing(false);
+      return;
+    }
+
+    let cancelled = false;
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
+
+    const clearWatch = () => {
+      if (renterGpsWatchIdRef.current != null && navigator.geolocation) {
+        navigator.geolocation.clearWatch(renterGpsWatchIdRef.current);
+        renterGpsWatchIdRef.current = null;
+      }
+    };
+
+    const ensureWatch = () => {
+      if (renterGpsWatchIdRef.current != null || !navigator.geolocation) return;
+      renterGpsWatchIdRef.current = navigator.geolocation.watchPosition(
+        (pos) => {
+          const ids = renterTrackVehicleIdsRef.current;
+          if (ids.length === 0) return;
+          const now = Date.now();
+          if (now - renterGpsLastPushRef.current < MIN_PUSH_INTERVAL_MS) return;
+          renterGpsLastPushRef.current = now;
+          const lat = pos.coords.latitude;
+          const lng = pos.coords.longitude;
+          void Promise.all(ids.map((vid) => pushRenterVehicleLocation(supabase, vid, lat, lng))).then(
+            (results) => {
+              const bad = results.find((r) => r.error);
+              if (bad?.error?.message) {
+                console.warn('Renter GPS push:', bad.error.message);
+              }
+            }
+          );
+        },
+        (geoErr) => {
+          console.warn('Geolocation:', geoErr.message);
+        },
+        { enableHighAccuracy: true, maximumAge: 20_000, timeout: 25_000 }
+      );
+    };
+
+    const poll = async () => {
+      if (cancelled) return;
+
+      const activeRentals = myRentals.filter(
+        (r) => r.vehicle_id && rentalIsApprovedActiveForTracking(r)
+      );
+      const vehicleIds = Array.from(new Set(activeRentals.map((r) => String(r.vehicle_id))));
+      if (vehicleIds.length === 0) {
+        renterTrackVehicleIdsRef.current = [];
+        setRenterLiveGpsSharing(false);
+        clearWatch();
+        return;
+      }
+
+      const { data, error } = await supabase.from('vehicles').select('*').in('id', vehicleIds);
+
+      if (cancelled) return;
+      if (error) {
+        console.warn('Renter tracking poll:', error.message);
+        return;
+      }
+
+      const trackIds = (data || [])
+        .filter((v: Record<string, unknown>) =>
+          renterTrackingRequestIsFresh(v.renter_tracking_requested_at as string | null | undefined)
+        )
+        .map((v: Record<string, unknown>) => String(v.id));
+
+      renterTrackVehicleIdsRef.current = trackIds;
+      setRenterLiveGpsSharing(trackIds.length > 0);
+
+      if (trackIds.length === 0) {
+        clearWatch();
+        return;
+      }
+
+      ensureWatch();
+    };
+
+    void poll();
+    pollTimer = setInterval(poll, 12_000);
+
+    return () => {
+      cancelled = true;
+      if (pollTimer) clearInterval(pollTimer);
+      clearWatch();
+      renterTrackVehicleIdsRef.current = [];
+      setRenterLiveGpsSharing(false);
+    };
+  }, [clientEmail, myRentals]);
+
+  // Load Rentals for selected vehicle
+  const loadvehicleRentals = async (vehicleId: string) => {
+    if (!vehicleId) return;
     
-    setLoadingPropertyBookings(true);
+    setLoadingvehicleRentals(true);
     try {
-      // Fetch all bookings for this property
-      const { data: bookingsData, error } = await supabase
-        .from('bookings')
+      // Fetch all Rentals for this vehicle
+      const { data: RentalsData, error } = await supabase
+        .from('rentals')
         .select(`
           *,
           rooms:room_id (
@@ -349,51 +1157,44 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
             room_number,
             room_name,
             max_beds
-          ),
-          beds:bed_id (
-            id,
-            bed_number,
-            bed_type,
-            deck_position,
-            status
           )
         `)
-        .or(`property_id.eq.${propertyId},boarding_house_id.eq.${propertyId}`)
+        .eq('vehicle_id', vehicleId)
         .order('created_at', { ascending: false });
 
       if (error) {
-        console.error('Error loading property bookings:', error);
+        console.error('Error loading vehicle Rentals:', error);
       } else {
-        setPropertyBookings(bookingsData || []);
+        setvehicleRentals(RentalsData || []);
       }
     } catch (e) {
-      console.error('Failed to load property bookings:', e);
+      console.error('Failed to load vehicle Rentals:', e);
     } finally {
-      setLoadingPropertyBookings(false);
+      setLoadingvehicleRentals(false);
     }
   };
 
-  // Load bookings when property is selected
+  // Load Rentals when vehicle is selected
   useEffect(() => {
-    if (selectedProperty && !showMaps && !showBookingForm) {
-      loadPropertyBookings(selectedProperty.id);
+    if (selectedVehicle && !showMaps && !showRentalForm) {
+      loadvehicleRentals(selectedVehicle.id);
     }
-  }, [selectedProperty, showMaps, showBookingForm]);
+  }, [selectedVehicle, showMaps, showRentalForm]);
 
 
 
   useEffect(() => {
-    const fetchProperties = async () => {
+    const fetchVehicles = async () => {
       try {
         setLoading(true);
-        console.log('=== PROPERTIES FETCH DEBUG START ===');
-        console.log('Supabase URL:', process.env.REACT_APP_SUPABASE_URL || 'https://jlahqyvpgdntlqfpxvoz.supabase.co');
+        console.log('=== Vehicles FETCH DEBUG START ===');
+        console.log('Supabase URL:', process.env.REACT_APP_SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || 'Not set');
         console.log('Current user:', await supabase.auth.getUser());
         
         // Test basic connection first
         console.log('Testing basic Supabase connection...');
         const { data: testData, error: testError } = await supabase
-          .from('properties')
+          .from('vehicles')
           .select('count')
           .limit(1);
         
@@ -403,30 +1204,30 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
         }
         console.log('✅ Basic connection test passed');
         
-        // Now fetch all properties with detailed logging
-        // Priority: Sort by total_bookings DESC (most frequently booked first), then by rating
-        console.log('Fetching all properties from database...');
+        // Now fetch all Vehicles with detailed logging
+        // Priority: Sort by total_Rentals DESC (most frequently booked first), then by rating
+        console.log('Fetching all Vehicles from database...');
         
-        // Try to fetch from properties table with status filter
+        // Try to fetch from Vehicles table with status filter
         let allData: any[] = [];
         let allError: any = null;
         
         // First try with status filter - simplified query without ordering by potentially missing columns
-        console.log('Attempting to fetch properties with status = available...');
+        console.log('Attempting to fetch Vehicles with status = available...');
         const { data: propsWithStatus, error: propsError } = await supabase
-          .from('properties')
+          .from('vehicles')
           .select('*')
           .eq('status', 'available');
         
         if (!propsError && propsWithStatus) {
           allData = propsWithStatus;
-          console.log('✅ Fetched properties with status filter:', allData.length);
+          console.log('✅ Fetched Vehicles with status filter:', allData.length);
           // Sort in JavaScript to avoid database column issues
           allData.sort((a, b) => {
-            // Sort by total_bookings if available, then rating, then created_at
-            const bookingsA = Number(a.total_bookings) || 0;
-            const bookingsB = Number(b.total_bookings) || 0;
-            if (bookingsB !== bookingsA) return bookingsB - bookingsA;
+            // Sort by total_Rentals if available, then rating, then created_at
+            const RentalsA = Number(a.total_Rentals) || 0;
+            const RentalsB = Number(b.total_Rentals) || 0;
+            if (RentalsB !== RentalsA) return RentalsB - RentalsA;
             
             const ratingA = Number(a.rating) || 0;
             const ratingB = Number(b.rating) || 0;
@@ -440,7 +1241,7 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
           // Fallback: fetch all and filter in code
           console.log('⚠️ Status filter failed, trying without filter...', propsError);
           const { data: allProps, error: allPropsError } = await supabase
-            .from('properties')
+            .from('vehicles')
             .select('*');
           
           if (allPropsError) {
@@ -448,12 +1249,12 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
             allError = allPropsError;
           } else {
             allData = allProps || [];
-            console.log('✅ Fetched all properties (fallback):', allData.length);
+            console.log('✅ Fetched all Vehicles (fallback):', allData.length);
             // Sort in JavaScript
             allData.sort((a, b) => {
-              const bookingsA = Number(a.total_bookings) || 0;
-              const bookingsB = Number(b.total_bookings) || 0;
-              if (bookingsB !== bookingsA) return bookingsB - bookingsA;
+              const RentalsA = Number(a.total_Rentals) || 0;
+              const RentalsB = Number(b.total_Rentals) || 0;
+              if (RentalsB !== RentalsA) return RentalsB - RentalsA;
               
               const ratingA = Number(a.rating) || 0;
               const ratingB = Number(b.rating) || 0;
@@ -467,7 +1268,7 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
         }
         
         if (allError) {
-          console.error('❌ Error fetching all properties:', allError);
+          console.error('❌ Error fetching all Vehicles:', allError);
           console.error('Error details:', {
             message: allError.message,
             details: allError.details,
@@ -477,34 +1278,34 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
           
           // If RLS error, try to provide helpful message
           if (allError.code === '42501' || allError.message?.includes('permission') || allError.message?.includes('policy')) {
-            console.error('🔒 RLS Policy Error: Properties table may have restrictive policies');
-            console.error('💡 Suggestion: Check RLS policies for properties table in Supabase');
-            console.error('💡 Run the SQL schema to add: "Everyone can view available properties" policy');
+            console.error('🔒 RLS Policy Error: Vehicles table may have restrictive policies');
+            console.error('💡 Suggestion: Check RLS policies for Vehicles table in Supabase');
+            console.error('💡 Run the SQL schema to add: "Everyone can view available Vehicles" policy');
           }
           
           // Don't throw, just set empty array and continue
-          setProperties([]);
-          setFilteredProperties([]);
+          setVehicles([]);
+          setFilteredVehicles([]);
           setLoading(false);
           return;
         }
         
         console.log('✅ Database query successful');
-        console.log('📊 Total properties in database:', allData?.length || 0);
-        console.log('📋 Raw properties data:', allData);
+        console.log('📊 Total Vehicles in database:', allData?.length || 0);
+        console.log('📋 Raw Vehicles data:', allData);
         
         if (!allData || allData.length === 0) {
-          console.warn('⚠️ No properties found in database');
+          console.warn('⚠️ No Vehicles found in database');
           console.log('This could mean:');
-          console.log('1. The properties table is empty');
+          console.log('1. The Vehicles table is empty');
           console.log('2. The table name is incorrect');
           console.log('3. There are permission issues');
           console.log('4. The database schema is not set up');
         }
         
-        // Log each property individually
+        // Log each vehicle individually
         (allData || []).forEach((prop, index) => {
-          console.log(`Property ${index + 1}:`, {
+          console.log(`vehicle ${index + 1}:`, {
             id: prop.id,
             title: prop.title,
             status: prop.status,
@@ -515,110 +1316,78 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
           });
         });
         
-        // Filter for available properties (only show verified/approved properties, not pending)
-        const availableProperties = (allData || []).filter((prop) => {
+        // Filter for available Vehicles (only show verified/approved Vehicles, not pending)
+        const availableVehicles = (allData || []).filter((prop) => {
           const status = (prop?.status ? String(prop.status) : '').toLowerCase();
-          // Only show available/active/vacant properties (pending properties require admin verification)
+          // Only show available/active/vacant Vehicles (pending Vehicles require admin verification)
           return status === 'available' || status === 'active' || status === 'vacant';
         });
-        console.log('🎯 Available properties count:', availableProperties.length);
-        console.log('📝 All property statuses:', (allData || []).map(p => ({ 
+        console.log('🎯 Available Vehicles count:', availableVehicles.length);
+        console.log('📝 All vehicle statuses:', (allData || []).map(p => ({ 
           id: p.id, 
           title: p.title, 
           status: p.status 
         })));
         
-        if (availableProperties.length === 0 && allData && allData.length > 0) {
-          console.warn('⚠️ No available properties found, but properties exist');
-          console.log('All properties have status:', Array.from(new Set((allData || []).map(p => p.status))));
+        if (availableVehicles.length === 0 && allData && allData.length > 0) {
+          console.warn('⚠️ No available Vehicles found, but Vehicles exist');
+          console.log('All Vehicles have status:', Array.from(new Set((allData || []).map(p => p.status))));
         }
         
         const toPublicUrl = (path: string) => {
           if (!path) return path;
           if (/^https?:\/\//i.test(path)) return path;
-          const res = supabase.storage.from('property-images').getPublicUrl(path);
+          const res = supabase.storage.from('vehicle-images').getPublicUrl(path);
           return res.data?.publicUrl || path;
         };
         
-        // Fetch booking counts for all properties
-        const propertyIds = availableProperties.map((p: any) => p.id);
-        let bookingCounts: Record<string, number> = {};
+        // Fetch rental counts for all Vehicles
+        const vehicleIds = availableVehicles.map((p: any) => p.id);
+        let rentalCounts: Record<string, number> = {};
         
-        if (propertyIds.length > 0) {
+        if (vehicleIds.length > 0) {
           try {
-            // Fetch bookings by property_id
-            const { data: bookingsByPropertyId } = await supabase
-              .from('bookings')
-              .select('property_id')
-              .in('property_id', propertyIds);
-            
-            // Fetch bookings by boarding_house_id
-            const { data: bookingsByBoardingHouseId } = await supabase
-              .from('bookings')
-              .select('boarding_house_id')
-              .in('boarding_house_id', propertyIds);
-            
-            // Count bookings by property_id
-            if (bookingsByPropertyId) {
-              bookingsByPropertyId.forEach((booking: any) => {
-                if (booking.property_id) {
-                  bookingCounts[booking.property_id] = (bookingCounts[booking.property_id] || 0) + 1;
+            // Fetch Rentals by vehicle_id
+            const { data: RentalsByvehicleId } = await supabase
+              .from('rentals')
+              .select('vehicle_id')
+              .in('vehicle_id', vehicleIds);
+
+            // Count Rentals by vehicle_id
+            if (RentalsByvehicleId) {
+              RentalsByvehicleId.forEach((rental: any) => {
+                if (rental.vehicle_id) {
+                  rentalCounts[rental.vehicle_id] = (rentalCounts[rental.vehicle_id] || 0) + 1;
                 }
               });
             }
-            
-            // Count bookings by boarding_house_id
-            if (bookingsByBoardingHouseId) {
-              bookingsByBoardingHouseId.forEach((booking: any) => {
-                if (booking.boarding_house_id) {
-                  bookingCounts[booking.boarding_house_id] = (bookingCounts[booking.boarding_house_id] || 0) + 1;
-                }
-              });
-            }
-          } catch (bookingErr) {
-            console.warn('Could not fetch booking counts:', bookingErr);
+          } catch (rentalErr) {
+            console.warn('Could not fetch rental counts:', rentalErr);
           }
         }
 
-        const mapped: Property[] = availableProperties.map((row: any) => {
-          const lat = Number(row.lat);
-          const lng = Number(row.lng);
-          const hasCoords = !Number.isNaN(lat) && !Number.isNaN(lng) && (lat !== 0 || lng !== 0);
-          const coordinates = hasCoords ? { lat, lng } : { lat: 11.7778, lng: 124.8847 };
-          const bookingCount = bookingCounts[row.id] || Number(row.total_bookings) || 0;
+        const mapped: Vehicle[] = availableVehicles.map((row: any) => {
+          const mappedVehicle = mapVehicleRecord(row);
           return {
-          id: row.id,
-          title: row.title,
-          description: row.description,
-          price: row.price,
-          location: row.location,
-          images: Array.isArray(row.images)
-            ? row.images.filter((p: any) => p && String(p).trim() !== '').map((p: any) => toPublicUrl(String(p)))
-            : (row.images && String(row.images).trim() !== '' ? [toPublicUrl(String(row.images))] : []),
-          owner: 'Landlord', // Generic landlord name - no personal info
-          amenities: Array.isArray(row.amenities) ? row.amenities : [],
-          coordinates,
-          rating: Number(row.rating) || 0,
-          totalReviews: Number(row.total_reviews) || 0,
-          isFeatured: Boolean(row.is_featured),
-          isVerified: Boolean(row.is_verified),
-          totalBookings: bookingCount
-        };
+            ...mappedVehicle,
+            images: mappedVehicle.images.map((path) => toPublicUrl(String(path))),
+            totalRentals: rentalCounts[row.id] || mappedVehicle.totalRentals || 0,
+          };
         });
         
-        console.log('🔄 Mapped properties for UI:', mapped);
-        console.log('📱 Setting properties state...');
-        setProperties(mapped);
-        setFilteredProperties(mapped);
-        console.log('✅ Properties state updated successfully');
-        console.log('=== PROPERTIES FETCH DEBUG END ===');
+        console.log('🔄 Mapped Vehicles for UI:', mapped);
+        console.log('📱 Setting Vehicles state...');
+        setVehicles(mapped);
+        setFilteredVehicles(mapped);
+        console.log('✅ Vehicles state updated successfully');
+        console.log('=== Vehicles FETCH DEBUG END ===');
         
       } catch (err) {
-        console.error('❌ CRITICAL ERROR in fetchProperties:', err);
+        console.error('❌ CRITICAL ERROR in fetchVehicles:', err);
         console.error('Error stack:', err);
         // Set empty arrays on error to prevent undefined issues
-        setProperties([]);
-        setFilteredProperties([]);
+        setVehicles([]);
+        setFilteredVehicles([]);
         console.log('🔄 Set empty arrays due to error');
       } finally {
         setLoading(false);
@@ -626,18 +1395,17 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
       }
     };
     
-    console.log('🚀 Starting fetchProperties...');
-    fetchProperties();
+    console.log('🚀 Starting fetchVehicles...');
+    fetchVehicles();
   }, []);
 
-  // Load rooms and beds for a property
-  const loadRoomsAndBeds = async (propertyId: string) => {
+  // Load rooms for a vehicle
+  const loadRoomsAndBeds = async (vehicleId: string) => {
     try {
-      // Try to load from boarding_houses schema first, fallback to properties
       const { data: roomsData, error: roomsError } = await supabase
         .from('rooms')
         .select('*')
-        .eq('boarding_house_id', propertyId)
+        .eq('vehicle_id', vehicleId)
         .eq('status', 'available')
         .order('room_number', { ascending: true });
 
@@ -648,133 +1416,109 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
 
       if (roomsData && roomsData.length > 0) {
         setAvailableRooms(roomsData);
-        
-        // Load beds for the first room by default
-        if (roomsData.length > 0) {
-          const firstRoomId = roomsData[0].id;
-          setSelectedRoomId(firstRoomId);
-          await loadBedsForRoom(firstRoomId);
-        }
+        setSelectedRoomId(roomsData[0].id);
       } else {
-        // Fallback: create a default room structure if rooms table doesn't exist
         setAvailableRooms([]);
-        setAvailableBeds([]);
+        setSelectedRoomId('');
       }
     } catch (error) {
       console.error('Failed to load rooms:', error);
       setAvailableRooms([]);
-      setAvailableBeds([]);
+      setSelectedRoomId('');
     }
   };
 
-  const loadBedsForRoom = async (roomId: string) => {
-    setLoadingBeds(true);
-    setAvailableBeds([]); // Clear previous beds while loading
-    try {
-      // First, get all beds for this room
-      const { data: bedsData, error: bedsError } = await supabase
-        .from('beds')
-        .select('*')
-        .eq('room_id', roomId)
-        .order('bed_number', { ascending: true });
+  const showrentalPreviewModal = async () => {
+    if (!selectedVehicle) return;
 
-      if (bedsError && bedsError.code !== 'PGRST116') {
-        console.error('Error loading beds:', bedsError);
-        setAvailableBeds([]);
-        setLoadingBeds(false);
-        return;
-      }
+    const vehicleAvailable = await verifyVehicleStillAvailable(selectedVehicle.id);
+    if (!vehicleAvailable) return;
 
-      if (bedsData && bedsData.length > 0) {
-        // Check which beds are already booked (have approved bookings)
-        const bedIds = bedsData.map((bed: any) => bed.id);
-        const { data: bookingsData } = await supabase
-          .from('bookings')
-          .select('bed_id, status')
-          .in('bed_id', bedIds)
-          .eq('status', 'approved');
-
-        const bookedBedIds = new Set(
-          (bookingsData || []).map((b: any) => b.bed_id).filter(Boolean)
-        );
-
-        // Filter beds: only show available beds that are not booked
-        const availableBedsList = bedsData.filter((bed: any) => {
-          // Bed must be available AND not have an approved booking
-          return bed.status === 'available' && !bookedBedIds.has(bed.id);
-        });
-
-        // Mark beds with their booking status for display
-        const bedsWithStatus = bedsData.map((bed: any) => ({
-          ...bed,
-          isBooked: bookedBedIds.has(bed.id),
-          canBook: bed.status === 'available' && !bookedBedIds.has(bed.id)
-        }));
-
-        setAvailableBeds(bedsWithStatus);
-        
-        // Auto-select first available and bookable bed
-        const firstAvailableBed = bedsWithStatus.find((bed: any) => bed.canBook);
-        if (firstAvailableBed) {
-          setSelectedBedId(firstAvailableBed.id);
-        } else {
-          setSelectedBedId(''); // Clear selection if no beds available
-        }
-      } else {
-        setAvailableBeds([]);
-      }
-    } catch (error) {
-      console.error('Failed to load beds:', error);
-      setAvailableBeds([]);
-    } finally {
-      setLoadingBeds(false);
+    if (isClientApproved === null) {
+      alert('We are still checking your account approval. Please try again in a moment.');
+      return;
     }
-  };
 
-  const showBookingPreviewModal = () => {
-    if (!selectedProperty) return;
+    if (!isClientApproved) {
+      alert('Your account is waiting for admin approval. You can browse vehicles, but you cannot submit rental requests until an admin approves your account.');
+      return;
+    }
     
-    // Check if property is verified - prevent booking unverified properties
-    if (!selectedProperty.isVerified) {
-      alert('This property is not yet verified by BoardingHub. Only verified properties can be booked for your safety and security.');
+    // Check if vehicle is verified - prevent rental unverified Vehicles
+    if (!selectedVehicle.isVerified) {
+      alert('This vehicle is not yet verified by RideHub. Only verified Vehicles can be rented for your safety and security.');
       return;
     }
     
     // Validate all required fields
-    const fullName = bookingFullName.trim() || bookingName.trim();
-    const email = bookingEmail.trim();
-    const address = bookingAddress.trim();
-    const barangay = bookingBarangay.trim();
-    const municipalityCity = bookingMunicipalityCity.trim();
-    const gender = bookingGender.trim();
-    const age = bookingAge.trim();
-    const citizenship = bookingCitizenship.trim();
-    const occupationStatus = bookingOccupationStatus.trim();
-    const message = bookingMessage.trim();
+    const fullName = rentalFullName.trim() || rentalName.trim();
+    const email = rentalEmail.trim();
+    const address = rentalAddress.trim();
+    const barangay = rentalBarangay.trim();
+    const municipalityCity = rentalMunicipalityCity.trim();
+    const gender = rentalGender.trim();
+    const age = rentalAge.trim();
+    const citizenship = rentalCitizenship.trim();
+    const occupationStatus = rentalOccupationStatus.trim();
 
     if (!fullName || !email || !address || !barangay || !municipalityCity || !gender || !age || !citizenship || !occupationStatus) {
-      alert('Please fill in all required fields: Full Name, Address, Barangay, Municipality/City, Gender, Age, Citizenship, and Occupation Status.');
+      const missing: string[] = [];
+      if (!fullName) missing.push('Full name');
+      if (!email) missing.push('Email');
+      if (!address) missing.push('Address');
+      if (!barangay) missing.push('Barangay');
+      if (!municipalityCity) missing.push('City');
+      if (!gender) missing.push('Gender');
+      if (!age) missing.push('Age');
+      if (!citizenship) missing.push('Citizenship');
+      if (!occupationStatus) missing.push('Occupation');
+      alert(
+        `These details are missing or not saved on your profile yet: ${missing.join(', ')}.\n\nOpen Edit profile from the menu, fill in every field (including Gender, Age, Citizenship, and Occupation / work status), tap Save changes, then try your rental again.`
+      );
       return;
     }
 
-    if (!selectedRoomId || !selectedBedId) {
-      alert('Please select a room and bed space.');
+    // Validate license ID document upload
+    if (!idDocumentFile) {
+      alert('Please upload your license ID (image or PDF) before submitting your rental request.');
       return;
     }
 
-    // Double-check that the selected bed is not occupied
-    const selectedBed = availableBeds.find((bed: any) => bed.id === selectedBedId);
-    if (!selectedBed || selectedBed.status !== 'available' || selectedBed.isBooked) {
-      alert('The selected bed is no longer available. Please select another bed.');
-      // Reload beds to refresh availability
-      loadBedsForRoom(selectedRoomId);
+    const driverLicense = rentalDriverLicense.trim();
+    if (!driverLicense) {
+      alert('Please enter your driver\'s license number (or valid driving permit ID).');
       return;
     }
 
-    // Get selected room and property details
-    const selectedRoom = availableRooms.find((room: any) => room.id === selectedRoomId);
-    
+    if (!rentalCheckInDate || !rentalCheckOutDate) {
+      alert('Please select reservation pick-up and return dates.');
+      return;
+    }
+    if (rentalCheckOutDate < rentalCheckInDate) {
+      alert('Return date must be on or after the pick-up date.');
+      return;
+    }
+
+    if (selectedRentalUnit === 'hour') {
+      if (!hourlyRentalQuote?.valid) {
+        alert(
+          'For hourly rent, set pick-up and return times so the return is after the pick-up (you can use the same calendar day or span multiple days).'
+        );
+        return;
+      }
+    }
+
+    if (reservationScheduleNotice?.variant === 'unavailable') {
+      alert(reservationScheduleNotice.message);
+      return;
+    }
+
     // Prepare preview data
+    const selectedRoom = availableRooms.find((room: any) => room.id === selectedRoomId);
+    const rentalPrice =
+      selectedRentalUnit === 'hour' && hourlyRentalQuote
+        ? hourlyRentalQuote.totalAmount
+        : getRentalRate(selectedVehicle.rentalRates, selectedRentalUnit);
     const previewData = {
       fullName,
       email,
@@ -785,24 +1529,75 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
       age,
       citizenship,
       occupationStatus,
-      message,
-      propertyTitle: selectedProperty.title,
-      propertyLocation: selectedProperty.location,
-      roomNumber: selectedRoom?.room_number || 'N/A',
-      roomName: selectedRoom?.room_name || 'N/A',
-      bedNumber: selectedBed?.bed_number || 'N/A',
-      bedType: selectedBed?.bed_type || 'N/A',
-      price: selectedProperty.price || 0,
-      checkInDate: selectedBed?.check_in_date || 'To be confirmed',
-      checkOutDate: selectedBed?.check_out_date || 'To be confirmed'
+      driverLicense,
+      message: rentalMessage.trim(),
+      paymentMethod: rentalPaymentMethod,
+      vehicleTitle: selectedVehicle.title,
+      vehicleLocation: selectedVehicle.location,
+      roomNumber: selectedRoom?.room_number || 'Standard',
+      roomName: selectedRoom?.room_name || 'Default vehicle slot',
+      rentalUnit: selectedRentalUnit,
+      rentalLabel: RENTAL_UNIT_LABELS[selectedRentalUnit],
+      price: rentalPrice,
+      checkInDate: rentalCheckInDate,
+      checkOutDate: rentalCheckOutDate,
+      ...(selectedRentalUnit === 'hour' && hourlyRentalQuote
+        ? {
+            pickUpTime: rentalPickUpTime,
+            returnTime: rentalReturnTime,
+            billableHours: hourlyRentalQuote.billableHours,
+            hourlyRate: hourlyRentalQuote.hourlyRate
+          }
+        : {})
     };
 
-    setBookingPreviewData(previewData);
-    setShowBookingPreview(true);
+    setRentalAgreementAccepted(false);
+    setrentalPreviewData(previewData);
+    setShowrentalPreview(true);
   };
 
-  const handleBookProperty = async () => {
-    if (!selectedProperty || !bookingPreviewData) return;
+  const handleBookvehicle = async () => {
+    if (!selectedVehicle || !rentalPreviewData) return;
+    if (!rentalAgreementAccepted) {
+      alert('Please read and accept the agreement and conditions before submitting your rental request.');
+      return;
+    }
+
+    const { data: approvedSchedule, error: approvedSchedErr } = await supabase
+      .from('rentals')
+      .select('check_in_date, check_out_date')
+      .eq('vehicle_id', selectedVehicle.id)
+      .eq('status', 'approved');
+    if (!approvedSchedErr && approvedSchedule?.length) {
+      const bad = approvedSchedule.find(
+        (r: { check_in_date: string | null; check_out_date: string | null }) =>
+          r.check_in_date &&
+          r.check_out_date &&
+          reservationRangesOverlap(
+            rentalPreviewData.checkInDate,
+            rentalPreviewData.checkOutDate,
+            r.check_in_date,
+            r.check_out_date
+          )
+      );
+      if (bad) {
+        alert('Those dates are no longer available for this vehicle. Please choose different dates.');
+        return;
+      }
+    }
+
+    const vehicleAvailable = await verifyVehicleStillAvailable(selectedVehicle.id);
+    if (!vehicleAvailable) return;
+
+    if (isClientApproved === null) {
+      alert('We are still checking your account approval. Please try again in a moment.');
+      return;
+    }
+
+    if (!isClientApproved) {
+      alert('Your account is waiting for admin approval. You cannot submit a rental request until an admin approves your account.');
+      return;
+    }
     
     // Extract data from preview
     const {
@@ -815,122 +1610,122 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
       age,
       citizenship,
       occupationStatus,
-      message
-    } = bookingPreviewData;
+      message,
+      paymentMethod,
+      rentalUnit,
+      rentalLabel,
+      checkInDate,
+      checkOutDate
+    } = rentalPreviewData;
+    const rentalPlanNote = buildRentalPlanNote(rentalUnit);
+    const paymentNote = `Payment Method: ${paymentMethod || 'Cash'}`;
+    const reservationNote =
+      rentalPreviewData.rentalUnit === 'hour' &&
+      rentalPreviewData.pickUpTime != null &&
+      rentalPreviewData.returnTime != null &&
+      rentalPreviewData.billableHours != null &&
+      rentalPreviewData.hourlyRate != null
+        ? `Reservation: Pick-up ${checkInDate} ${rentalPreviewData.pickUpTime} → Return ${checkOutDate} ${rentalPreviewData.returnTime} (${rentalPreviewData.billableHours} h × ₱${Number(rentalPreviewData.hourlyRate).toLocaleString()}/hr)`
+        : `Reservation: Pick-up ${checkInDate}, Return ${checkOutDate}`;
+    const clientNote = message ? `Client Note: ${message}` : '';
+    const licenseNote =
+      rentalPreviewData.driverLicense != null && String(rentalPreviewData.driverLicense).trim() !== ''
+        ? `Driver license: ${String(rentalPreviewData.driverLicense).trim()}`
+        : '';
+    const specialRequests = [rentalPlanNote, reservationNote, paymentNote, licenseNote, clientNote]
+      .filter(Boolean)
+      .join('\n');
 
-    // Get selected bed (re-check availability)
-    const selectedBed = availableBeds.find((bed: any) => bed.id === selectedBedId);
-    if (!selectedBed || selectedBed.status !== 'available' || selectedBed.isBooked) {
-      alert('The selected bed is no longer available. Please select another bed.');
-      // Reload beds to refresh availability
-      await loadBedsForRoom(selectedRoomId);
-      setShowBookingPreview(false);
-      return;
-    }
     try {
-      // Try to insert into new bookings schema with all fields
-      const bookingData: any = {
-        boarding_house_id: selectedProperty.id,
-        property_id: selectedProperty.id, // Fallback for old schema
+      const rentalData: Record<string, unknown> = {
+        vehicle_id: selectedVehicle.id,
         tenant_email: email,
-        room_id: selectedRoomId,
-        bed_id: selectedBedId,
+        room_id: selectedRoomId || null,
         full_name: fullName,
-        address: address,
-        barangay: barangay,
+        address,
+        barangay,
         municipality_city: municipalityCity,
-        gender: gender,
+        gender,
         age: parseInt(age),
-        citizenship: citizenship,
+        citizenship,
         occupation_status: occupationStatus,
-        client_name: fullName, // Fallback for old schema
-        client_email: email, // Fallback for old schema
-        message: message,
+        driver_license: (() => {
+          const v = rentalPreviewData.driverLicense != null ? String(rentalPreviewData.driverLicense).trim() : '';
+          return v ? v.slice(0, 255) : null;
+        })(),
+        special_requests: specialRequests,
+        check_in_date: checkInDate,
+        check_out_date: checkOutDate,
         status: 'pending',
-        total_amount: selectedProperty.price || 0
+        total_amount: rentalPreviewData.price || 0,
+        rental_unit: rentalPreviewData.rentalUnit ?? null
       };
 
-      const { error } = await supabase
-        .from('bookings')
-        .insert([bookingData]);
-      
-      if (error) {
-        // If error, try with minimal fields for backward compatibility
-        console.warn('Full booking insert failed, trying minimal fields:', error);
-        const { error: fallbackError } = await supabase
-          .from('bookings')
-          .insert([
-            {
-              property_id: selectedProperty.id,
-              client_name: fullName,
-              client_email: email,
-              message: `${message}\n\nAdditional Info:\nAddress: ${address}, ${barangay}, ${municipalityCity}\nGender: ${gender}, Age: ${age}\nCitizenship: ${citizenship}, Occupation: ${occupationStatus}`,
-              status: 'pending',
-              total_amount: selectedProperty.price || 0
-            }
-          ]);
-        if (fallbackError) throw fallbackError;
+      if (rentalPreviewData.rentalUnit === 'hour') {
+        rentalData.pick_up_time = rentalPreviewData.pickUpTime ?? null;
+        rentalData.return_time = rentalPreviewData.returnTime ?? null;
+        rentalData.billable_hours = rentalPreviewData.billableHours ?? null;
+        rentalData.hourly_rate_snapshot = rentalPreviewData.hourlyRate ?? null;
       }
 
+      const { error } = await supabase.from('rentals').insert([rentalData]);
+      
+      if (error) throw error;
+
       try {
-        console.log('Fetching owner email for property:', selectedProperty.id);
+        console.log('Fetching owner email for vehicle:', selectedVehicle.id);
         const { data: propMeta, error: propError } = await supabase
-          .from('properties')
+          .from('vehicles')
           .select('owner_email, title')
-          .eq('id', selectedProperty.id)
+          .eq('id', selectedVehicle.id)
           .single();
         
-        if (propError) console.error('Error fetching property owner info:', propError);
+        if (propError) console.error('Error fetching vehicle owner info:', propError);
 
         const ownerEmail = (propMeta as any)?.owner_email || '';
-        const propertyTitle = (propMeta as any)?.title || selectedProperty.title;
+        const vehicleTitle = (propMeta as any)?.title || selectedVehicle.title;
         
         console.log('Owner Email found:', ownerEmail);
 
         if (ownerEmail && ownerEmail.trim() !== '') {
-          console.log(`Attempting to send landlord email to: "${ownerEmail}"`);
-          const emailResult = await sendLandlordBookingEmail({
+          console.log(`Attempting to send owner email to: "${ownerEmail}"`);
+          const reservationLine =
+            rentalPreviewData.rentalUnit === 'hour' &&
+            rentalPreviewData.pickUpTime != null &&
+            rentalPreviewData.returnTime != null &&
+            rentalPreviewData.billableHours != null &&
+            rentalPreviewData.hourlyRate != null
+              ? `Reservation: Pick-up ${checkInDate} ${rentalPreviewData.pickUpTime} → Return ${checkOutDate} ${rentalPreviewData.returnTime} (${rentalPreviewData.billableHours} h × PHP ${Number(rentalPreviewData.hourlyRate).toLocaleString()}/hr)`
+              : `Reservation: Pick-up ${checkInDate} → Return ${checkOutDate}`;
+          const emailResult = await sendOwnerRentalEmail({
             toEmail: ownerEmail.trim(),
-            ownerName: 'Landlord',
-            propertyTitle,
+            ownerName: 'Owner',
+            vehicleTitle,
             clientName: fullName,
             clientEmail: email,
-            message: `Booking Request Details:\n\nFull Name: ${fullName}\nAddress: ${address}, ${barangay}, ${municipalityCity}\nGender: ${gender}\nAge: ${age}\nCitizenship: ${citizenship}\nOccupation Status: ${occupationStatus}\n\nMessage: ${message}`,
+            message: `rental Request Details:\n\n${reservationLine}\nRental Plan: ${rentalLabel}\nQuoted Amount: PHP ${Number(rentalPreviewData.price || 0).toLocaleString()}\nPayment Method: ${paymentMethod || 'Cash'}\nFull Name: ${fullName}\nDriver license: ${rentalPreviewData.driverLicense != null ? String(rentalPreviewData.driverLicense).trim() : '—'}\nAddress: ${address}, ${barangay}, ${municipalityCity}\nGender: ${gender}\nAge: ${age}\nCitizenship: ${citizenship}\nOccupation Status: ${occupationStatus}${message ? `\n\nMessage: ${message}` : ''}`,
           });
           
           if (!emailResult.success) {
             console.error('Email sending failed:', emailResult.error);
-            alert(`Booking saved, but email notification failed: ${emailResult.error?.text || 'Unknown error'}`);
+            alert(`rental saved, but email notification failed: ${emailResult.error?.text || 'Unknown error'}`);
           }
         } else {
             console.warn('No owner email found, skipping email notification.');
         }
       } catch (emailErr) {
-        console.error('Failed to send landlord booking email:', emailErr);
+        console.error('Failed to send owner rental email:', emailErr);
       }
-      alert('Booking request sent successfully!');
-      setShowBookingForm(false);
-      setBookingMessage('');
-      setBookingName('');
-      setBookingEmail('');
-      setBookingFullName('');
-      setBookingAddress('');
-      setBookingBarangay('');
-      setBookingMunicipalityCity('');
-      setBookingGender('');
-      setBookingAge('');
-      setBookingCitizenship('');
-      setBookingOccupationStatus('');
-      setSelectedRoomId('');
-      setSelectedBedId('');
-      setAvailableRooms([]);
-      
-      // Refresh bookings list
-      await loadMyBookings();
-      setAvailableBeds([]);
+      alert('rental request sent successfully!');
+      resetrentalWorkflow();
+      setSelectedVehicle(null);
+      setShowMaps(false);
+
+      // Refresh Rentals list
+      await loadMyRentals();
     } catch (err: any) {
-      console.error('Booking failed', err);
-      alert(`Failed to send booking request: ${err?.message || 'Unknown error'}`);
+      console.error('rental failed', err);
+      alert(`Failed to send rental request: ${err?.message || 'Unknown error'}`);
     }
   };
 
@@ -967,40 +1762,40 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
 
   // Search and filter functions
   const applyFilters = () => {
-    let filtered = properties;
-    console.log('Applying filters:', { searchLocation, searchFilters, totalProperties: properties.length });
+    let filtered = vehicles;
+    console.log('Applying filters:', { searchLocation, searchFilters, totalVehicles: vehicles.length });
 
     // Location filter (includes title, location, and description)
     if (searchLocation.trim()) {
-      filtered = filtered.filter(property =>
-        property.location.toLowerCase().includes(searchLocation.toLowerCase()) ||
-        property.title.toLowerCase().includes(searchLocation.toLowerCase()) ||
-        (property.description && property.description.toLowerCase().includes(searchLocation.toLowerCase()))
+      filtered = filtered.filter(vehicle =>
+        vehicle.location.toLowerCase().includes(searchLocation.toLowerCase()) ||
+        vehicle.title.toLowerCase().includes(searchLocation.toLowerCase()) ||
+        (vehicle.description && vehicle.description.toLowerCase().includes(searchLocation.toLowerCase()))
       );
     }
 
     // Price filter
-    filtered = filtered.filter(property =>
-      property.price >= searchFilters.minPrice && property.price <= searchFilters.maxPrice
+    filtered = filtered.filter(vehicle =>
+      vehicle.price >= searchFilters.minPrice && vehicle.price <= searchFilters.maxPrice
     );
 
     // Rating filter
     if (searchFilters.minRating > 0) {
-      filtered = filtered.filter(property =>
-        (property.rating || 0) >= searchFilters.minRating
+      filtered = filtered.filter(vehicle =>
+        (vehicle.rating || 0) >= searchFilters.minRating
       );
     }
 
-    // Amenities filter - Fixed to handle array properly
-    if (searchFilters.amenities.length > 0) {
-      filtered = filtered.filter(property => {
-        if (!property.amenities || !Array.isArray(property.amenities) || property.amenities.length === 0) {
+    // Features filter - Fixed to handle array properly
+    if (searchFilters.features.length > 0) {
+      filtered = filtered.filter(vehicle => {
+        if (!vehicle.features || !Array.isArray(vehicle.features) || vehicle.features.length === 0) {
           return false;
         }
-        // Check if property has all selected amenities
-        return searchFilters.amenities.every(amenity =>
-          property.amenities.some((propAmenity: string) => 
-            propAmenity.toLowerCase().trim() === amenity.toLowerCase().trim()
+        // Check if vehicle has all selected features
+        return searchFilters.features.every(feature =>
+          vehicle.features.some((vehicleFeature: string) => 
+            vehicleFeature.toLowerCase().trim() === feature.toLowerCase().trim()
           )
         );
       });
@@ -1008,38 +1803,38 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
 
     // Sort by priority: most frequently booked first, then featured, then rating
     filtered.sort((a, b) => {
-      // First priority: Most frequently booked (totalBookings)
-      const bookingsA = a.totalBookings || 0;
-      const bookingsB = b.totalBookings || 0;
-      if (bookingsB !== bookingsA) {
-        return bookingsB - bookingsA;
+      // First priority: Most frequently booked (totalRentals)
+      const RentalsA = a.totalRentals || 0;
+      const RentalsB = b.totalRentals || 0;
+      if (RentalsB !== RentalsA) {
+        return RentalsB - RentalsA;
       }
-      // Second priority: Featured properties
+      // Second priority: Featured Vehicles
       if (a.isFeatured && !b.isFeatured) return -1;
       if (!a.isFeatured && b.isFeatured) return 1;
       // Third priority: Rating
       return (b.rating || 0) - (a.rating || 0);
     });
 
-    console.log('Filtered results:', filtered.length, 'properties');
-    setFilteredProperties(filtered);
+    console.log('Filtered results:', filtered.length, 'vehicles');
+    setFilteredVehicles(filtered);
   };
 
-  // Load reviews for a property
-  const loadReviews = async (propertyId: string) => {
+  // Load reviews for a vehicle
+  const loadReviews = async (vehicleId: string) => {
     try {
       const { data: reviewsData, error } = await supabase
         .from('reviews')
-        .select('id, client_name, rating, review_text, created_at')
-        .eq('property_id', propertyId)
+        .select('id, tenant_email, rating, review_text, created_at')
+        .eq('vehicle_id', vehicleId)
         .order('created_at', { ascending: false });
       
       if (error) throw error;
       
       const mappedReviews: Review[] = (reviewsData || []).map((r: any) => ({
         id: r.id,
-        propertyId: propertyId,
-        clientName: r.client_name,
+        vehicleId: vehicleId,
+        clientName: r.tenant_email || 'Client',
         rating: r.rating,
         reviewText: r.review_text,
         createdAt: r.created_at
@@ -1047,11 +1842,11 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
       
       setReviews(mappedReviews);
       
-      // Update selected property rating if reviews exist
-      if (mappedReviews.length > 0 && selectedProperty && selectedProperty.id === propertyId) {
+      // Update selected vehicle rating if reviews exist
+      if (mappedReviews.length > 0 && selectedVehicle && selectedVehicle.id === vehicleId) {
         const totalRating = mappedReviews.reduce((sum, r) => sum + (r.rating || 0), 0);
         const averageRating = totalRating / mappedReviews.length;
-        setSelectedProperty(prev => prev ? {
+        setSelectedVehicle(prev => prev ? {
           ...prev,
           rating: averageRating,
           totalReviews: mappedReviews.length
@@ -1066,8 +1861,10 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
   const testDatabaseConnection = async () => {
     try {
       console.log('Testing database connection...');
-      console.log('Supabase URL:', process.env.REACT_APP_SUPABASE_URL || 'https://jlahqyvpgdntlqfpxvoz.supabase.co');
-      console.log('Supabase Key (first 20 chars):', (process.env.REACT_APP_SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpsYWhxeXZwZ2RudGxxZnB4dm96Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTczMzY1MTAsImV4cCI6MjA3MjkxMjUxMH0.UrNCmuMXv9nPI8oXKD79aYzKI8VQnfWvprKIafk9hPg').substring(0, 20) + '...');
+      const configuredUrl = process.env.REACT_APP_SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '';
+      const configuredKey = process.env.REACT_APP_SUPABASE_ANON_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
+      console.log('Supabase URL:', configuredUrl || 'Not set');
+      console.log('Supabase Key (first 20 chars):', configuredKey ? configuredKey.substring(0, 20) + '...' : 'Not set');
       
       // Test 1: Basic connection
       const { data: testData, error: testError } = await supabase
@@ -1108,16 +1905,16 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
     }
   };
 
-  // Submit review (only allowed after booking approval)
+  // Submit review (only allowed after rental approval)
   const submitReview = async () => {
-    if (!selectedProperty || !reviewText.trim()) {
+    if (!selectedVehicle || !reviewText.trim()) {
       alert('Please provide a review text');
       return;
     }
 
     // Validate required fields
-    const reviewClientEmail = bookingEmail || clientEmail;
-    const reviewClientName = bookingFullName || bookingName || 'Anonymous';
+    const reviewClientEmail = rentalEmail || clientEmail;
+    const reviewClientName = rentalFullName || rentalName || 'Anonymous';
     
     if (!reviewClientEmail) {
       alert('Please provide your email address to submit a review');
@@ -1125,61 +1922,56 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
     }
 
     try {
-      // Check if user has an approved booking for this property
-      console.log('Checking for approved booking...');
-      const { data: approvedBookings, error: bookingCheckError } = await supabase
-        .from('bookings')
+      // Check if user has an approved rental for this vehicle
+      console.log('Checking for approved rental...');
+      const { data: approvedRentals, error: rentalCheckError } = await supabase
+        .from('rentals')
         .select('id, status')
-        .eq('property_id', selectedProperty.id)
-        .or(`client_email.eq.${reviewClientEmail},tenant_email.eq.${reviewClientEmail}`)
+        .eq('vehicle_id', selectedVehicle.id)
+        .eq('tenant_email', reviewClientEmail)
         .eq('status', 'approved')
         .limit(1);
 
-      if (bookingCheckError) {
-        console.error('Error checking bookings:', bookingCheckError);
-        alert('Unable to verify your booking status. Please try again later or contact support.');
+      if (rentalCheckError) {
+        console.error('Error checking Rentals:', rentalCheckError);
+        alert('Unable to verify your rental status. Please try again later or contact support.');
         return;
       }
 
-      if (!approvedBookings || approvedBookings.length === 0) {
-        setReviewErrorMessage('You can only submit a review if your booking request has been approved by the landlord. Please wait for your booking to be approved first.');
+      if (!approvedRentals || approvedRentals.length === 0) {
+        setReviewErrorMessage('You can only submit a review if your rental request has been approved by the owner. Please wait for your rental to be approved first.');
         setShowReviewErrorModal(true);
         return;
       }
 
-      const approvedBookingId = approvedBookings[0]?.id;
+      const approvedrentalId = approvedRentals[0]?.id;
 
-      // Test database connection first
+      // Test system connection first
       const connectionOk = await testDatabaseConnection();
       if (!connectionOk) {
-        alert('Database connection failed. Please try again later.');
+        alert('System connection failed. Please try again later.');
         return;
       }
 
       console.log('Submitting review with data:', {
-        booking_id: approvedBookingId,
-        property_id: selectedProperty.id,
-        client_name: reviewClientName,
-        client_email: reviewClientEmail,
+        rental_id: approvedrentalId,
+        vehicle_id: selectedVehicle.id,
+        tenant_email: reviewClientEmail,
         rating: reviewRating,
         review_text: reviewText.trim(),
         is_verified: true
       });
 
-      // Try to insert with booking_id first (new schema), fallback to property_id (old schema)
       const reviewData: any = {
-        property_id: selectedProperty.id,
-        boarding_house_id: selectedProperty.id,
-        client_name: reviewClientName,
-        client_email: reviewClientEmail,
+        vehicle_id: selectedVehicle.id,
         tenant_email: reviewClientEmail,
         rating: reviewRating,
         review_text: reviewText.trim(),
         is_verified: true
       };
 
-      if (approvedBookingId) {
-        reviewData.booking_id = approvedBookingId;
+      if (approvedrentalId) {
+        reviewData.rental_id = approvedrentalId;
       }
 
       const { data, error } = await supabase
@@ -1198,7 +1990,7 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
         const { data: allReviews, error: reviewsError } = await supabase
           .from('reviews')
           .select('rating')
-        .eq('property_id', selectedProperty.id)
+        .eq('vehicle_id', selectedVehicle.id)
         .eq('is_verified', true);
       
       let calculatedRating = 0;
@@ -1210,106 +2002,92 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
         calculatedTotalReviews = allReviews.length;
         console.log('📊 Calculated rating from reviews:', calculatedRating, 'total reviews:', calculatedTotalReviews);
           
-        // Update property rating in database (fallback if trigger didn't run)
+        // Update vehicle rating in database (fallback if trigger didn't run)
           await supabase
-            .from('properties')
+            .from('vehicles')
             .update({
             rating: calculatedRating,
             total_reviews: calculatedTotalReviews
             })
-            .eq('id', selectedProperty.id);
+            .eq('id', selectedVehicle.id);
       }
       
       // Wait a moment for database operations to complete
       await new Promise(resolve => setTimeout(resolve, 300));
       
-      // Refresh properties list to get updated ratings from database
+      // Refresh Vehicles list to get updated ratings from database
       try {
-        const { data: allUpdatedProperties, error: refreshError } = await supabase
-            .from('properties')
+        const { data: allUpdatedVehicles, error: refreshError } = await supabase
+            .from('vehicles')
             .select('*')
           .order('created_at', { ascending: false });
           
-        if (!refreshError && allUpdatedProperties) {
+        if (!refreshError && allUpdatedVehicles) {
             const toPublicUrl = (path: string) => {
               if (!path) return path;
               if (/^https?:\/\//i.test(path)) return path;
-              const res = supabase.storage.from('property-images').getPublicUrl(path);
+              const res = supabase.storage.from('vehicle-images').getPublicUrl(path);
               return res.data?.publicUrl || path;
             };
             
-          // Filter for available properties (only show verified/approved properties, not pending)
-          const availableProperties = (allUpdatedProperties || []).filter((prop: any) => {
+          // Filter for available Vehicles (only show verified/approved Vehicles, not pending)
+          const availableVehicles = (allUpdatedVehicles || []).filter((prop: any) => {
               const status = (prop?.status ? String(prop.status) : '').toLowerCase();
-              // Only show available/active/vacant properties (pending properties require admin verification)
+              // Only show available/active/vacant Vehicles (pending Vehicles require admin verification)
               return status === 'available' || status === 'active' || status === 'vacant';
             });
             
-            const mapped: Property[] = availableProperties.map((row: any) => {
-              const lat = Number(row.lat);
-              const lng = Number(row.lng);
-              const hasCoords = !Number.isNaN(lat) && !Number.isNaN(lng) && (lat !== 0 || lng !== 0);
-              const coordinates = hasCoords ? { lat, lng } : { lat: 11.7778, lng: 124.8847 };
-            
-            // Use calculated rating if database rating is 0 or missing
-            let finalRating = Number(row.rating) || 0;
-            let finalTotalReviews = Number(row.total_reviews) || 0;
-            
-            if (row.id === selectedProperty.id && calculatedRating > 0) {
-              // For the property we just reviewed, use calculated values if DB values are stale
-              if (finalRating === 0 || finalTotalReviews === 0) {
-                finalRating = calculatedRating;
-                finalTotalReviews = calculatedTotalReviews;
-                console.log('🔄 Using calculated rating for property:', row.title, finalRating);
+            const mapped: Vehicle[] = availableVehicles.map((row: any) => {
+              // Use calculated rating if database rating is 0 or missing
+              let finalRating = Number(row.rating) || 0;
+              let finalTotalReviews = Number(row.total_reviews) || 0;
+              
+              if (row.id === selectedVehicle.id && calculatedRating > 0) {
+                // For the vehicle we just reviewed, use calculated values if DB values are stale
+                if (finalRating === 0 || finalTotalReviews === 0) {
+                  finalRating = calculatedRating;
+                  finalTotalReviews = calculatedTotalReviews;
+                  console.log('🔄 Using calculated rating for vehicle:', row.title, finalRating);
+                }
               }
-            }
-            
+
+              const mappedVehicle = mapVehicleRecord(row);
+              
               return {
-                id: row.id,
-                title: row.title,
-                description: row.description,
-                price: row.price,
-                location: row.location,
-                images: Array.isArray(row.images)
-                  ? row.images.filter((p: any) => p && String(p).trim() !== '').map((p: any) => toPublicUrl(String(p)))
-                  : (row.images && String(row.images).trim() !== '' ? [toPublicUrl(String(row.images))] : []),
-                owner: 'Landlord',
-                amenities: Array.isArray(row.amenities) ? row.amenities : [],
-                coordinates,
-              rating: finalRating,
-              totalReviews: finalTotalReviews,
-                isFeatured: Boolean(row.is_featured),
-                isVerified: Boolean(row.is_verified)
+                ...mappedVehicle,
+                images: mappedVehicle.images.map((path) => toPublicUrl(String(path))),
+                rating: finalRating,
+                totalReviews: finalTotalReviews,
               };
             });
           
-          console.log('🔄 Refreshing properties after review submission');
-          console.log('📊 Updated properties with ratings:', mapped.map(p => ({ 
+          console.log('🔄 Refreshing Vehicles after review submission');
+          console.log('📊 Updated Vehicles with ratings:', mapped.map(p => ({ 
             id: p.id, 
             title: p.title, 
             rating: p.rating, 
             totalReviews: p.totalReviews 
           })));
           
-            setProperties(mapped);
-          setFilteredProperties(mapped);
+            setVehicles(mapped);
+          setFilteredVehicles(mapped);
           
-          // Update selected property with fresh data
-          const updatedProperty = mapped.find(p => p.id === selectedProperty.id);
-          if (updatedProperty) {
-            setSelectedProperty(updatedProperty);
-            console.log('✅ Updated selected property rating:', updatedProperty.rating, 'reviews:', updatedProperty.totalReviews);
+          // Update selected vehicle with fresh data
+          const updatedvehicle = mapped.find(p => p.id === selectedVehicle.id);
+          if (updatedvehicle) {
+            setSelectedVehicle(updatedvehicle);
+            console.log('✅ Updated selected vehicle rating:', updatedvehicle.rating, 'reviews:', updatedvehicle.totalReviews);
           }
           
-            // Trigger filter update to refresh filtered properties
+            // Trigger filter update to refresh filtered Vehicles
             setTimeout(() => {
               applyFilters();
             }, 100);
         } else if (refreshError) {
-          console.error('❌ Error refreshing properties:', refreshError);
+          console.error('❌ Error refreshing Vehicles:', refreshError);
           }
       } catch (refreshError) {
-        console.error('Failed to refresh properties:', refreshError);
+        console.error('Failed to refresh Vehicles:', refreshError);
       }
       
       alert('Review submitted successfully! Your review is now visible.');
@@ -1318,7 +2096,7 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
       setReviewRating(5);
       
       // Reload reviews
-      loadReviews(selectedProperty.id);
+      loadReviews(selectedVehicle.id);
     } catch (error) {
       console.error('Failed to submit review:', error);
       console.error('Error type:', typeof error);
@@ -1340,29 +2118,31 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
     }
   };
 
-  // Load reviews when property is selected
+  // Load reviews when vehicle is selected
   useEffect(() => {
-    if (selectedProperty && !showMaps && !showBookingForm) {
-      loadReviews(selectedProperty.id);
+    if (selectedVehicle && !showMaps && !showRentalForm) {
+      loadReviews(selectedVehicle.id);
     }
-  }, [selectedProperty?.id, showMaps, showBookingForm]);
+  }, [selectedVehicle?.id, showMaps, showRentalForm]);
 
-  // Load rooms and beds when booking form is opened
+  // Load rooms and beds when rental form is opened
   useEffect(() => {
-    if (showBookingForm && selectedProperty) {
-      loadRoomsAndBeds(selectedProperty.id);
+    if (showRentalForm && selectedVehicle) {
+      loadRoomsAndBeds(selectedVehicle.id);
     }
-  }, [showBookingForm, selectedProperty?.id]);
+  }, [showRentalForm, selectedVehicle?.id]);
 
   // Apply filters when search or filters change
   useEffect(() => {
     applyFilters();
-  }, [searchLocation, searchFilters, properties]);
+  }, [searchLocation, searchFilters, vehicles]);
 
-  const openConversation = async (conversation: { id: string; property_id: string; owner_email: string; client_email: string }) => {
+  const openConversation = async (conversation: { id: string; vehicle_id: string; owner_email: string; client_email: string }) => {
     try {
-      // Verify this conversation belongs to the current tenant
-      if (conversation.client_email !== clientEmail) {
+      // Verify this conversation belongs to the current tenant (RLS uses JWT email; compare case-insensitively)
+      if (
+        (conversation.client_email || '').trim().toLowerCase() !== (clientEmail || '').trim().toLowerCase()
+      ) {
         alert('You can only access your own conversations.');
         return;
       }
@@ -1382,26 +2162,204 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
       const channel = supabase
         .channel(`messages-${conversation.id}`)
         .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `conversation_id=eq.${conversation.id}` }, (payload: any) => {
-          setChatMessages(prev => [...prev, payload.new as any]);
+          setChatMessages((prev) => mergeMessageById(prev, payload.new as ChatMessageRow));
           setTimeout(scrollMessagesToBottom, 0);
         })
         .subscribe();
       setChatChannel(channel);
-    } catch (e) {
+    } catch (e: any) {
       console.error('Open conversation failed', e);
-      alert('Failed to open chat');
+      const detail =
+        e?.message ||
+        e?.error_description ||
+        (typeof e === 'string' ? e : e ? JSON.stringify(e) : '');
+      alert(
+        `Failed to open chat${detail ? `: ${detail}` : ''}\n\nIf it says relation or 42P01, run chat_conversations_messages.sql in Supabase.`
+      );
     } finally {
       setChatLoading(false);
     }
   };
 
+  const sendClientChatMessage = async () => {
+    if (!activeConversation) return;
+    const content = chatInput.trim();
+    if (!content) return;
+    try {
+      const [{ data: authData }, { data: sessionData }] = await Promise.all([
+        supabase.auth.getUser(),
+        supabase.auth.getSession(),
+      ]);
+      const senderEmail = (
+        sessionData?.session?.user?.email ||
+        authData?.user?.email ||
+        clientEmail ||
+        ''
+      ).trim();
+      if (!senderEmail) {
+        alert('Sign in to send messages.');
+        return;
+      }
+      const { data: inserted, error } = await supabase
+        .from('messages')
+        .insert([
+          {
+            conversation_id: activeConversation.id,
+            sender_email: senderEmail,
+            content,
+          },
+        ])
+        .select('id, conversation_id, sender_email, content, created_at')
+        .single();
+      if (error) throw error;
+      notifyChatRecipientNonBlocking(activeConversation.id, content, senderEmail);
+      setChatInput('');
+      setChatMessages((prev) => mergeMessageById(prev, inserted as ChatMessageRow));
+      setTimeout(scrollMessagesToBottom, 0);
+    } catch (err: unknown) {
+      console.error('Send message failed', err);
+      const e = err as { message?: string; code?: string; details?: string; hint?: string };
+      const parts = [
+        e.message || 'Failed to send message.',
+        e.code ? `Code: ${e.code}` : '',
+        e.details ? `Details: ${e.details}` : '',
+        e.hint ? `Hint: ${e.hint}` : '',
+      ].filter(Boolean);
+      alert(
+        `${parts.join('\n')}\n\nRe-run the latest chat_conversations_messages.sql in Supabase (adds chat_session_email_norm). Your login email must match this chat’s renter email on the conversation.`
+      );
+    }
+  };
+
+  /** Open or create owner ↔ renter chat for a vehicle (notifications + My Rentals). */
+  const openTenantChatForVehicle = async (vehicleId: string | null | undefined) => {
+    if (!clientEmail?.trim()) {
+      alert('Sign in to use chat.');
+      return;
+    }
+    if (!vehicleId) {
+      alert('Chat is not available for this rental (no vehicle linked).');
+      return;
+    }
+    setShowNotif(false);
+    try {
+      const { data: convs, error: convErr } = await supabase
+        .from('conversations')
+        .select('*')
+        .eq('vehicle_id', vehicleId)
+        .order('created_at', { ascending: false });
+      if (convErr) throw convErr;
+      const clientLower = clientEmail.trim().toLowerCase();
+      let conversation =
+        (convs || []).find(
+          (c: { client_email?: string }) =>
+            (c.client_email || '').trim().toLowerCase() === clientLower
+        ) || null;
+      if (!conversation) {
+        const { data: propRow, error: propErr } = await supabase
+          .from('vehicles')
+          .select('owner_email')
+          .eq('id', vehicleId)
+          .single();
+        if (propErr) throw propErr;
+        const ownerEmailFromVehicle = (propRow as { owner_email?: string })?.owner_email || '';
+        if (!ownerEmailFromVehicle) {
+          alert('Chat is not available yet. Please try again later.');
+          return;
+        }
+        const { data: created, error: insErr } = await supabase
+          .from('conversations')
+          .insert([{ vehicle_id: vehicleId, owner_email: ownerEmailFromVehicle, client_email: clientEmail }])
+          .select('*')
+          .single();
+        if (insErr) throw insErr;
+        conversation = created;
+      }
+      if (
+        (conversation.client_email || '').trim().toLowerCase() !== clientEmail.trim().toLowerCase()
+      ) {
+        alert('You can only access your own conversations.');
+        return;
+      }
+      setActiveConversation(conversation);
+      setChatOpen(true);
+      setChatLoading(true);
+      const { data: msgs, error: msgErr } = await supabase
+        .from('messages')
+        .select('*')
+        .eq('conversation_id', conversation.id)
+        .order('created_at', { ascending: true });
+      if (msgErr) throw msgErr;
+      setChatMessages(msgs || []);
+      setTimeout(scrollMessagesToBottom, 0);
+      if (chatChannel) {
+        try {
+          chatChannel.unsubscribe();
+        } catch {
+          /* ignore */
+        }
+        setChatChannel(null);
+      }
+      const channel = supabase
+        .channel(`messages-${conversation.id}`)
+        .on(
+          'postgres_changes',
+          { event: 'INSERT', schema: 'public', table: 'messages', filter: `conversation_id=eq.${conversation.id}` },
+          (payload: { new: Record<string, unknown> }) => {
+            setChatMessages((prev) => mergeMessageById(prev, payload.new as ChatMessageRow));
+            setTimeout(scrollMessagesToBottom, 0);
+          }
+        )
+        .subscribe();
+      setChatChannel(channel);
+    } catch (e: unknown) {
+      console.error('Open chat (tenant) failed', e);
+      const err = e as { message?: string; error_description?: string };
+      const detail =
+        err?.message ||
+        err?.error_description ||
+        (typeof e === 'string' ? e : e ? JSON.stringify(e) : '');
+      alert(
+        `Failed to open chat${detail ? `: ${detail}` : ''}\n\nIf it says relation or 42P01, run chat_conversations_messages.sql in Supabase.`
+      );
+    } finally {
+      setChatLoading(false);
+    }
+  };
+
+  const unreadNotificationCount = notifications.filter((notification) => !notification.read_at).length;
+  const pendingRentalCount = myRentals.filter((rental) => rental.status === 'pending').length;
+  const approvedRentalCount = myRentals.filter((rental) => rental.status === 'approved').length;
+  const featuredVehicleCount = vehicles.filter((vehicle) => vehicle.isFeatured).length;
+  const topRatedVehicleCount = vehicles.filter((vehicle) => (vehicle.rating || 0) >= 4.5).length;
+  const activeFilterCount = [
+    searchLocation.trim().length > 0,
+    searchFilters.minPrice > 0,
+    searchFilters.maxPrice < 50000,
+    searchFilters.minRating > 0,
+    searchFilters.features.length > 0,
+    searchFilters.location.trim().length > 0,
+  ].filter(Boolean).length;
+  const ratedVehicles = vehicles.filter((vehicle) => (vehicle.rating || 0) > 0);
+  const averageVehicleRating = ratedVehicles.length
+    ? (ratedVehicles.reduce((sum, vehicle) => sum + (vehicle.rating || 0), 0) / ratedVehicles.length).toFixed(1)
+    : '0.0';
+  const approvalLabel =
+    isClientApproved === null ? 'Syncing approval' : isClientApproved ? 'Approved to rent' : 'Pending admin review';
+  const approvalTone =
+    isClientApproved === null
+      ? 'bg-amber-100 text-amber-800'
+      : isClientApproved
+      ? 'bg-emerald-100 text-emerald-800'
+      : 'bg-slate-200 text-slate-700';
+
   return (
-    <div className="min-h-screen w-screen bg-white overflow-y-auto">
+    <div className="dashboard-bento-shell min-h-screen w-screen overflow-y-auto">
         {/* Top Orange Bar */}
         <div className="w-full h-1 bg-gradient-to-r from-primary-500 via-primary-600 to-primary-700"></div>
         
         {/* Location Header - Glassmorphism */}
-        <div className="backdrop-blur-xl bg-white/70 border-b border-white/20 px-3 sm:px-6 py-3 sm:py-4 flex-shrink-0 sticky top-0 z-40 shadow-sm">
+        <div className="dashboard-bento-toolbar px-3 sm:px-6 py-3 sm:py-4 flex-shrink-0 sticky top-0 z-[90]">
           <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between w-full gap-3 sm:gap-4">
             <div className="flex items-center space-x-2 sm:space-x-4 w-full lg:w-auto">
               <div className="flex-1 lg:flex-none">
@@ -1426,7 +2384,7 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                 <div className="relative flex-1 sm:flex-none w-full sm:w-64">
                   <input
                     type="text"
-                    placeholder="Search properties..."
+                    placeholder="Search Vehicles..."
                     value={searchLocation}
                     onChange={(e) => setSearchLocation(e.target.value)}
                     onKeyDown={(e) => {
@@ -1474,36 +2432,36 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                 <span className="font-medium text-sm sm:text-base">Filters</span>
               </button>
               
-              {/* View Toggle - Properties / My Bookings */}
+              {/* View Toggle - Vehicles / My Rentals */}
               <div className="flex items-center gap-2 backdrop-blur-md bg-white/60 rounded-xl p-1 border border-white/30 shadow-sm w-full sm:w-auto">
                 <button
-                  onClick={() => setActiveView('properties')}
+                  onClick={() => setActiveView('Vehicles')}
                   className={`px-3 sm:px-4 py-2 rounded-lg transition-all duration-200 text-sm font-semibold flex-1 sm:flex-none ${
-                    activeView === 'properties'
+                    activeView === 'Vehicles'
                       ? 'bg-gradient-to-r from-primary-500 to-primary-600 text-white shadow-md'
                       : 'text-gray-700 hover:bg-white/80'
                   }`}
                 >
-                  Properties
+                  Vehicles
                 </button>
                 <button
-                  onClick={() => setActiveView('bookings')}
+                  onClick={() => setActiveView('Rentals')}
                   className={`px-3 sm:px-4 py-2 rounded-lg transition-all duration-200 text-sm font-semibold relative flex-1 sm:flex-none ${
-                    activeView === 'bookings'
+                    activeView === 'Rentals'
                       ? 'bg-primary-600 text-white shadow-md'
                       : 'text-gray-700 hover:bg-white/80'
                   }`}
                 >
-                  My Bookings
-                  {myBookings.length > 0 && (
+                  My Rentals
+                  {myRentals.length > 0 && (
                     <span className="absolute -top-1 -right-1 bg-red-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full">
-                      {myBookings.length}
+                      {myRentals.length}
                     </span>
                   )}
                 </button>
               </div>
               {/* Notifications Bell */}
-              <div className="relative">
+              <div className="relative z-[100]">
                 <button
                   onClick={() => setShowNotif(!showNotif)}
                   className="relative text-gray-600 hover:text-gray-800 transition-colors duration-200 p-1"
@@ -1512,22 +2470,19 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                   <svg className="w-5 h-5 sm:w-6 sm:h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 17h5l-1.405-1.405A2 2 0 0118 14.158V11a6 6 0 10-12 0v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
                   </svg>
-                  {(() => {
-                    const unreadCount = notifications.filter(n => !n.read_at).length;
-                    return unreadCount > 0 ? (
-                      <span className="absolute -top-1 -right-1 sm:-top-2 sm:-right-2 bg-red-600 text-white text-[10px] sm:text-xs font-bold px-1.5 sm:px-2 py-0.5 rounded-full">
-                        {unreadCount}
-                      </span>
-                    ) : null;
-                  })()}
+                  {unreadNotificationCount > 0 ? (
+                    <span className="absolute -top-1 -right-1 sm:-top-2 sm:-right-2 bg-red-600 text-white text-[10px] sm:text-xs font-bold px-1.5 sm:px-2 py-0.5 rounded-full">
+                      {unreadNotificationCount}
+                    </span>
+                  ) : null}
                 </button>
                 {showNotif && (
-                  <div className="absolute right-0 top-10 sm:top-12 w-[calc(100vw-2rem)] sm:w-96 max-w-sm backdrop-blur-xl bg-white/80 rounded-2xl shadow-2xl border border-white/30 py-2 z-50">
+                  <div className="absolute right-0 top-10 sm:top-12 w-[calc(100vw-2rem)] sm:w-96 max-w-sm backdrop-blur-xl bg-white/95 rounded-2xl shadow-2xl border border-white/30 py-2 z-[120] overflow-hidden">
                     <div className="px-3 pb-2 pt-1 border-b flex items-center justify-between">
                       <span className="font-semibold">Notifications</span>
                       <button
                         onClick={async () => {
-                          if (!clientEmail) return;
+                          if (notificationRecipientEmails.length === 0) return;
                           try {
                             const unreadNotifications = notifications.filter(n => !n.read_at);
                             if (unreadNotifications.length === 0) return;
@@ -1535,7 +2490,7 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                             const { error } = await supabase
                               .from('notifications')
                               .update({ read_at: new Date().toISOString() })
-                              .eq('recipient_email', clientEmail)
+                              .in('recipient_email', notificationRecipientEmails)
                               .is('read_at', null);
                             
                             if (error) {
@@ -1562,81 +2517,37 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                       {notifications.slice(0, 20).map((n) => (
                         <div key={n.id} className={`px-3 py-2 hover:bg-white/40 backdrop-blur-sm border-b border-white/20 last:border-b-0 transition-colors ${!n.read_at ? 'bg-primary-50/30' : ''}`}>
                           <div className="text-sm font-semibold text-gray-900">{n.title}</div>
-                          <div className="text-xs text-gray-600 mt-0.5">{n.body}</div>
+                          <div className="text-xs text-gray-600 mt-0.5 whitespace-pre-wrap">{n.body}</div>
+                          {n.type === 'rental_approved' && (
+                            <p className="text-[11px] text-primary-800 mt-1.5 font-medium">
+                              Your rental is approved — open My Rentals to see your request notes, or chat with the owner below.
+                            </p>
+                          )}
+                          {n.type === 'chat_message' && (
+                            <p className="text-[11px] text-gray-600 mt-1">New message from the owner — open chat to reply.</p>
+                          )}
                           <div className="text-[10px] text-gray-500 mt-1">{new Date(n.created_at).toLocaleString()}</div>
-                          {(n.type === 'booking_approved' || n.type === 'chat_message') && (
-                            <div className="mt-2">
+                          {(n.type === 'rental_approved' || n.type === 'chat_message') && n.vehicle_id && (
+                            <div className="mt-2 flex flex-wrap gap-2">
                               <button
-                                onClick={async () => {
-                                  try {
-                                    // Only access conversations for this tenant
-                                    const { data: convs, error: convErr } = await supabase
-                                      .from('conversations')
-                                      .select('*')
-                                      .eq('property_id', n.property_id)
-                                      .eq('client_email', clientEmail)
-                                      .order('created_at', { ascending: false })
-                                      .limit(1);
-                                    if (convErr) throw convErr;
-                                    let conversation = convs && convs[0];
-                                    if (!conversation) {
-                                      // Try to create a conversation - but only if we have the necessary info
-                                      // We need to get owner_email from the property, but this should be done securely
-                                      const { data: propRow, error: propErr } = await supabase
-                                        .from('properties')
-                                        .select('owner_email')
-                                        .eq('id', n.property_id)
-                                        .single();
-                                      if (propErr) throw propErr;
-                                      const ownerEmail = (propRow as any)?.owner_email || '';
-                                      if (!ownerEmail) {
-                                        alert('Chat not available yet. Please try again later.');
-                                        return;
-                                      }
-                                      const { data: created, error: insErr } = await supabase
-                                        .from('conversations')
-                                        .insert([{ property_id: n.property_id, owner_email: ownerEmail, client_email: clientEmail }])
-                                        .select('*')
-                                        .single();
-                                      if (insErr) throw insErr;
-                                      conversation = created;
-                                    }
-                                    
-                                    // Verify the conversation belongs to this tenant
-                                    if (conversation.client_email !== clientEmail) {
-                                      alert('You can only access your own conversations.');
-                                      return;
-                                    }
-                                    
-                                    setActiveConversation(conversation);
-                                    setChatOpen(true);
-                                    setChatLoading(true);
-                                    const { data: msgs, error: msgErr } = await supabase
-                                      .from('messages')
-                                      .select('*')
-                                      .eq('conversation_id', conversation.id)
-                                      .order('created_at', { ascending: true });
-                                    if (msgErr) throw msgErr;
-                                    setChatMessages(msgs || []);
-                                    setTimeout(scrollMessagesToBottom, 0);
-                                    if (chatChannel) { try { chatChannel.unsubscribe(); } catch {}; setChatChannel(null); }
-                                    const channel = supabase
-                                      .channel(`messages-${conversation.id}`)
-                                      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `conversation_id=eq.${conversation.id}` }, (payload: any) => {
-                                        setChatMessages(prev => [...prev, payload.new as any]);
-                                        setTimeout(scrollMessagesToBottom, 0);
-                                      })
-                                      .subscribe();
-                                    setChatChannel(channel);
-                                  } catch (e) {
-                                    console.error('Open chat (tenant) failed', e);
-                                    alert('Failed to open chat');
-                                  } finally {
-                                    setChatLoading(false);
-                                  }
+                                type="button"
+                                onClick={() => {
+                                  void openTenantChatForVehicle(n.vehicle_id);
                                 }}
                                 className="text-xs text-primary-600 hover:text-primary-700 font-semibold"
-                              >Open Chat</button>
+                              >
+                                Open Chat
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setShowNotif(false);
+                                  setActiveView('Rentals');
+                                }}
+                                className="text-xs text-gray-600 hover:text-gray-800 font-semibold"
+                              >
+                                View rental
+                              </button>
                             </div>
                           )}
                         </div>
@@ -1648,16 +2559,28 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
               <div className="relative">
                 <button 
                   onClick={() => setShowMenu(!showMenu)}
-                  className="text-gray-600 hover:text-gray-800 transition-colors duration-200"
+                  className={`h-10 w-10 rounded-2xl border transition-all duration-200 flex items-center justify-center ${
+                    showMenu
+                      ? 'bg-primary-600 text-white border-primary-600 shadow-lg shadow-primary-600/20'
+                      : 'bg-white/70 text-gray-700 border-white/50 hover:bg-white hover:text-primary-700 shadow-sm'
+                  }`}
+                  aria-label="Open account menu"
                 >
-                  <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
                   </svg>
                 </button>
                 
                 {/* Dropdown Menu */}
                 {showMenu && (
-                  <div className="absolute right-0 top-10 w-48 backdrop-blur-xl bg-white/80 rounded-2xl shadow-2xl border border-white/30 py-2 z-50">
+                  <div className="absolute right-0 top-12 w-64 overflow-hidden rounded-[28px] border border-white/70 bg-white/90 shadow-[0_24px_60px_rgba(20,32,43,0.18)] backdrop-blur-2xl z-50">
+                    <div className="border-b border-gray-100/80 bg-gradient-to-r from-primary-50 to-white px-4 py-3">
+                      <p className="text-xs font-bold uppercase tracking-[0.18em] text-primary-700">Account</p>
+                      <p className="mt-1 truncate text-sm font-semibold text-gray-900">
+                        {clientEmail || user?.email || 'Rider menu'}
+                      </p>
+                    </div>
+                    <div className="p-2">
                     <button
                       onClick={async () => {
                         setShowMenu(false);
@@ -1712,12 +2635,17 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                           setShowViewProfile(true);
                         }
                       }}
-                      className="w-full px-4 py-3 text-left hover:bg-gray-50 flex items-center space-x-3"
+                      className="group w-full rounded-2xl px-3 py-3 text-left transition-all duration-200 hover:bg-primary-50 flex items-center gap-3"
                     >
-                      <svg className="w-5 h-5 text-primary-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
-                      </svg>
-                      <span className="text-gray-700 font-medium">View Profile</span>
+                      <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-primary-100 text-primary-700 transition-all duration-200 group-hover:bg-primary-600 group-hover:text-white">
+                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
+                        </svg>
+                      </span>
+                      <span>
+                        <span className="block text-sm font-bold text-gray-900">View Profile</span>
+                        <span className="block text-xs text-gray-500">Check your saved details</span>
+                      </span>
                     </button>
 
                     <button
@@ -1745,6 +2673,16 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                             .eq('email', email)
                             .single();
 
+                          const { data: clientProfile } = user?.id
+                            ? await supabase
+                                .from('client_profiles')
+                                .select(
+                                  'gender, age, citizenship, occupation_status'
+                                )
+                                .eq('user_id', user.id)
+                                .maybeSingle()
+                            : { data: null };
+
                           const profile = userProfile || appUser;
                           setProfileData({
                             full_name: profile?.full_name || user?.user_metadata?.full_name || '',
@@ -1754,7 +2692,16 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                             city: profile?.city || '',
                             profile_image_url: profile?.profile_image_url || '',
                             id_document_url: profile?.id_document_url || '',
-                            email: user?.email || ''
+                            email: user?.email || '',
+                            gender: String(clientProfile?.gender || '').trim(),
+                            age:
+                              clientProfile?.age != null && clientProfile.age !== ''
+                                ? String(clientProfile.age)
+                                : '',
+                            citizenship: (String(clientProfile?.citizenship || '').trim() ||
+                              '') as '' | 'Filipino' | 'Foreigner',
+                            occupation_status: (String(clientProfile?.occupation_status || '').trim() ||
+                              '') as '' | 'Student' | 'Worker'
                           });
                           setProfileImagePreview(profile?.profile_image_url || null);
                           setIdDocumentPreview(profile?.id_document_url || null);
@@ -1770,17 +2717,26 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                             city: '',
                             profile_image_url: '',
                             id_document_url: '',
-                            email: user?.email || ''
+                            email: user?.email || '',
+                            gender: '',
+                            age: '',
+                            citizenship: '',
+                            occupation_status: ''
                           });
                           setShowEditProfile(true);
                         }
                       }}
-                      className="w-full px-4 py-3 text-left hover:bg-gray-50 flex items-center space-x-3"
+                      className="group w-full rounded-2xl px-3 py-3 text-left transition-all duration-200 hover:bg-primary-50 flex items-center gap-3"
                     >
-                      <svg className="w-5 h-5 text-primary-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-                      </svg>
-                      <span className="text-gray-700 font-medium">Edit Profile</span>
+                      <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-primary-100 text-primary-700 transition-all duration-200 group-hover:bg-primary-600 group-hover:text-white">
+                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                        </svg>
+                      </span>
+                      <span>
+                        <span className="block text-sm font-bold text-gray-900">Edit Profile</span>
+                        <span className="block text-xs text-gray-500">Update contact and ID info</span>
+                      </span>
                     </button>
 
                     <button
@@ -1788,24 +2744,35 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                         setShowMaps(true);
                         setShowMenu(false);
                       }}
-                      className="w-full px-4 py-3 text-left hover:bg-gray-50 flex items-center space-x-3"
+                      className="group w-full rounded-2xl px-3 py-3 text-left transition-all duration-200 hover:bg-primary-50 flex items-center gap-3"
                     >
-                      <svg className="w-5 h-5 text-primary-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7" />
-                      </svg>
-                      <span className="text-gray-700 font-medium">Maps</span>
+                      <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-primary-100 text-primary-700 transition-all duration-200 group-hover:bg-primary-600 group-hover:text-white">
+                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7" />
+                        </svg>
+                      </span>
+                      <span>
+                        <span className="block text-sm font-bold text-gray-900">Maps</span>
+                        <span className="block text-xs text-gray-500">Browse vehicle locations</span>
+                      </span>
                     </button>
 
-
+                    <div className="my-2 h-px bg-gray-100" />
                     <button
                       onClick={handleLogout}
-                      className="w-full px-4 py-3 text-left hover:bg-red-50 flex items-center space-x-3 text-red-600"
+                      className="group w-full rounded-2xl px-3 py-3 text-left transition-all duration-200 hover:bg-red-50 flex items-center gap-3 text-red-600"
                     >
-                      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
-                      </svg>
-                      <span className="font-medium">Logout</span>
+                      <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-red-100 text-red-600 transition-all duration-200 group-hover:bg-red-600 group-hover:text-white">
+                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+                        </svg>
+                      </span>
+                      <span>
+                        <span className="block text-sm font-bold">Logout</span>
+                        <span className="block text-xs text-red-400">End this session</span>
+                      </span>
                     </button>
+                    </div>
                   </div>
                 )}
               </div>
@@ -1813,11 +2780,155 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
           </div>
         </div>
 
+        <div className="px-3 sm:px-6 pt-4 sm:pt-6">
+          {renterLiveGpsSharing ? (
+            <div
+              className="mb-4 rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-950 shadow-sm"
+              role="status"
+            >
+              <span className="font-semibold">Live location sharing is on.</span> Your owner opened{' '}
+              <span className="font-medium">Track on map</span> for an active trip. Keep this tab open and allow
+              location access so your position updates on their map (refreshes about every 20–30 seconds).
+            </div>
+          ) : null}
+          <div className="grid gap-4 lg:grid-cols-12 mb-4 sm:mb-6">
+            <section className="dashboard-bento-card lg:col-span-7 p-5 sm:p-6">
+              <div className="flex flex-wrap items-center gap-2 mb-4">
+                <span className="dashboard-bento-badge">Client Hub</span>
+                <span className={`dashboard-bento-pill ${approvalTone}`}>{approvalLabel}</span>
+              </div>
+              <div className="flex flex-col gap-5">
+                <div className="space-y-3">
+                  <h2 className="text-2xl sm:text-3xl font-bold text-[#221711] leading-tight">
+                    Browse verified rides, track bookings, and stay ready to move.
+                  </h2>
+                  <p className="max-w-2xl text-sm sm:text-base text-[#6b584b] leading-relaxed">
+                    Your dashboard now groups search, status, and trip activity into one cleaner board so you can jump between discovery and booking without losing context.
+                  </p>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <button
+                    onClick={() => setActiveView('Vehicles')}
+                    className="dashboard-bento-action text-left"
+                  >
+                    <div>
+                      <p className="text-xs font-semibold uppercase tracking-[0.18em] text-orange-600">Browse</p>
+                      <p className="mt-1 text-sm font-semibold text-[#221711]">Open vehicle feed</p>
+                    </div>
+                    <svg className="w-5 h-5 text-orange-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7l5 5m0 0l-5 5m5-5H6" />
+                    </svg>
+                  </button>
+                  <button
+                    onClick={() => setActiveView('Rentals')}
+                    className="dashboard-bento-action text-left"
+                  >
+                    <div>
+                      <p className="text-xs font-semibold uppercase tracking-[0.18em] text-orange-600">Trips</p>
+                      <p className="mt-1 text-sm font-semibold text-[#221711]">Review my rentals</p>
+                    </div>
+                    <span className="text-sm font-bold text-orange-600">{myRentals.length}</span>
+                  </button>
+                  <button
+                    onClick={() => setShowMaps(true)}
+                    className="dashboard-bento-action text-left"
+                  >
+                    <div>
+                      <p className="text-xs font-semibold uppercase tracking-[0.18em] text-orange-600">Map</p>
+                      <p className="mt-1 text-sm font-semibold text-[#221711]">Open location view</p>
+                    </div>
+                    <svg className="w-5 h-5 text-orange-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7" />
+                    </svg>
+                  </button>
+                  <button
+                    onClick={() => setShowFilters((prev) => !prev)}
+                    className="dashboard-bento-action text-left"
+                  >
+                    <div>
+                      <p className="text-xs font-semibold uppercase tracking-[0.18em] text-orange-600">Refine</p>
+                      <p className="mt-1 text-sm font-semibold text-[#221711]">
+                        {showFilters ? 'Hide filters' : 'Tune search filters'}
+                      </p>
+                    </div>
+                    <span className="text-sm font-bold text-orange-600">{activeFilterCount}</span>
+                  </button>
+                </div>
+              </div>
+            </section>
+
+            <section className="dashboard-bento-card lg:col-span-5 p-5 sm:p-6">
+              <div className="grid grid-cols-2 gap-3">
+                <div className="dashboard-bento-metric p-4">
+                  <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#8f6d5a]">Visible rides</p>
+                  <p className="mt-2 text-3xl font-bold text-[#221711]">{filteredVehicles.length}</p>
+                  <p className="mt-1 text-sm text-[#6b584b]">{vehicles.length} total available right now</p>
+                </div>
+                <div className="dashboard-bento-metric p-4">
+                  <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#8f6d5a]">My rentals</p>
+                  <p className="mt-2 text-3xl font-bold text-[#221711]">{myRentals.length}</p>
+                  <p className="mt-1 text-sm text-[#6b584b]">{approvedRentalCount} approved, {pendingRentalCount} pending</p>
+                </div>
+                <div className="dashboard-bento-metric p-4">
+                  <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#8f6d5a]">Unread alerts</p>
+                  <p className="mt-2 text-3xl font-bold text-[#221711]">{unreadNotificationCount}</p>
+                  <p className="mt-1 text-sm text-[#6b584b]">Messages, approvals, and owner replies</p>
+                </div>
+                <div className="dashboard-bento-metric p-4">
+                  <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#8f6d5a]">Ride quality</p>
+                  <p className="mt-2 text-3xl font-bold text-[#221711]">{averageVehicleRating}</p>
+                  <p className="mt-1 text-sm text-[#6b584b]">{topRatedVehicleCount} top-rated and {featuredVehicleCount} featured</p>
+                </div>
+              </div>
+
+              <div className="dashboard-bento-metric mt-4 p-4">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#8f6d5a]">Search pulse</p>
+                    <p className="mt-2 text-lg font-bold text-[#221711]">
+                      {searchLocation ? `Looking near ${searchLocation}` : `Exploring from ${currentLocation}`}
+                    </p>
+                    <p className="mt-1 text-sm text-[#6b584b]">
+                      {activeFilterCount > 0
+                        ? `${activeFilterCount} active filter${activeFilterCount === 1 ? '' : 's'} shaping your feed.`
+                        : 'No filters applied yet, so you are seeing the broadest set of available vehicles.'}
+                    </p>
+                  </div>
+                  <button
+                    onClick={onBack}
+                    className="dashboard-bento-pill bg-white text-[#221711] border border-white/80"
+                  >
+                    Back
+                  </button>
+                </div>
+              </div>
+            </section>
+          </div>
+        </div>
+
         {/* Filters Panel */}
         {showFilters && (
-          <div className="backdrop-blur-xl bg-white/70 rounded-3xl shadow-2xl border border-white/30 p-4 sm:p-6 mb-4 sm:mb-6 mx-3 sm:mx-6">
-            <h3 className="text-base sm:text-lg font-bold text-gray-900 mb-3 sm:mb-4">Filter Properties</h3>
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
+          <div className="backdrop-blur-xl bg-white/80 rounded-2xl shadow-xl border border-white/40 p-4 sm:p-5 mb-4 sm:mb-6 mx-3 sm:mx-6">
+            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
+              <div>
+                <h3 className="text-base sm:text-lg font-bold text-gray-900">Filter Vehicles</h3>
+                <p className="text-sm text-gray-500">Narrow results by price, rating, and vehicle equipment.</p>
+              </div>
+              <button
+                onClick={() => setSearchFilters({
+                  minPrice: 0,
+                  maxPrice: 50000,
+                  minRating: 0,
+                  features: [],
+                  location: ''
+                })}
+                className="self-start sm:self-auto px-3 py-2 text-sm font-semibold text-gray-600 hover:text-gray-900 rounded-lg hover:bg-white/70"
+              >
+                Clear Filters
+              </button>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-3 xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,1fr)_minmax(22rem,1.4fr)] gap-4">
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-2">Min Price (₱)</label>
                 <input
@@ -1853,72 +2964,63 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                   <option value={5}>5 Stars</option>
                 </select>
               </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">Amenities</label>
-                <div className="grid grid-cols-2 gap-2">
-                  {['WiFi', 'Air Conditioning', 'Private Kitchen', 'Shared Kitchen', 'Laundry', 'Parking', 'Security', 'Gym'].map(amenity => (
-                    <label key={amenity} className="flex items-center space-x-2 text-sm">
+              <div className="md:col-span-3 xl:col-span-1">
+                <label className="block text-sm font-medium text-gray-700 mb-2">Vehicle Features</label>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-2">
+                  {VEHICLE_FEATURE_FILTERS.map(feature => (
+                    <label key={feature} className="flex items-center gap-2 text-sm text-gray-700 min-w-0">
                       <input
                         type="checkbox"
-                        checked={searchFilters.amenities.includes(amenity)}
+                        checked={searchFilters.features.includes(feature)}
                         onChange={(e) => {
                           if (e.target.checked) {
                             setSearchFilters(prev => ({ 
                               ...prev, 
-                              amenities: [...prev.amenities, amenity] 
+                              features: [...prev.features, feature] 
                             }));
                           } else {
                             setSearchFilters(prev => ({ 
                               ...prev, 
-                              amenities: prev.amenities.filter(a => a !== amenity) 
+                              features: prev.features.filter(f => f !== feature) 
                             }));
                           }
                         }}
                         className="rounded border-gray-300 text-primary-600 focus:ring-primary-500"
                       />
-                      <span>{amenity}</span>
+                      <span className="truncate">{feature}</span>
                     </label>
                   ))}
                 </div>
               </div>
             </div>
-            <div className="mt-4 flex justify-end">
-              <button
-                onClick={() => setSearchFilters({
-                  minPrice: 0,
-                  maxPrice: 50000,
-                  minRating: 0,
-                  amenities: [],
-                  location: ''
-                })}
-                className="px-4 py-2 text-gray-600 hover:text-gray-800 font-medium"
-              >
-                Clear Filters
-              </button>
-            </div>
           </div>
         )}
 
-        {/* My Bookings Section */}
-        {activeView === 'bookings' && (
+        {/* My Rentals Section */}
+        {activeView === 'Rentals' && (
           <div className="px-3 sm:px-6 py-3 sm:py-4 flex-shrink-0">
-            <h2 className="text-xl sm:text-2xl font-bold text-gray-900 mb-3 sm:mb-4">My Bookings</h2>
-            {loadingBookings ? (
+            <h2 className="text-xl sm:text-2xl font-bold text-gray-900">My Rentals</h2>
+            <p className="text-sm text-gray-600 mt-1 mb-3 sm:mb-4">
+              Approved rentals are listed first. Your notes and owner messages appear on each card — use <span className="font-semibold">Message owner</span> to chat.
+            </p>
+            {loadingRentals ? (
               <div className="text-center py-8">
-                <div className="text-gray-600">Loading your bookings...</div>
+                <div className="text-gray-600">Loading your Rentals...</div>
               </div>
-            ) : myBookings.length === 0 ? (
+            ) : myRentals.length === 0 ? (
               <div className="text-center py-12 backdrop-blur-xl bg-white/70 rounded-3xl shadow-2xl border border-white/30">
                 <svg className="w-16 h-16 text-gray-400 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
                 </svg>
-                <p className="text-gray-600 text-lg mb-2">No bookings yet</p>
-                <p className="text-gray-500 text-sm">Start browsing properties and make your first booking!</p>
+                <p className="text-gray-600 text-lg mb-2">No Rentals yet</p>
+                <p className="text-gray-500 text-sm">Start browsing Vehicles and make your first rental!</p>
               </div>
             ) : (
               <div className="space-y-4">
-                {myBookings.map((booking) => {
-                  const property = booking.properties || {};
+                {myRentals.map((rental) => {
+                  const vehicle = rental.Vehicles || {};
+                  const rentalRentalUnit = extractRentalUnitFromText(rental.special_requests, rental.message);
+                  const paymentMethod = rental.payment_method || extractPaymentMethodFromText(rental.special_requests, rental.message);
                   const statusColors = {
                     pending: 'bg-yellow-100 text-yellow-800 border-yellow-300',
                     approved: 'bg-green-100 text-green-800 border-green-300',
@@ -1932,34 +3034,34 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                   
                   return (
                     <div
-                      key={booking.id}
+                      key={rental.id}
                       className="backdrop-blur-xl bg-white/70 rounded-3xl shadow-2xl border border-white/30 p-4 sm:p-6 hover:shadow-3xl transition-all duration-300"
                     >
                       <div className="flex flex-col sm:flex-row gap-4">
-                        {/* Property Image */}
-                        {property.images && property.images.length > 0 && (
+                        {/* vehicle Image */}
+                        {vehicle.images && vehicle.images.length > 0 && (
                           <div className="w-full sm:w-48 h-48 sm:h-32 rounded-xl overflow-hidden flex-shrink-0">
                             <img
-                              src={Array.isArray(property.images) ? property.images[0] : property.images}
-                              alt={property.title || 'Property'}
+                              src={Array.isArray(vehicle.images) ? vehicle.images[0] : vehicle.images}
+                              alt={vehicle.title || 'vehicle'}
                               className="w-full h-full object-cover"
                             />
                           </div>
                         )}
                         
-                        {/* Booking Details */}
+                        {/* rental Details */}
                         <div className="flex-1">
                           <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3 mb-3">
                             <div>
                               <h3 className="text-lg sm:text-xl font-bold text-gray-900 mb-1">
-                                {property.title || 'Property'}
+                                {vehicle.title || 'vehicle'}
                               </h3>
-                              <p className="text-sm text-gray-600 mb-2">{property.location || 'Location not specified'}</p>
-                              {booking.check_in_date && booking.check_out_date && (
+                              <p className="text-sm text-gray-600 mb-2">{vehicle.location || 'Location not specified'}</p>
+                              {rental.check_in_date && rental.check_out_date && (
                                 <div className="text-sm text-gray-600">
-                                  <span className="font-semibold">Check-in:</span> {new Date(booking.check_in_date).toLocaleDateString()}
+                                  <span className="font-semibold">Check-in:</span> {new Date(rental.check_in_date).toLocaleDateString()}
                                   {' • '}
-                                  <span className="font-semibold">Check-out:</span> {new Date(booking.check_out_date).toLocaleDateString()}
+                                  <span className="font-semibold">Check-out:</span> {new Date(rental.check_out_date).toLocaleDateString()}
                                 </div>
                               )}
                             </div>
@@ -1967,114 +3069,102 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                             {/* Status Badge */}
                             <div className="flex items-start gap-3">
                               <span className={`px-4 py-2 rounded-full text-sm font-semibold border-2 ${
-                                statusColors[booking.status as keyof typeof statusColors] || statusColors.pending
+                                statusColors[rental.status as keyof typeof statusColors] || statusColors.pending
                               }`}>
-                                {statusLabels[booking.status as keyof typeof statusLabels] || booking.status}
+                                {statusLabels[rental.status as keyof typeof statusLabels] || rental.status}
                               </span>
                             </div>
                           </div>
                           
-                          {/* Booking Info */}
+                          {/* rental Info */}
                           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
                             <div>
-                              <p className="text-xs text-gray-500 mb-1">Booking ID</p>
-                              <p className="text-sm font-mono text-gray-700">{booking.id.substring(0, 8)}...</p>
+                              <p className="text-xs text-gray-500 mb-1">rental ID</p>
+                              <p className="text-sm font-mono text-gray-700">{rental.id.substring(0, 8)}...</p>
                             </div>
-                            <div>
-                              <p className="text-xs text-gray-500 mb-1">Booking Date</p>
-                              <p className="text-sm text-gray-700">{new Date(booking.created_at).toLocaleDateString()}</p>
-                            </div>
-                            
-                            {/* Room Information */}
-                            {booking.room && (
-                              <div className="bg-primary-50 rounded-lg p-3 border border-primary-200">
-                                <p className="text-xs text-gray-500 mb-2 font-semibold">Room Details</p>
-                                <div className="flex items-center gap-2 mb-1">
-                                  <svg className="w-5 h-5 text-primary-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" />
-                                  </svg>
-                                  <p className="text-sm font-bold text-gray-900">
-                                    {booking.room.room_name || `Room ${booking.room.room_number}`}
-                                  </p>
-                                </div>
-                                {booking.room.room_number && (
-                                  <p className="text-xs text-gray-600">Room Number: {booking.room.room_number}</p>
-                                )}
-                                {booking.room.max_beds && (
-                                  <p className="text-xs text-gray-600">Max Capacity: {booking.room.max_beds} beds</p>
-                                )}
-                                {booking.room.price_per_bed && (
-                                  <p className="text-xs text-primary-600 font-semibold">₱{Number(booking.room.price_per_bed).toLocaleString()}/bed</p>
-                                )}
-                              </div>
-                            )}
-                            
-                            {/* Bed Information */}
-                            {booking.bed && (
-                              <div className="bg-purple-50 rounded-lg p-3 border border-purple-200">
-                                <p className="text-xs text-gray-500 mb-2 font-semibold">Bed Details</p>
-                                <div className="flex items-center gap-2 mb-1">
-                                  <svg className="w-5 h-5 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
-                                  </svg>
-                                  <p className="text-sm font-bold text-gray-900">
-                                    {booking.bed.bed_number}
-                                  </p>
-                                  {booking.bed.deck_position && (
-                                    <span className="text-xs px-2 py-1 bg-purple-200 text-purple-800 rounded-full font-semibold">
-                                      {booking.bed.deck_position.toUpperCase()}
-                                    </span>
-                                  )}
-                                </div>
-                                <div className="flex flex-wrap items-center gap-2 mt-2">
-                                  <span className={`text-xs px-2 py-1 rounded-full font-semibold ${
-                                    booking.bed.bed_type === 'single' ? 'bg-primary-100 text-primary-800' :
-                                    booking.bed.bed_type === 'double_deck_upper' ? 'bg-green-100 text-green-800' :
-                                    booking.bed.bed_type === 'double_deck_lower' ? 'bg-orange-100 text-orange-800' :
-                                    'bg-gray-100 text-gray-800'
-                                  }`}>
-                                    {booking.bed.bed_type === 'single' ? 'Single Bed' :
-                                     booking.bed.bed_type === 'double_deck_upper' ? 'Upper Deck' :
-                                     booking.bed.bed_type === 'double_deck_lower' ? 'Lower Deck' :
-                                     booking.bed.bed_type}
-                                  </span>
-                                  {booking.bed.status && (
-                                    <span className={`text-xs px-2 py-1 rounded-full font-semibold ${
-                                      booking.bed.status === 'available' ? 'bg-green-100 text-green-800' :
-                                      booking.bed.status === 'occupied' ? 'bg-red-100 text-red-800' :
-                                      'bg-yellow-100 text-yellow-800'
-                                    }`}>
-                                      {booking.bed.status.charAt(0).toUpperCase() + booking.bed.status.slice(1)}
-                                    </span>
-                                  )}
-                                </div>
-                                {booking.bed.price && (
-                                  <p className="text-xs text-purple-600 font-semibold mt-2">₱{Number(booking.bed.price).toLocaleString()}</p>
-                                )}
-                              </div>
-                            )}
-                            
-                            {booking.total_amount && (
+                            {rental.driver_license && (
                               <div>
-                                <p className="text-xs text-gray-500 mb-1">Total Amount</p>
-                                <p className="text-lg font-bold text-primary-600">₱{Number(booking.total_amount).toLocaleString()}</p>
+                                <p className="text-xs text-gray-500 mb-1">Driver&apos;s license</p>
+                                <p className="text-sm font-mono text-gray-700">{rental.driver_license}</p>
                               </div>
                             )}
-                            {booking.payment_status && (
+                            <div>
+                              <p className="text-xs text-gray-500 mb-1">rental Date</p>
+                              <p className="text-sm text-gray-700">{new Date(rental.created_at).toLocaleDateString()}</p>
+                            </div>
+                            
+                            {rental.total_amount && (
+                              <div>
+                                <p className="text-xs text-gray-500 mb-1">Quoted Amount</p>
+                                <p className="text-lg font-bold text-primary-600">₱{Number(rental.total_amount).toLocaleString()}</p>
+                              </div>
+                            )}
+                            {rentalRentalUnit && (
+                              <div>
+                                <p className="text-xs text-gray-500 mb-1">Rent Plan</p>
+                                <p className="text-sm font-semibold text-primary-700">{RENTAL_UNIT_LABELS[rentalRentalUnit]}</p>
+                              </div>
+                            )}
+                            {rental.payment_status && (
                               <div>
                                 <p className="text-xs text-gray-500 mb-1">Payment Status</p>
-                                <p className="text-sm text-gray-700 capitalize">{booking.payment_status}</p>
+                                <p className="text-sm text-gray-700 capitalize">{rental.payment_status}</p>
+                              </div>
+                            )}
+                            {paymentMethod && (
+                              <div>
+                                <p className="text-xs text-gray-500 mb-1">Payment Method</p>
+                                <p className="text-sm text-gray-700">{paymentMethod}</p>
                               </div>
                             )}
                           </div>
-                          
-                          {/* Message/Notes */}
-                          {booking.message && (
-                            <div className="mt-3 p-3 bg-gray-50 rounded-lg">
-                              <p className="text-xs text-gray-500 mb-1">Your Message</p>
-                              <p className="text-sm text-gray-700">{booking.message}</p>
+
+                          {rental.status === 'approved' && (
+                            <div className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50/90 px-3 py-2.5">
+                              <p className="text-sm font-semibold text-emerald-900">Approved rental</p>
+                              <p className="text-xs text-emerald-800 mt-0.5">
+                                Your request was accepted. Use Message owner for pickup details or questions.
+                              </p>
                             </div>
                           )}
+
+                          {(() => {
+                            const notes = (rental.special_requests || '').trim();
+                            const legacy = (rental.message || '').trim();
+                            if (!notes && !legacy) return null;
+                            return (
+                              <div className="mt-3 p-3 bg-gray-50 rounded-lg border border-gray-100">
+                                <p className="text-xs text-gray-500 mb-1 font-semibold">
+                                  Your message & notes to the owner
+                                </p>
+                                {notes ? (
+                                  <p className="text-sm text-gray-800 whitespace-pre-wrap">{notes}</p>
+                                ) : null}
+                                {legacy && legacy !== notes ? (
+                                  <p
+                                    className={`text-sm text-gray-800 whitespace-pre-wrap ${
+                                      notes ? 'mt-2 pt-2 border-t border-gray-200' : ''
+                                    }`}
+                                  >
+                                    {legacy}
+                                  </p>
+                                ) : null}
+                              </div>
+                            );
+                          })()}
+
+                          {(rental.status === 'approved' || rental.status === 'pending') &&
+                          rental.vehicle_id ? (
+                            <div className="mt-4 flex flex-wrap gap-2">
+                              <button
+                                type="button"
+                                onClick={() => void openTenantChatForVehicle(rental.vehicle_id)}
+                                className="inline-flex items-center gap-2 px-4 py-2.5 rounded-full bg-primary-600 text-white text-sm font-semibold shadow-sm hover:bg-primary-700 transition-colors"
+                              >
+                                Message owner
+                              </button>
+                            </div>
+                          ) : null}
                         </div>
                       </div>
                     </div>
@@ -2085,164 +3175,436 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
           </div>
         )}
 
-        {/* Most Booked Section (from database only) */}
-        {!showFilters && activeView === 'properties' && (
-        <div className="px-3 sm:px-6 py-3 sm:py-4 flex-shrink-0">
-          <h2 className="text-xl sm:text-2xl font-bold text-gray-900 mb-3 sm:mb-4">Most Booked</h2>
-          {loading && (
-            <div className="text-sm sm:text-base text-gray-600">Loading properties...</div>
-          )}
-          {!loading && properties.length === 0 && (
-            <div className="text-center py-6 sm:py-8">
-              <div className="text-gray-500 text-base sm:text-lg mb-2">No properties available</div>
-              <div className="text-xs sm:text-sm text-gray-400">Check back later or try adjusting your search filters.</div>
+        {/* Most Rented Section (from database only) */}
+        {!showFilters && activeView === 'Vehicles' && (
+          <div className="px-3 sm:px-6 py-3 sm:py-4 flex-shrink-0">
+            <div className="mb-4 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-[0.24em] text-primary-600">Top performing rides</p>
+                <h2 className="mt-2 text-2xl sm:text-3xl font-bold text-[#221711]">Most Rented</h2>
+                <p className="mt-2 max-w-2xl text-sm sm:text-base text-[#6b584b]">
+                  Ranked by repeat bookings first, then sharpened with ratings so the strongest vehicles rise to the top.
+                </p>
+              </div>
+              <div className="dashboard-bento-metric px-4 py-3 sm:min-w-[220px]">
+                <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#8f6d5a]">Live leaderboard</p>
+                <p className="mt-2 text-lg font-bold text-[#221711]">{vehicles.length} rides available</p>
+                <p className="mt-1 text-sm text-[#6b584b]">Swipe through the top rides from rental activity.</p>
+              </div>
             </div>
-          )}
-          {!loading && properties.length > 0 && (() => {
-            // Sort properties by totalBookings (most booked first), then by rating
-            const mostBooked = [...properties].sort((a, b) => {
-              const bookingsA = a.totalBookings || 0;
-              const bookingsB = b.totalBookings || 0;
-              if (bookingsB !== bookingsA) return bookingsB - bookingsA;
-              const ratingA = a.rating || 0;
-              const ratingB = b.rating || 0;
-              return ratingB - ratingA;
-            }).slice(0, 3);
-            
-            return (
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 sm:gap-4">
-              {mostBooked.map((property) => (
-                <div key={property.id} className="backdrop-blur-xl bg-white/70 rounded-3xl shadow-2xl border border-white/30 overflow-hidden hover:shadow-3xl transition-all duration-300">
-                  <div className="h-48 relative">
-                    {property.images && property.images.length > 0 ? (
-                      <ImageCarousel 
-                        images={property.images} 
-                        alt={property.title}
-                        className="absolute inset-0 w-full h-full"
-                        bucket="property-images"
-                      />
-                    ) : (
-                      <div className="h-full bg-gradient-to-br from-gray-100 to-gray-200 flex items-center justify-center">
-                        <span className="text-gray-500 font-medium">No image</span>
+            {loading && (
+              <div className="text-sm sm:text-base text-gray-600">Loading vehicles...</div>
+            )}
+            {!loading && vehicles.length === 0 && (
+              <div className="text-center py-6 sm:py-8">
+                <div className="text-gray-500 text-base sm:text-lg mb-2">No vehicles available</div>
+                <div className="text-xs sm:text-sm text-gray-400">Check back later or try adjusting your search filters.</div>
+              </div>
+            )}
+            {!loading && vehicles.length > 0 && (() => {
+              const mostBooked = [...vehicles]
+                .sort((a, b) => {
+                  const RentalsA = a.totalRentals || 0;
+                  const RentalsB = b.totalRentals || 0;
+                  if (RentalsB !== RentalsA) return RentalsB - RentalsA;
+                  const ratingA = a.rating || 0;
+                  const ratingB = b.rating || 0;
+                  return ratingB - ratingA;
+                })
+                .slice(0, 8);
+
+              return (
+                <div>
+                  <div className="mb-4 flex items-center justify-between gap-3">
+                    <div className="flex items-center gap-2">
+                      {mostBooked.map((vehicle, index) => (
+                        <button
+                          key={`most-rented-dot-${vehicle.id}`}
+                          onClick={() => {
+                            const carousel = document.getElementById('most-rented-carousel');
+                            const slide = carousel?.children[index] as HTMLElement | undefined;
+                            slide?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'start' });
+                            setMostRentedIndex(index);
+                          }}
+                          className={`h-2.5 rounded-full transition-all ${
+                            mostRentedIndex === index ? 'w-8 bg-primary-600' : 'w-2.5 bg-orange-200 hover:bg-orange-300'
+                          }`}
+                          aria-label={`Show most rented vehicle ${index + 1}`}
+                        />
+                      ))}
                     </div>
-                    )}
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => {
+                          const carousel = document.getElementById('most-rented-carousel');
+                          const nextIndex = Math.max(0, mostRentedIndex - 1);
+                          const slide = carousel?.children[nextIndex] as HTMLElement | undefined;
+                          slide?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'start' });
+                          setMostRentedIndex(nextIndex);
+                        }}
+                        className="h-10 w-10 rounded-full border border-orange-100 bg-white/85 text-[#7b401e] shadow-sm transition-all hover:-translate-y-0.5 hover:bg-orange-50"
+                        aria-label="Previous most rented vehicle"
+                      >
+                        &lt;
+                      </button>
+                      <button
+                        onClick={() => {
+                          const carousel = document.getElementById('most-rented-carousel');
+                          const nextIndex = Math.min(mostBooked.length - 1, mostRentedIndex + 1);
+                          const slide = carousel?.children[nextIndex] as HTMLElement | undefined;
+                          slide?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'start' });
+                          setMostRentedIndex(nextIndex);
+                        }}
+                        className="h-10 w-10 rounded-full border border-orange-100 bg-white/85 text-[#7b401e] shadow-sm transition-all hover:-translate-y-0.5 hover:bg-orange-50"
+                        aria-label="Next most rented vehicle"
+                      >
+                        &gt;
+                      </button>
+                    </div>
                   </div>
-                  <div className="p-4">
-                    <h3 className="font-bold text-lg text-gray-900 mb-1">{property.title}</h3>
-                    <p className="text-gray-600 text-sm mb-2">{property.location}</p>
-                    <div className="flex items-center gap-2 mb-2">
-                      <div className="flex items-center gap-1 text-sm text-gray-600">
-                        <svg className="w-4 h-4 text-primary-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
-                        </svg>
-                        <span className="font-semibold text-gray-700">{property.totalBookings || 0}</span>
-                        <span className="text-gray-500">booking{property.totalBookings !== 1 ? 's' : ''}</span>
-                      </div>
-                    </div>
-                    <div className="flex items-center justify-between">
-                      <span className="text-primary-600 font-bold text-lg">₱{property.price.toLocaleString()}</span>
-                      <button onClick={() => { setSelectedProperty(property); /* setShowMaps(true); */ }} className="text-primary-600 hover:text-primary-700 text-sm font-semibold">View</button>
-                    </div>
+                  <div
+                    id="most-rented-carousel"
+                    className="vehicle-showcase-carousel scrollbar-hide"
+                    onScroll={(event) => {
+                      const container = event.currentTarget;
+                      const firstSlide = container.children[0] as HTMLElement | undefined;
+                      if (!firstSlide) return;
+                      const gap = 16;
+                      const nextIndex = Math.round(container.scrollLeft / (firstSlide.offsetWidth + gap));
+                      setMostRentedIndex(Math.min(Math.max(nextIndex, 0), mostBooked.length - 1));
+                    }}
+                  >
+                  {mostBooked.map((vehicle, index) => {
+                    const highlightTags = buildVehicleHighlights(vehicle, 4);
+                    const ratingValue =
+                      vehicle.rating && vehicle.rating > 0 ? vehicle.rating.toFixed(1) : 'New';
+                    const reviewLabel =
+                      vehicle.totalReviews && vehicle.totalReviews > 0
+                        ? `${vehicle.totalReviews} review${vehicle.totalReviews === 1 ? '' : 's'}`
+                        : 'No reviews yet';
+                    const rankLabel =
+                      index === 0 ? 'Most rented' : index === 1 ? 'Crowd favorite' : 'Trending now';
+
+                    return (
+                      <article
+                        key={vehicle.id}
+                        className="vehicle-spotlight-card vehicle-carousel-slide"
+                      >
+                        <div className="lg:grid lg:min-h-[30rem] lg:grid-cols-[1.35fr_0.95fr]">
+                          <div className="vehicle-spotlight-media h-[22rem] sm:h-[24rem] lg:h-full">
+                            {vehicle.images && vehicle.images.length > 0 ? (
+                              <ImageCarousel
+                                images={vehicle.images}
+                                alt={vehicle.title}
+                                className="absolute inset-0 h-full w-full"
+                                bucket="vehicle-images"
+                              />
+                            ) : (
+                              <div className="absolute inset-0 flex items-center justify-center bg-gradient-to-br from-[#67412d] to-[#2d1d16] text-white/80">
+                                <span className="text-sm font-semibold uppercase tracking-[0.18em]">No photo yet</span>
+                              </div>
+                            )}
+                            <div className="absolute inset-0 z-[1] bg-gradient-to-t from-[#120c09] via-[#120c09]/46 to-transparent" />
+                            <div className="absolute inset-x-0 top-0 z-[2] flex items-start justify-between gap-3 p-4 sm:p-5">
+                              <span className="vehicle-rank-badge">#{index + 1} {rankLabel}</span>
+                              <div className="flex flex-wrap justify-end gap-2">
+                                {vehicle.isFeatured && <span className="vehicle-signal-pill">Featured</span>}
+                                <span className={`vehicle-signal-pill ${vehicle.isVerified ? 'vehicle-signal-pill-success' : ''}`}>
+                                  {vehicle.isVerified ? 'Verified ride' : 'Open listing'}
+                                </span>
+                              </div>
+                            </div>
+                            <div className="absolute inset-x-0 bottom-0 z-[2] p-4 sm:p-5">
+                              <div className="flex flex-wrap gap-2">
+                                {highlightTags.map((tag) => (
+                                  <span key={`${vehicle.id}-${tag}`} className="vehicle-spotlight-tag">
+                                    {tag}
+                                  </span>
+                                ))}
+                              </div>
+                              <div className="mt-4 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+                                <div className="max-w-xl">
+                                  <p className="text-sm text-white/78">{vehicle.location}</p>
+                                  <h3 className="mt-1 text-2xl font-bold text-white sm:text-3xl">{vehicle.title}</h3>
+                                  <p className="mt-2 text-sm leading-6 text-white/80">
+                                    {buildVehicleTeaser(vehicle)}
+                                  </p>
+                                </div>
+                                <div className="vehicle-price-stack self-start sm:self-auto">
+                                  <span className="text-[11px] font-semibold uppercase tracking-[0.22em] text-white/70">
+                                    Starts at
+                                  </span>
+                                  <span className="mt-2 text-2xl font-bold text-white">
+                                    ₱{vehicle.price.toLocaleString()}
+                                  </span>
+                                  <span className="text-sm text-white/75">per day</span>
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="vehicle-spotlight-panel p-4 sm:p-5">
+                            <div className="grid grid-cols-2 gap-3">
+                              <div className="vehicle-stat-chip">
+                                <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-white/58">Bookings</span>
+                                <span className="text-xl font-bold text-white">{vehicle.totalRentals || 0}</span>
+                                <span className="text-xs text-white/62">
+                                  rental{vehicle.totalRentals === 1 ? '' : 's'} recorded
+                                </span>
+                              </div>
+                              <div className="vehicle-stat-chip">
+                                <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-white/58">Rating</span>
+                                <span className="text-xl font-bold text-white">{ratingValue}</span>
+                                <span className="text-xs text-white/62">{reviewLabel}</span>
+                              </div>
+                              <div className="vehicle-stat-chip">
+                                <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-white/58">Safety zone</span>
+                                <span className="text-xl font-bold text-white">{vehicle.boundarySizeMeters}m</span>
+                                <span className="text-xs text-white/62">tracked radius square</span>
+                              </div>
+                              <div className="vehicle-stat-chip">
+                                <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-white/58">Amenities</span>
+                                <span className="text-xl font-bold text-white">{highlightTags.length}</span>
+                                <span className="text-xs text-white/62">quick highlights</span>
+                              </div>
+                            </div>
+
+                            <div className="mt-4 flex flex-wrap gap-2">
+                              {([
+                                ['Hour', getRentalRate(vehicle.rentalRates, 'hour')],
+                                ['Day', getRentalRate(vehicle.rentalRates, 'day')],
+                                ['Week', getRentalRate(vehicle.rentalRates, 'week')],
+                              ] as const).map(([label, amount]) => (
+                                <span key={`${vehicle.id}-${label}`} className="vehicle-rate-chip">
+                                  <span>{label}</span>
+                                  <strong>₱{amount.toLocaleString()}</strong>
+                                </span>
+                              ))}
+                            </div>
+
+                            <div className="mt-5 flex flex-col gap-3 sm:flex-row">
+                              <button
+                                onClick={() => setSelectedVehicle(vehicle)}
+                                className="vehicle-card-button vehicle-card-button-secondary"
+                              >
+                                View details
+                              </button>
+                              <button
+                                onClick={() => openRentalOptions(vehicle)}
+                                className="vehicle-card-button vehicle-card-button-primary"
+                              >
+                                Rent now
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      </article>
+                    );
+                  })}
                   </div>
                 </div>
-              ))}
-            </div>
-            );
-          })()}
-        </div>
+              );
+            })()}
+          </div>
         )}
 
-        {/* New Listings Section */}
+        {/* Vehicle Collection Section */}
         <div className="px-3 sm:px-6 py-3 sm:py-4 flex-1 overflow-y-auto overflow-x-hidden">
-          <div className="flex items-center mb-3 sm:mb-4">
-            <svg className="w-4 h-4 sm:w-5 sm:h-5 text-primary-600 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" />
-            </svg>
-            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between w-full gap-2 sm:gap-0">
-              <h2 className="text-xl sm:text-2xl font-bold text-gray-900">New Listings</h2>
+          <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+            <div className="flex items-start gap-3">
+              <div className="rounded-2xl bg-white/85 p-3 shadow-lg shadow-orange-100">
+                <svg className="h-5 w-5 text-primary-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" />
+                </svg>
+              </div>
+              <div>
+                <h2 className="text-xl sm:text-2xl font-bold text-gray-900">Available Rides</h2>
+                <p className="mt-1 text-sm text-[#6b584b]">
+                  Compare prices, reviews, rental activity, and key amenities without opening every card.
+                </p>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="dashboard-bento-pill bg-white/85 text-[#7b401e] border border-white/80">
+                {filteredVehicles.length} result{filteredVehicles.length === 1 ? '' : 's'}
+              </span>
               {searchLocation && (
-                <span className="text-xs sm:text-sm text-gray-600">
-                  {filteredProperties.length} result{filteredProperties.length !== 1 ? 's' : ''} found
+                <span className="rounded-full border border-orange-100 bg-orange-50 px-3 py-1 text-xs font-semibold text-orange-700">
+                  Near {searchLocation}
                 </span>
               )}
             </div>
           </div>
           <div className="space-y-4 w-full">
             {loading && (
-              <div className="text-center text-gray-600">Loading properties...</div>
+              <div className="text-center text-gray-600">Loading vehicles...</div>
             )}
-            {filteredProperties.map((property, index) => (
-              <div
-                key={property.id}
-                className="backdrop-blur-xl bg-white/70 rounded-3xl shadow-2xl border border-white/30 p-4 hover:shadow-3xl hover:bg-white/80 transition-all duration-300 cursor-pointer transform hover:-translate-y-1"
-                onClick={() => { setSelectedProperty(property); /* setShowMaps(true); */ }}
-              >
-                <div className="flex items-center space-x-4">
-                  <div className="w-14 h-14 rounded-xl overflow-hidden bg-gray-100 flex items-center justify-center flex-shrink-0">
-                    {property.images && property.images[0] ? (
-                      <ImageWithFallback src={property.images[0]} alt={property.title} className="w-full h-full object-cover" data-sb-bucket="property-images" data-sb-path={property.images[0]} />
-                    ) : (
-                    <svg className="w-8 h-8 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
-                    </svg>
-                    )}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2">
-                      <h3 className="font-bold text-lg text-gray-900 truncate">{property.title}</h3>
-                      {property.isVerified ? (
-                        <span className="px-2 py-1 rounded-full text-xs font-semibold bg-gradient-to-r from-green-500 to-green-600 text-white flex items-center gap-1 shadow-md">
-                          <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
-                            <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
-                          </svg>
-                          BH Verified
-                        </span>
-                      ) : (
-                        <span className="px-2 py-1 rounded-full text-xs font-semibold bg-gradient-to-r from-gray-400 to-gray-500 text-white flex items-center gap-1 shadow-md">
-                          <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
-                            <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-13a1 1 0 10-2 0v3.586L7.707 7.293a1 1 0 00-1.414 1.414l3 3a1 1 0 001.414 0l3-3a1 1 0 00-1.414-1.414L11 8.586V5z" clipRule="evenodd" />
-                          </svg>
-                          Pending Verification
-                        </span>
-                      )}
-                    </div>
-                    <p className="text-gray-600 text-sm truncate">{property.location}</p>
-                    <div className="mt-2 flex items-center gap-3">
-                      <span className="text-primary-600 font-bold text-lg">₱{property.price.toLocaleString()}/month</span>
-                      <div className="flex items-center gap-1 text-xs text-gray-600">
-                        <svg className="w-3.5 h-3.5 text-primary-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
-                        </svg>
-                        <span className="font-semibold text-gray-700">{property.totalBookings || 0}</span>
-                        <span className="text-gray-500">booking{property.totalBookings !== 1 ? 's' : ''}</span>
+            {!loading && filteredVehicles.length > 0 && (
+              <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                {filteredVehicles.map((vehicle, index) => {
+                  const highlightTags = buildVehicleHighlights(vehicle, 4);
+                  const ratingValue =
+                    vehicle.rating && vehicle.rating > 0 ? vehicle.rating.toFixed(1) : 'New';
+                  const reviewLabel =
+                    vehicle.totalReviews && vehicle.totalReviews > 0
+                      ? `${vehicle.totalReviews} review${vehicle.totalReviews === 1 ? '' : 's'}`
+                      : 'Fresh listing';
+
+                  return (
+                    <article
+                      key={vehicle.id}
+                      className="vehicle-collection-card group cursor-pointer"
+                      onClick={() => setSelectedVehicle(vehicle)}
+                    >
+                      <div className="grid grid-cols-1 md:grid-cols-[15rem_minmax(0,1fr)]">
+                        <div className="vehicle-collection-media h-64 md:h-full">
+                          {vehicle.images && vehicle.images[0] ? (
+                            <ImageWithFallback
+                              src={vehicle.images[0]}
+                              alt={vehicle.title}
+                              className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-105"
+                              data-sb-bucket="vehicle-images"
+                              data-sb-path={vehicle.images[0]}
+                            />
+                          ) : (
+                            <div className="flex h-full items-center justify-center bg-gradient-to-br from-orange-200 to-orange-100">
+                              <svg className="h-12 w-12 text-orange-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
+                              </svg>
+                            </div>
+                          )}
+                          <div className="absolute inset-0 bg-gradient-to-t from-[#130d0a]/70 via-[#130d0a]/20 to-transparent" />
+                          <div className="absolute left-4 right-4 top-4 z-[2] flex flex-wrap items-start justify-between gap-2">
+                            <div className="flex flex-wrap gap-2">
+                              {index < 3 && <span className="vehicle-rank-badge">Fast moving</span>}
+                              {vehicle.isFeatured && <span className="vehicle-signal-pill">Featured</span>}
+                            </div>
+                            <span className={`vehicle-signal-pill ${vehicle.isVerified ? 'vehicle-signal-pill-success' : ''}`}>
+                              {vehicle.isVerified ? 'Verified ride' : 'Open listing'}
+                            </span>
+                          </div>
+                          <div className="absolute bottom-4 left-4 right-4 z-[2]">
+                            <div className="vehicle-price-stack">
+                              <span className="text-[11px] font-semibold uppercase tracking-[0.22em] text-white/70">
+                                Starts at
+                              </span>
+                              <span className="mt-2 text-2xl font-bold text-white">₱{vehicle.price.toLocaleString()}</span>
+                              <span className="text-sm text-white/75">per day</span>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="p-5 sm:p-6">
+                          <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+                            <div className="min-w-0">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <h3 className="text-2xl font-bold text-[#221711]">{vehicle.title}</h3>
+                                <span className="rounded-full bg-[#fff4ea] px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-[#8b4d24]">
+                                  {vehicle.isVerified ? 'Ready to rent' : 'Preview only'}
+                                </span>
+                              </div>
+                              <p className="mt-2 text-sm text-[#6b584b]">{vehicle.location}</p>
+                            </div>
+
+                            <div className="vehicle-inline-metric lg:min-w-[8.75rem]">
+                              <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[#8f6d5a]">
+                                Rental activity
+                              </span>
+                              <span className="mt-1 text-2xl font-bold text-[#221711]">
+                                {vehicle.totalRentals || 0}
+                              </span>
+                              <span className="text-sm text-[#6b584b]">
+                                booking{vehicle.totalRentals === 1 ? '' : 's'}
+                              </span>
+                            </div>
+                          </div>
+
+                          <p
+                            className="mt-4 text-sm leading-6 text-[#5f4c3f]"
+                            style={{
+                              display: '-webkit-box',
+                              WebkitLineClamp: 3,
+                              WebkitBoxOrient: 'vertical',
+                              overflow: 'hidden',
+                            }}
+                          >
+                            {buildVehicleTeaser(vehicle, 185)}
+                          </p>
+
+                          <div className="mt-4 flex flex-wrap gap-2">
+                            {highlightTags.map((tag) => (
+                              <span key={`${vehicle.id}-${tag}`} className="vehicle-feature-pill">
+                                {tag}
+                              </span>
+                            ))}
+                          </div>
+
+                          <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
+                            <div className="vehicle-inline-metric">
+                              <span className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[#8f6d5a]">Rating</span>
+                              <span className="text-xl font-bold text-[#221711]">{ratingValue}</span>
+                              <span className="text-sm text-[#6b584b]">{reviewLabel}</span>
+                            </div>
+                            <div className="vehicle-inline-metric">
+                              <span className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[#8f6d5a]">Zone</span>
+                              <span className="text-xl font-bold text-[#221711]">{vehicle.boundarySizeMeters}m</span>
+                              <span className="text-sm text-[#6b584b]">tracked area</span>
+                            </div>
+                            <div className="vehicle-inline-metric">
+                              <span className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[#8f6d5a]">Plans</span>
+                              <span className="text-xl font-bold text-[#221711]">{RENTAL_UNITS.length}</span>
+                              <span className="text-sm text-[#6b584b]">hour to month</span>
+                            </div>
+                          </div>
+
+                          <div className="mt-4 flex flex-wrap gap-2">
+                            {([
+                              ['Hour', getRentalRate(vehicle.rentalRates, 'hour')],
+                              ['Day', getRentalRate(vehicle.rentalRates, 'day')],
+                              ['Week', getRentalRate(vehicle.rentalRates, 'week')],
+                              ['Month', getRentalRate(vehicle.rentalRates, 'month')],
+                            ] as const).map(([label, amount]) => (
+                              <span key={`${vehicle.id}-${label}`} className="vehicle-rate-chip">
+                                <span>{label}</span>
+                                <strong>₱{amount.toLocaleString()}</strong>
+                              </span>
+                            ))}
+                          </div>
+
+                          <div className="mt-5 flex flex-col gap-3 sm:flex-row">
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setSelectedVehicle(vehicle);
+                              }}
+                              className="vehicle-card-button vehicle-card-button-secondary"
+                            >
+                              View details
+                            </button>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                openRentalOptions(vehicle);
+                              }}
+                              className="vehicle-card-button vehicle-card-button-primary"
+                            >
+                              Rent now
+                            </button>
+                          </div>
+                        </div>
                       </div>
-                    </div>
-                    <div className="mt-3">
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setSelectedProperty(property);
-                        }}
-                        className="glass-button px-4 py-2 rounded-lg transition-colors duration-200 text-sm font-medium flex items-center space-x-2"
-                      >
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
-                        </svg>
-                        <span>View</span>
-                      </button>
-                    </div>
-                  </div>
-                </div>
+                    </article>
+                  );
+                })}
               </div>
-            ))}
-            {!loading && filteredProperties.length === 0 && (
+            )}
+            {!loading && filteredVehicles.length === 0 && (
               <div className="text-center py-8">
                 <div className="text-gray-500 text-lg mb-2">
-                  {searchLocation ? 'No properties found matching your search.' : 
-                   properties.length === 0 ? 'No properties available at the moment. Please check back later or contact an administrator.' :
-                   'No properties found matching your filters.'}
+                  {searchLocation ? 'No vehicles found matching your search.' : 
+                   vehicles.length === 0 ? 'No vehicles available at the moment. Please check back later or contact an administrator.' :
+                   'No vehicles found matching your filters.'}
                 </div>
                 {searchLocation && (
                   <button
@@ -2252,16 +3614,16 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                     }}
                     className="text-primary-600 hover:text-primary-700 font-medium"
                   >
-                    Clear search and show all properties
+                    Clear search and show all Vehicles
                   </button>
                 )}
-                {properties.length === 0 && !searchLocation && (
+                {vehicles.length === 0 && !searchLocation && (
                   <div className="mt-4 text-sm text-gray-400">
                     <p>This could mean:</p>
                     <ul className="list-disc list-inside mt-2 space-y-1">
-                      <li>No properties have been added yet</li>
-                      <li>All properties are currently unavailable</li>
-                      <li>There might be a database connection issue</li>
+                      <li>No Vehicles have been added yet</li>
+                      <li>All Vehicles are currently unavailable</li>
+                      <li>There might be a system connection issue</li>
                     </ul>
                     <p className="mt-2">Check the browser console for more details.</p>
                   </div>
@@ -2271,33 +3633,314 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
           </div>
         </div>
 
-          {/* Enhanced Booking Form Modal */}
-          {showBookingForm && selectedProperty && (
-            <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-3 sm:p-4 z-50">
-              <div className="backdrop-blur-2xl bg-white/80 rounded-3xl max-w-2xl w-full p-4 sm:p-6 md:p-8 shadow-2xl border border-white/40 max-h-[90vh] overflow-y-auto">
-                <div className="text-center mb-6">
-                  <div className="w-16 h-16 bg-primary-100 rounded-full flex items-center justify-center mx-auto mb-4">
-                    <svg className="w-8 h-8 text-primary-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
-                    </svg>
+          {showRentalOptions && selectedVehicle && (
+            <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/60 backdrop-blur-sm sm:items-center sm:p-4">
+              <div
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="rental-options-title"
+                className="flex h-[100dvh] max-h-[100dvh] w-full max-w-3xl flex-col overflow-hidden rounded-t-3xl border border-white/40 bg-white shadow-2xl sm:h-auto sm:max-h-[min(92dvh,52rem)] sm:rounded-3xl"
+              >
+                <header className="flex shrink-0 items-start justify-between gap-3 border-b border-gray-100 bg-white px-4 py-3 sm:px-6 sm:py-4">
+                  <div className="min-w-0 flex-1">
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-primary-600">Choose rent plan</p>
+                    <h3
+                      id="rental-options-title"
+                      className="mt-0.5 text-lg font-bold text-gray-900 sm:text-2xl"
+                      title={selectedVehicle.title}
+                    >
+                      {selectedVehicle.title}
+                    </h3>
+                    <p className="mt-1 text-xs text-gray-600 sm:text-sm">
+                      Pick the rental duration first, then we will open the rent form.
+                    </p>
                   </div>
-                  <h3 className="text-2xl font-bold text-gray-900 mb-2">Complete Booking Form</h3>
-                  <p className="text-gray-600">
-                    Fill in all required information to book <span className="font-semibold text-primary-600">{selectedProperty.title}</span>
+                  <button
+                    type="button"
+                    onClick={() => setShowRentalOptions(false)}
+                    className="shrink-0 rounded-full p-2 text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-800"
+                    aria-label="Close"
+                  >
+                    <svg className="h-5 w-5 sm:h-6 sm:w-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  </button>
+                </header>
+
+                <div className="min-h-0 flex-1 overflow-y-auto overscroll-y-contain px-4 py-4 sm:px-6 sm:py-5 [-webkit-overflow-scrolling:touch]">
+                  {selectedVehicle.images && selectedVehicle.images.length > 0 && (
+                    <div className="mb-5 max-w-md mx-auto sm:mx-0">
+                      <ImageCarousel
+                        images={selectedVehicle.images}
+                        alt={selectedVehicle.title}
+                        className="w-full"
+                        bucket="vehicle-images"
+                        compact
+                        showcase3d
+                      />
+                    </div>
+                  )}
+
+                  <div className="mb-5">
+                    <RentalBoundaryRentCallout vehicle={selectedVehicle} compact />
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-4 lg:grid-cols-4">
+                    {RENTAL_UNITS.map((unit) => {
+                      const amount = getRentalRate(selectedVehicle.rentalRates, unit);
+                      return (
+                        <button
+                          key={unit}
+                          type="button"
+                          onClick={() => confirmRentalPlan(unit)}
+                          className="group min-h-[10.5rem] text-left rounded-2xl border border-orange-200 bg-gradient-to-br from-orange-50 to-white p-4 hover:border-orange-400 hover:shadow-lg transition-all duration-200 sm:min-h-0"
+                        >
+                          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-orange-600">
+                            {RENTAL_UNIT_LABELS[unit]}
+                          </p>
+                          <p className="text-2xl font-bold text-gray-900 mt-3">
+                            ₱{amount.toLocaleString()}
+                          </p>
+                          <p className="text-sm text-gray-500 mt-1">{RENTAL_UNIT_SUFFIXES[unit]}</p>
+                          <p className="text-sm text-gray-600 mt-4 group-hover:text-gray-800">
+                            Continue with this rent plan
+                          </p>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <footer className="flex shrink-0 justify-end border-t border-gray-100 bg-white px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:px-6">
+                  <button
+                    type="button"
+                    onClick={() => setShowRentalOptions(false)}
+                    className="w-full rounded-xl bg-gray-100 py-3 font-semibold text-gray-700 transition-colors hover:bg-gray-200 sm:w-auto sm:px-8"
+                  >
+                    Cancel
+                  </button>
+                </footer>
+              </div>
+            </div>
+          )}
+
+          {/* Enhanced rental Form Modal — flex column: sticky header/footer, scrollable body */}
+          {showRentalForm && selectedVehicle && (
+            <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/60 backdrop-blur-sm sm:items-center sm:p-4">
+              <div
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="rental-form-main-title"
+                className="flex h-[100dvh] max-h-[100dvh] w-full max-w-2xl flex-col overflow-hidden rounded-t-3xl border border-white/40 bg-white/95 shadow-2xl backdrop-blur-2xl sm:h-auto sm:max-h-[min(90dvh,56rem)] sm:rounded-3xl"
+              >
+                <header className="flex shrink-0 items-start justify-between gap-3 border-b border-gray-100/90 bg-white/95 px-4 py-3 sm:px-6 sm:py-4">
+                  <div className="min-w-0 flex-1">
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-primary-600">Rent request</p>
+                    <h3
+                      id="rental-form-main-title"
+                      className="mt-0.5 truncate text-base font-bold text-gray-900 sm:text-lg"
+                      title={selectedVehicle.title}
+                    >
+                      {selectedVehicle.title}
+                    </h3>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={resetrentalWorkflow}
+                    className="shrink-0 rounded-full p-2 text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-800"
+                    aria-label="Close rent form"
+                  >
+                    <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  </button>
+                </header>
+
+                <div className="min-h-0 flex-1 overflow-y-auto overscroll-y-contain px-4 py-4 sm:px-6 sm:py-5 [-webkit-overflow-scrolling:touch]">
+                <div className="mx-auto max-w-full pb-1">
+                <div className="mb-5 text-center sm:text-left">
+                  {selectedVehicle.images && selectedVehicle.images.length > 0 ? (
+                    <div className="mx-auto mb-4 max-w-lg sm:mx-0">
+                      <ImageCarousel
+                        images={selectedVehicle.images}
+                        alt={selectedVehicle.title}
+                        className="w-full"
+                        bucket="vehicle-images"
+                        showcase3d
+                      />
+                    </div>
+                  ) : (
+                    <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-primary-100 sm:mx-0">
+                      <svg className="h-7 w-7 text-primary-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                      </svg>
+                    </div>
+                  )}
+                  <h4 className="text-xl font-bold text-gray-900 sm:text-2xl">Complete rent form</h4>
+                  <p className="mt-2 text-sm text-gray-600 sm:text-base">
+                    Pick reservation dates and upload your license ID. Personal details come from your profile and cannot be edited here.
                   </p>
                 </div>
+
+                <div className="mb-6 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-800">
+                  <p className="font-semibold text-slate-900">Account details (read-only)</p>
+                  <p className="mt-1 text-slate-700">
+                    Name, email, address, and profile details below are loaded from your saved profile. To change them, close this form and use{' '}
+                    <span className="font-semibold">Edit profile</span> in the menu, then open rent again.
+                  </p>
+                </div>
+
+                <div className="mb-6 bg-primary-50 border border-primary-200 rounded-2xl p-4">
+                  <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-semibold text-primary-700">Selected Rent Plan</p>
+                      <p className="text-xl font-bold text-primary-900">{RENTAL_UNIT_LABELS[selectedRentalUnit]}</p>
+                      <p className="text-sm text-primary-700">
+                        ₱{selectedRentalPrice.toLocaleString()} {RENTAL_UNIT_SUFFIXES[selectedRentalUnit]}
+                      </p>
+                      {selectedRentalUnit === 'hour' && hourlyRentalQuote && (
+                        <div className="mt-2 rounded-lg border border-primary-200/80 bg-white/70 px-3 py-2 text-sm text-primary-900">
+                          {hourlyRentalQuote.valid ? (
+                            <p>
+                              <span className="font-semibold">{hourlyRentalQuote.billableHours}</span> hour
+                              {hourlyRentalQuote.billableHours !== 1 ? 's' : ''} billed × ₱
+                              {hourlyRentalQuote.hourlyRate.toLocaleString()}/hr ={' '}
+                              <span className="font-bold">₱{hourlyRentalQuote.totalAmount.toLocaleString()}</span>
+                            </p>
+                          ) : (
+                            <p className="text-primary-800/90">
+                              Choose dates and times so your return is after pick-up. The total updates automatically.
+                            </p>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                    <button
+                      onClick={() => {
+                        setShowRentalForm(false);
+                        setShowRentalOptions(true);
+                      }}
+                      className="px-4 py-2 bg-white text-primary-700 rounded-xl border border-primary-200 hover:border-primary-300 transition-colors font-semibold"
+                    >
+                      Change Plan
+                    </button>
+                  </div>
+                </div>
+
+                <div className="mb-6">
+                  <RentalBoundaryRentCallout vehicle={selectedVehicle} />
+                </div>
+
+                <div className="mb-6">
+                  <h4 className="text-lg font-semibold text-gray-900 mb-4 pb-2 border-b">
+                    {selectedRentalUnit === 'hour' ? 'Reservation dates & times' : 'Reservation dates'}
+                  </h4>
+                  <p className="text-sm text-gray-600 mb-3">
+                    {selectedRentalUnit === 'hour'
+                      ? 'Pick pick-up and return dates, then set the clock times. Price is the hourly rate times billed hours (rounded up to the next full hour). Same-day returns are fine.'
+                      : 'Choose your pick-up date and return date. The owner may confirm exact pickup and drop-off times with you.'}
+                  </p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-semibold text-gray-700 mb-2">
+                        Pick-up date <span className="text-red-500">*</span>
+                      </label>
+                      <input
+                        type="date"
+                        value={rentalCheckInDate}
+                        min={getLocalDateYmd()}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          setRentalCheckInDate(v);
+                          if (rentalCheckOutDate && rentalCheckOutDate < v) {
+                            setRentalCheckOutDate(v);
+                          }
+                        }}
+                        className="w-full px-4 py-3 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent text-gray-900"
+                        required
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-semibold text-gray-700 mb-2">
+                        Return date <span className="text-red-500">*</span>
+                      </label>
+                      <input
+                        type="date"
+                        value={rentalCheckOutDate}
+                        min={rentalCheckInDate || getLocalDateYmd()}
+                        onChange={(e) => setRentalCheckOutDate(e.target.value)}
+                        className="w-full px-4 py-3 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent text-gray-900"
+                        required
+                      />
+                    </div>
+                  </div>
+                  {selectedRentalUnit === 'hour' && (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-4">
+                      <div>
+                        <label className="block text-sm font-semibold text-gray-700 mb-2">
+                          Pick-up time <span className="text-red-500">*</span>
+                        </label>
+                        <input
+                          type="time"
+                          value={rentalPickUpTime}
+                          onChange={(e) => setRentalPickUpTime(e.target.value)}
+                          className="w-full px-4 py-3 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent text-gray-900"
+                          required
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-sm font-semibold text-gray-700 mb-2">
+                          Return time <span className="text-red-500">*</span>
+                        </label>
+                        <input
+                          type="time"
+                          value={rentalReturnTime}
+                          onChange={(e) => setRentalReturnTime(e.target.value)}
+                          className="w-full px-4 py-3 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent text-gray-900"
+                          required
+                        />
+                      </div>
+                    </div>
+                  )}
+                  {vehicleScheduleLoading && (
+                    <p className="mt-3 text-sm text-gray-500">Checking availability for these dates…</p>
+                  )}
+                  {reservationScheduleNotice?.variant === 'unavailable' && (
+                    <div
+                      className="mt-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-900 flex gap-3"
+                      role="alert"
+                    >
+                      <svg className="w-5 h-5 flex-shrink-0 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                      </svg>
+                      <span>{reservationScheduleNotice.message}</span>
+                    </div>
+                  )}
+                  {reservationScheduleNotice?.variant === 'pending' && (
+                    <div
+                      className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950 flex gap-3"
+                      role="status"
+                    >
+                      <svg className="w-5 h-5 flex-shrink-0 text-amber-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                      </svg>
+                      <span>{reservationScheduleNotice.message}</span>
+                    </div>
+                  )}
+                </div>
                 
-                {/* Personal Information Section */}
+                {/* Personal Information Section (from profile — not editable) */}
                 <div className="mb-6">
                   <h4 className="text-lg font-semibold text-gray-900 mb-4 pb-2 border-b">Personal Information</h4>
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <div className="sm:col-span-2">
                       <label className="block text-sm font-semibold text-gray-700 mb-2">Full Name <span className="text-red-500">*</span></label>
                       <input 
-                        value={bookingFullName} 
-                        onChange={(e) => setBookingFullName(e.target.value)} 
-                        placeholder="Juan Dela Cruz" 
-                        className="w-full px-4 py-3 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent text-gray-900" 
+                        value={rentalFullName} 
+                        readOnly
+                        disabled
+                        placeholder="From your profile" 
+                        className={rentalFormLockedFieldClass}
                         required
                       />
                     </div>
@@ -2305,19 +3948,20 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                       <label className="block text-sm font-semibold text-gray-700 mb-2">Email <span className="text-red-500">*</span></label>
                       <input 
                         type="email" 
-                        value={bookingEmail} 
-                        onChange={(e) => setBookingEmail(e.target.value)} 
-                        placeholder="juan@email.com" 
-                        className="w-full px-4 py-3 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent text-gray-900" 
+                        value={rentalEmail} 
+                        readOnly
+                        disabled
+                        placeholder="From your profile" 
+                        className={rentalFormLockedFieldClass}
                         required
                       />
                     </div>
                     <div>
                       <label className="block text-sm font-semibold text-gray-700 mb-2">Gender <span className="text-red-500">*</span></label>
                       <select 
-                        value={bookingGender} 
-                        onChange={(e) => setBookingGender(e.target.value)} 
-                        className="w-full px-4 py-3 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent text-gray-900"
+                        value={rentalGender} 
+                        disabled
+                        className={rentalFormLockedFieldClass}
                         required
                       >
                         <option value="">Select Gender</option>
@@ -2330,21 +3974,22 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                       <label className="block text-sm font-semibold text-gray-700 mb-2">Age <span className="text-red-500">*</span></label>
                       <input 
                         type="number" 
-                        value={bookingAge} 
-                        onChange={(e) => setBookingAge(e.target.value)} 
-                        placeholder="25" 
+                        value={rentalAge} 
+                        readOnly
+                        disabled
+                        placeholder="From your profile" 
                         min="18" 
                         max="100"
-                        className="w-full px-4 py-3 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent text-gray-900" 
+                        className={rentalFormLockedFieldClass}
                         required
                       />
                     </div>
                     <div>
                       <label className="block text-sm font-semibold text-gray-700 mb-2">Citizenship <span className="text-red-500">*</span></label>
                       <select 
-                        value={bookingCitizenship} 
-                        onChange={(e) => setBookingCitizenship(e.target.value)} 
-                        className="w-full px-4 py-3 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent text-gray-900"
+                        value={rentalCitizenship} 
+                        disabled
+                        className={rentalFormLockedFieldClass}
                         required
                       >
                         <option value="">Select Citizenship</option>
@@ -2355,9 +4000,9 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                     <div>
                       <label className="block text-sm font-semibold text-gray-700 mb-2">Occupation Status <span className="text-red-500">*</span></label>
                       <select 
-                        value={bookingOccupationStatus} 
-                        onChange={(e) => setBookingOccupationStatus(e.target.value)} 
-                        className="w-full px-4 py-3 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent text-gray-900"
+                        value={rentalOccupationStatus} 
+                        disabled
+                        className={rentalFormLockedFieldClass}
                         required
                       >
                         <option value="">Select Status</option>
@@ -2368,337 +4013,232 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                   </div>
                 </div>
 
-                {/* Address Section */}
+                {/* Address Section (from profile — not editable) */}
                 <div className="mb-6">
                   <h4 className="text-lg font-semibold text-gray-900 mb-4 pb-2 border-b">Address Information</h4>
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <div className="sm:col-span-2">
                       <label className="block text-sm font-semibold text-gray-700 mb-2">Address <span className="text-red-500">*</span></label>
                       <input 
-                        value={bookingAddress} 
-                        onChange={(e) => setBookingAddress(e.target.value)} 
-                        placeholder="Street Address" 
-                        className="w-full px-4 py-3 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent text-gray-900" 
+                        value={rentalAddress} 
+                        readOnly
+                        disabled
+                        placeholder="From your profile" 
+                        className={rentalFormLockedFieldClass}
                         required
                       />
                     </div>
                     <div>
                       <label className="block text-sm font-semibold text-gray-700 mb-2">Barangay <span className="text-red-500">*</span></label>
                       <input 
-                        value={bookingBarangay} 
-                        onChange={(e) => setBookingBarangay(e.target.value)} 
-                        placeholder="Barangay Name" 
-                        className="w-full px-4 py-3 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent text-gray-900" 
+                        value={rentalBarangay} 
+                        readOnly
+                        disabled
+                        placeholder="From your profile" 
+                        className={rentalFormLockedFieldClass}
                         required
                       />
                     </div>
                     <div>
                       <label className="block text-sm font-semibold text-gray-700 mb-2">Municipality/City <span className="text-red-500">*</span></label>
                       <input 
-                        value={bookingMunicipalityCity} 
-                        onChange={(e) => setBookingMunicipalityCity(e.target.value)} 
-                        placeholder="City or Municipality" 
-                        className="w-full px-4 py-3 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent text-gray-900" 
+                        value={rentalMunicipalityCity} 
+                        readOnly
+                        disabled
+                        placeholder="From your profile" 
+                        className={rentalFormLockedFieldClass}
                         required
                       />
                     </div>
                   </div>
                 </div>
 
-                {/* Room and Bed Selection - Table Format */}
+                {/* License ID document upload (rent form) */}
                 <div className="mb-6">
-                  <h4 className="text-lg font-semibold text-gray-900 mb-4 pb-2 border-b">Room & Bed Selection <span className="text-red-500">*</span></h4>
-                  
-                  {availableRooms.length === 0 ? (
-                    <div className="w-full px-4 py-3 border border-gray-200 rounded-xl bg-gray-50 text-gray-500 text-center">
-                      No rooms available. Please contact the landlord.
+                  <h4 className="text-lg font-semibold text-gray-900 mb-4 pb-2 border-b">Upload license ID <span className="text-red-500">*</span></h4>
+                  <div className="space-y-4">
+                    <div className="border-2 border-dashed border-gray-300 rounded-xl p-6 text-center hover:border-primary-500 transition-colors cursor-pointer bg-gray-50 hover:bg-primary-50"
+                      onClick={() => {
+                        const input = document.getElementById('idDocumentInput') as HTMLInputElement;
+                        input?.click();
+                      }}>
+                      <input 
+                        id="idDocumentInput"
+                        type="file" 
+                        accept="image/*,.pdf"
+                        style={{ display: 'none' }}
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (file) {
+                            setIdDocumentFile(file);
+                            const reader = new FileReader();
+                            reader.onload = (event) => {
+                              setIdDocumentPreview(event.target?.result as string);
+                            };
+                            reader.readAsDataURL(file);
+                          }
+                        }}
+                        required
+                      />
+                      <svg className="w-12 h-12 text-primary-400 mx-auto mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+                      </svg>
+                      <p className="text-gray-900 font-semibold mb-1">Upload your license ID</p>
+                      <p className="text-sm text-gray-600">Click here to select a photo or scan of your license ID (image or PDF)</p>
+                      <p className="text-xs text-gray-500 mt-2">Supported formats: JPG, PNG, GIF, PDF (Max 10MB)</p>
                     </div>
-                  ) : (
-                    <div className="space-y-6">
-                      {/* Rooms Table */}
-                      <div>
-                        <label className="block text-sm font-semibold text-gray-700 mb-3">Select Room</label>
-                        <div className="overflow-x-auto border border-gray-200 rounded-xl">
-                          <table className="w-full">
-                            <thead className="bg-gray-50">
-                              <tr>
-                                <th className="px-4 py-3 text-left text-xs font-semibold text-gray-700 uppercase">Room</th>
-                                <th className="px-4 py-3 text-left text-xs font-semibold text-gray-700 uppercase">Name</th>
-                                <th className="px-4 py-3 text-left text-xs font-semibold text-gray-700 uppercase">Available Beds</th>
-                                <th className="px-4 py-3 text-left text-xs font-semibold text-gray-700 uppercase">Status</th>
-                                <th className="px-4 py-3 text-left text-xs font-semibold text-gray-700 uppercase">Action</th>
-                              </tr>
-                            </thead>
-                            <tbody className="divide-y divide-gray-200">
-                              {availableRooms.map((room: any) => (
-                                <tr 
-                                  key={room.id} 
-                                  className={`hover:bg-gray-50 transition-colors ${
-                                    selectedRoomId === room.id ? 'bg-primary-50 border-l-4 border-l-primary-600' : ''
-                                  }`}
-                                >
-                                  <td className="px-4 py-3 text-gray-900 font-medium">
-                                    {room.room_number}
-                                  </td>
-                                  <td className="px-4 py-3 text-gray-700">
-                                    {room.room_name || `Room ${room.room_number}`}
-                                  </td>
-                                  <td className="px-4 py-3 text-gray-700">
-                                    {room.max_beds - room.current_occupancy} / {room.max_beds}
-                                  </td>
-                                  <td className="px-4 py-3">
-                                    <span className={`px-3 py-1 rounded-full text-xs font-semibold ${
-                                      room.status === 'available' ? 'bg-green-100 text-green-800' :
-                                      room.status === 'full' ? 'bg-red-100 text-red-800' :
-                                      'bg-yellow-100 text-yellow-800'
-                                    }`}>
-                                      {room.status === 'available' ? 'Available' : room.status === 'full' ? 'Full' : 'Maintenance'}
-                                    </span>
-                                  </td>
-                                  <td className="px-4 py-3">
-                                    <button
-                                      onClick={() => {
-                                        setSelectedRoomId(room.id);
-                                        loadBedsForRoom(room.id);
-                                        setSelectedBedId(''); // Reset bed selection when room changes
-                                      }}
-                                      className={`px-4 py-2 rounded-lg text-sm font-semibold transition-colors ${
-                                        selectedRoomId === room.id
-                                          ? 'glass-button'
-                                          : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                                      }`}
-                                    >
-                                      {selectedRoomId === room.id ? 'Selected' : 'Select'}
-                                    </button>
-                                  </td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
+                    
+                    {idDocumentPreview && (
+                      <div className="mt-4 p-4 bg-green-50 border border-green-200 rounded-xl">
+                        <div className="flex items-start gap-3">
+                          <svg className="w-5 h-5 text-green-600 flex-shrink-0 mt-0.5" fill="currentColor" viewBox="0 0 20 20">
+                            <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                          </svg>
+                          <div className="flex-1">
+                            <p className="text-sm font-semibold text-green-900">File uploaded successfully</p>
+                            <p className="text-xs text-green-700 mt-1">{idDocumentFile?.name}</p>
+                            {idDocumentPreview && idDocumentPreview.includes('data:image') && (
+                              <img src={idDocumentPreview} alt="License ID preview" className="mt-3 max-h-32 rounded-lg" />
+                            )}
+                          </div>
+                          <button
+                            onClick={() => {
+                              setIdDocumentFile(null);
+                              setIdDocumentPreview(null);
+                            }}
+                            className="text-green-600 hover:text-green-800 font-medium text-sm"
+                          >
+                            Remove
+                          </button>
                         </div>
                       </div>
-
-                      {/* Beds Table - Show when room is selected */}
-                      {selectedRoomId && (
-                        <div>
-                          <label className="block text-sm font-semibold text-gray-700 mb-3">Select Bed Space</label>
-                          {loadingBeds ? (
-                            <div className="w-full px-4 py-8 border border-gray-200 rounded-xl bg-gray-50 text-center">
-                              <div className="flex flex-col items-center justify-center gap-3">
-                                <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary-600"></div>
-                                <p className="text-gray-600 font-medium">Loading beds...</p>
-                              </div>
-                            </div>
-                          ) : availableBeds.length > 0 ? (
-                            <div className="overflow-x-auto border border-gray-200 rounded-xl">
-                              <table className="w-full">
-                                <thead className="bg-gray-50">
-                                  <tr>
-                                    <th className="px-4 py-3 text-left text-xs font-semibold text-gray-700 uppercase">Bed Number</th>
-                                    <th className="px-4 py-3 text-left text-xs font-semibold text-gray-700 uppercase">Bed Type</th>
-                                    <th className="px-4 py-3 text-left text-xs font-semibold text-gray-700 uppercase">Status</th>
-                                    <th className="px-4 py-3 text-left text-xs font-semibold text-gray-700 uppercase">Action</th>
-                                  </tr>
-                                </thead>
-                                <tbody className="divide-y divide-gray-200">
-                                  {availableBeds.map((bed: any) => {
-                                    const canBook = bed.canBook !== false && bed.status === 'available' && !bed.isBooked;
-                                    const isSelected = selectedBedId === bed.id;
-                                    const isOccupied = bed.status === 'occupied' || bed.isBooked;
-                                    
-                                    return (
-                                      <tr 
-                                        key={bed.id}
-                                        className={`transition-colors ${
-                                          isSelected ? 'bg-primary-50 border-l-4 border-l-primary-600' :
-                                          canBook ? 'hover:bg-green-50' : 'opacity-60 bg-gray-50'
-                                        }`}
-                                      >
-                                        <td className="px-4 py-3 text-gray-900 font-medium">
-                                          {bed.bed_number}
-                                          {isOccupied && (
-                                            <span className="ml-2 text-xs text-red-600 font-semibold">(Occupied)</span>
-                                          )}
-                                        </td>
-                                        <td className="px-4 py-3 text-gray-700">
-                                          {bed.bed_type ? bed.bed_type.replace(/_/g, ' ').replace(/\b\w/g, (l: string) => l.toUpperCase()) : 'Single'}
-                                          {bed.deck_position && ` (${bed.deck_position})`}
-                                        </td>
-                                        <td className="px-4 py-3">
-                                          <div className="flex items-center gap-2">
-                                            <span className={`inline-block w-3 h-3 rounded-full ${
-                                              canBook ? 'bg-green-500' : 'bg-red-500'
-                                            }`}></span>
-                                            <span className={`text-sm font-medium ${
-                                              canBook ? 'text-green-700' : 'text-red-700'
-                                            }`}>
-                                              {canBook ? 'Available' : isOccupied ? 'Occupied' : 'Unavailable'}
-                                            </span>
-                                          </div>
-                                        </td>
-                                        <td className="px-4 py-3">
-                                          <button
-                                            onClick={() => {
-                                              if (canBook) {
-                                                setSelectedBedId(bed.id);
-                                              } else {
-                                                alert('This bed is already occupied and cannot be booked. Please select an available bed.');
-                                              }
-                                            }}
-                                            disabled={!canBook}
-                                            className={`px-4 py-2 rounded-lg text-sm font-semibold transition-colors ${
-                                              isSelected
-                                                ? 'glass-button'
-                                                : canBook
-                                                ? 'bg-green-100 text-green-700 hover:bg-green-200'
-                                                : 'bg-gray-200 text-gray-400 cursor-not-allowed'
-                                            }`}
-                                            title={!canBook ? 'This bed is occupied and cannot be booked' : 'Click to select this bed'}
-                                          >
-                                            {isSelected ? 'Selected' : canBook ? 'Select' : 'Occupied'}
-                                          </button>
-                                        </td>
-                                      </tr>
-                                    );
-                                  })}
-                                </tbody>
-                              </table>
-                            </div>
-                          ) : (
-                            <div className="w-full px-4 py-3 border border-gray-200 rounded-xl bg-gray-50 text-gray-500 text-center">
-                              No beds available for this room.
-                            </div>
-                          )}
-                        </div>
-                      )}
-
-                      {/* Selection Summary */}
-                      {selectedRoomId && selectedBedId && (
-                        <div className="bg-primary-50 border border-primary-200 rounded-xl p-4">
-                          <div className="flex items-center justify-between">
-                            <div>
-                              <p className="text-sm font-semibold text-primary-900">Selected:</p>
-                              <p className="text-sm text-primary-700">
-                                {availableRooms.find((r: any) => r.id === selectedRoomId)?.room_name || 
-                                 `Room ${availableRooms.find((r: any) => r.id === selectedRoomId)?.room_number}`} - 
-                                Bed {availableBeds.find((b: any) => b.id === selectedBedId)?.bed_number}
-                              </p>
-                            </div>
-                            <button
-                              onClick={() => {
-                                setSelectedRoomId('');
-                                setSelectedBedId('');
-                                setAvailableBeds([]);
-                              }}
-                              className="text-sm text-primary-600 hover:text-primary-800 font-medium"
-                            >
-                              Clear Selection
-                            </button>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  )}
+                    )}
+                  </div>
                 </div>
 
-                {/* Additional Message */}
                 <div className="mb-6">
-                  <label className="block text-sm font-semibold text-gray-700 mb-3">Additional Message (Optional)</label>
-                  <textarea 
-                    value={bookingMessage} 
-                    onChange={(e) => setBookingMessage(e.target.value)} 
-                    placeholder="Tell the landlord about yourself, your requirements, and why you're interested in this property..." 
-                    className="w-full h-32 px-4 py-3 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent text-gray-900 placeholder-gray-500 resize-none" 
+                  <h4 className="text-lg font-semibold text-gray-900 mb-4 pb-2 border-b">
+                    Driver&apos;s license <span className="text-red-500">*</span>
+                  </h4>
+                  <p className="text-sm text-gray-600 mb-3">
+                    Enter the number on your driver&apos;s license (or valid driving permit). The owner may verify this at handover.
+                  </p>
+                  <label className="block text-sm font-semibold text-gray-700 mb-2" htmlFor="rental-driver-license">
+                    License number
+                  </label>
+                  <input
+                    id="rental-driver-license"
+                    type="text"
+                    value={rentalDriverLicense}
+                    onChange={(e) => setRentalDriverLicense(e.target.value)}
+                    autoComplete="off"
+                    placeholder="e.g. N01-23-456789"
+                    className="w-full px-4 py-3 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent text-gray-900"
+                    required
                   />
                 </div>
 
-                {/* Payment Disclaimer */}
-                <div className="mb-6 p-4 bg-yellow-50 border border-yellow-200 rounded-xl">
-                  <div className="flex items-start space-x-3">
-                    <svg className="w-5 h-5 text-yellow-600 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-                    </svg>
-                    <div className="flex-1">
-                      <p className="text-sm font-semibold text-yellow-900 mb-1">Payment Notice</p>
-                      <p className="text-sm text-yellow-800">
-                        Please note that payment processing is handled outside of this system. After your booking request is approved, you will need to coordinate payment directly with the landlord through the messaging system or other agreed-upon methods.
-                      </p>
-                    </div>
+                <div className="mb-6">
+                  <h4 className="text-lg font-semibold text-gray-900 mb-4 pb-2 border-b">Payment</h4>
+                  <div>
+                    <label className="block text-sm font-semibold text-gray-700 mb-2">Preferred Payment Method</label>
+                    <select
+                      value={rentalPaymentMethod}
+                      onChange={(e) => setRentalPaymentMethod(e.target.value as (typeof PAYMENT_METHODS)[number])}
+                      className="w-full px-4 py-3 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent text-gray-900"
+                    >
+                      {PAYMENT_METHODS.map((method) => (
+                        <option key={method} value={method}>{method}</option>
+                      ))}
+                    </select>
+                    <p className="mt-2 text-xs text-gray-500">Final payment confirmation is handled by the owner after approval.</p>
                   </div>
                 </div>
                 
-                <div className="flex gap-4">
-                  <button 
-                    onClick={() => {
-                      setShowBookingForm(false);
-                      // Reset form
-                      setBookingFullName('');
-                      setBookingAddress('');
-                      setBookingBarangay('');
-                      setBookingMunicipalityCity('');
-                      setBookingGender('');
-                      setBookingAge('');
-                      setBookingCitizenship('');
-                      setBookingOccupationStatus('');
-                      setSelectedRoomId('');
-                      setSelectedBedId('');
-                      setAvailableRooms([]);
-                      setAvailableBeds([]);
-                    }} 
-                    className="flex-1 bg-gray-100 text-gray-700 py-3 rounded-xl hover:bg-gray-200 transition-colors duration-200 font-semibold"
-                  >
-                    Cancel
-                  </button>
-                  <button 
-                    onClick={showBookingPreviewModal} 
-                    className="flex-1 bg-gradient-to-r from-primary-600 to-primary-700 text-white py-3 rounded-xl hover:from-primary-700 hover:to-primary-800 transition-all duration-200 font-semibold shadow-lg hover:shadow-xl transform hover:-translate-y-0.5"
-                  >
-                    Preview Booking Request
-                  </button>
                 </div>
+                </div>
+
+                <footer className="shrink-0 border-t border-gray-100 bg-white/95 px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:px-6 sm:py-4">
+                  <div className="flex flex-col gap-2 sm:flex-row sm:gap-3">
+                    <button
+                      type="button"
+                      onClick={resetrentalWorkflow}
+                      className="w-full rounded-xl bg-gray-100 py-3 font-semibold text-gray-700 transition-colors hover:bg-gray-200 sm:flex-1 sm:py-3.5"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      onClick={showrentalPreviewModal}
+                      disabled={
+                        vehicleScheduleLoading || reservationScheduleNotice?.variant === 'unavailable'
+                      }
+                      className={`w-full rounded-xl py-3 font-semibold shadow-lg transition-all duration-200 sm:flex-1 sm:py-3.5 ${
+                        vehicleScheduleLoading || reservationScheduleNotice?.variant === 'unavailable'
+                          ? 'cursor-not-allowed bg-gray-300 text-gray-500 shadow-none'
+                          : 'bg-gradient-to-r from-primary-600 to-primary-700 text-white hover:from-primary-700 hover:to-primary-800 hover:shadow-xl active:scale-[0.99] sm:hover:-translate-y-0.5'
+                      }`}
+                    >
+                      Preview rent request
+                    </button>
+                  </div>
+                </footer>
               </div>
             </div>
           )}
 
         {/* Info Modal (no map) */}
-        {selectedProperty && !showMaps && !showBookingForm && (
+        {selectedVehicle && !showMaps && !showRentalForm && !showRentalOptions && (
           <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-3 sm:p-4 z-50">
             <div className="backdrop-blur-2xl bg-white/80 rounded-3xl max-w-2xl w-full max-h-[90vh] overflow-y-auto shadow-2xl border border-white/40">
               <div className="p-4 sm:p-6">
                 <div className="flex justify-between items-center mb-4">
-                  <h2 className="text-2xl font-bold text-gray-900 truncate pr-4">{selectedProperty.title}</h2>
-                  <button onClick={() => setSelectedProperty(null)} className="text-gray-400 hover:text-gray-600 transition-colors duration-200 p-2 hover:bg-gray-100 rounded-full">
+                  <h2 className="text-2xl font-bold text-gray-900 truncate pr-4">{selectedVehicle.title}</h2>
+                  <button onClick={() => setSelectedVehicle(null)} className="text-gray-400 hover:text-gray-600 transition-colors duration-200 p-2 hover:bg-gray-100 rounded-full">
                     <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12"/></svg>
                   </button>
                 </div>
 
-                <div className="rounded-2xl overflow-hidden border border-gray-200 mb-4">
-                  {selectedProperty.images && selectedProperty.images.length > 0 ? (
-                    <ImageCarousel 
-                      images={selectedProperty.images} 
-                      alt={selectedProperty.title}
+                {selectedVehicleOutsideBoundary && (
+                  <div
+                    className="mb-4 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-950"
+                    role="alert"
+                  >
+                    <strong>Outside allowed area.</strong> Last reported GPS is outside this vehicle&apos;s rental
+                    boundary. Check your notifications for details.
+                  </div>
+                )}
+
+                <div className="mb-4">
+                  {selectedVehicle.images && selectedVehicle.images.length > 0 ? (
+                    <ImageCarousel
+                      images={selectedVehicle.images}
+                      alt={selectedVehicle.title}
                       className="w-full"
-                      bucket="property-images"
+                      bucket="vehicle-images"
+                      showcase3d
                     />
                   ) : (
-                    <div className="w-full h-64 flex items-center justify-center text-gray-400">No image</div>
+                    <div className="w-full h-64 flex items-center justify-center text-gray-400 rounded-2xl border border-gray-200">
+                      No image
+                    </div>
                   )}
                 </div>
 
                 <div className="grid grid-cols-1 gap-4">
                   <div>
                     <h3 className="font-semibold text-gray-900 mb-1">Location</h3>
-                    <div className="text-gray-700">{selectedProperty.location}</div>
+                    <div className="text-gray-700">{selectedVehicle.location}</div>
                   </div>
                   <div>
                     <h3 className="font-semibold text-gray-900 mb-1">Description</h3>
-                    <div className="text-gray-700">{selectedProperty.description}</div>
+                    <div className="text-gray-700">{selectedVehicle.description}</div>
                   </div>
-                  {selectedProperty.amenities?.length > 0 && (
+                  {selectedVehicle.features?.length > 0 && (
                     <div>
-                      <h3 className="font-semibold text-gray-900 mb-2">Amenities</h3>
+                      <h3 className="font-semibold text-gray-900 mb-2">Features</h3>
                       <div className="flex flex-wrap gap-2">
-                        {selectedProperty.amenities.map((a, i) => (
+                        {selectedVehicle.features.map((a: string, i: number) => (
                           <span key={i} className="px-3 py-1 bg-gray-100 rounded-lg text-sm text-gray-700">{a}</span>
                         ))}
                       </div>
@@ -2743,11 +4283,11 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
 
                 <div className="flex items-center justify-between mt-6">
                   <div className="flex items-center space-x-4">
-                    <div className="text-primary-600 font-bold text-xl">₱{selectedProperty.price.toLocaleString()}</div>
+                    <div className="text-primary-600 font-bold text-xl">₱{selectedVehicle.price.toLocaleString()}</div>
                     {(() => {
-                      // Calculate rating from reviews if property rating is not available
-                      let displayRating = selectedProperty.rating;
-                      let displayTotalReviews = selectedProperty.totalReviews || 0;
+                      // Calculate rating from reviews if vehicle rating is not available
+                      let displayRating = selectedVehicle.rating;
+                      let displayTotalReviews = selectedVehicle.totalReviews || 0;
                       
                       if (reviews.length > 0 && (!displayRating || displayRating === 0)) {
                         const totalRating = reviews.reduce((sum, r) => sum + (r.rating || 0), 0);
@@ -2776,8 +4316,8 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                     })()}
                   </div>
                   <div className="flex space-x-2">
-                    <button onClick={() => { setShowBookingForm(true); }} className="glass-button px-5 py-2.5 rounded-xl hover:opacity-90">Book</button>
-                    <button onClick={() => { setShowReviewForm(true); loadReviews(selectedProperty.id); }} className="bg-green-600 text-white px-5 py-2.5 rounded-xl hover:bg-green-700">Write Review</button>
+                    <button onClick={() => openRentalOptions(selectedVehicle)} className="glass-button px-5 py-2.5 rounded-xl hover:opacity-90">Rent</button>
+                    <button onClick={() => { setShowReviewForm(true); loadReviews(selectedVehicle.id); }} className="bg-green-600 text-white px-5 py-2.5 rounded-xl hover:bg-green-700">Write Review</button>
                   </div>
                 </div>
                 </div>
@@ -2791,48 +4331,64 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
             <div className="backdrop-blur-2xl bg-white/80 rounded-none sm:rounded-3xl max-w-4xl w-full h-full sm:h-auto sm:max-h-[90vh] overflow-y-auto shadow-2xl border border-white/40">
               <div className="p-4 sm:p-6 relative">
                 <div className="flex justify-between items-center mb-6">
-                  <h2 className="text-2xl font-bold text-gray-900">Property Maps</h2>
+                  <h2 className="text-2xl font-bold text-gray-900">vehicle Maps</h2>
                   <button onClick={() => setShowMaps(false)} className="text-gray-400 hover:text-gray-600 transition-colors duration-200 p-2 hover:bg-gray-100 rounded-full">
                     <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12"/></svg>
                   </button>
                 </div>
+                {selectedVehicle && selectedVehicleOutsideBoundary && (
+                  <div
+                    className="mb-4 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-950"
+                    role="alert"
+                  >
+                    <strong>Outside allowed area.</strong> This vehicle&apos;s last reported position is outside its
+                    boundary. Open notifications for alerts.
+                  </div>
+                )}
                 <div className="grid grid-cols-1 gap-4">
                   <div className="h-96 bg-gray-100 rounded-2xl overflow-hidden relative" style={{ position: 'relative', zIndex: 1, minHeight: '384px' }}>
-                <GoogleMap
-                      center={(selectedProperty ? selectedProperty.coordinates : ((filteredProperties[0] || properties[0])?.coordinates)) || { lat: 11.7778, lng: 124.8847 }}
+                    <GoogleMap
+                      center={(selectedVehicle ? selectedVehicle.coordinates : ((filteredVehicles[0] || vehicles[0])?.coordinates)) || { lat: 11.7778, lng: 124.8847 }}
                       zoom={15}
-                    satellite={true}
+                      satellite={true}
                       preferLeaflet={true}
-                      markers={(filteredProperties.length ? filteredProperties : properties).map((p) => ({
+                      markers={(filteredVehicles.length ? filteredVehicles : vehicles).map((p) => ({
                         position: p.coordinates,
                         title: p.title,
                         info: p.description,
                         iconUrl: p.images && p.images[0] ? p.images[0] : undefined
                       }))}
+                      polygons={selectedVehicle ? [{
+                        path: getSquareBoundaryPath(selectedVehicle.boundary),
+                        strokeColor: '#2563eb',
+                        strokeWeight: 2,
+                        fillColor: '#60a5fa',
+                        fillOpacity: 0.08,
+                      }] : []}
                       onMarkerClick={(i) => {
-                        const list = filteredProperties.length ? filteredProperties : properties;
-                        setSelectedProperty(list[i]);
+                        const list = filteredVehicles.length ? filteredVehicles : vehicles;
+                        setSelectedVehicle(list[i]);
                       }}
                     className="h-full w-full"
                   />
                   </div>
                 </div>
 
-                {selectedProperty && (
-                  <div className="absolute inset-0" onClick={() => setSelectedProperty(null)} style={{ zIndex: 2 }}>
+                {selectedVehicle && (
+                  <div className="absolute inset-0" onClick={() => setSelectedVehicle(null)} style={{ zIndex: 2 }}>
                     <div className="absolute inset-0 bg-black/40 z-[900]"></div>
                     <div className="absolute inset-y-0 right-0 z-[1000] w-full sm:w-[28rem] md:w-[32rem] bg-white shadow-2xl border-l border-gray-100 flex flex-col overflow-hidden" onClick={(e) => e.stopPropagation()} style={{ position: 'absolute' }}>
                       <div className="px-4 sm:px-5 pt-3 sm:pt-4">
                         <div className="flex items-center justify-between">
-                          <h3 className="text-xl sm:text-2xl font-bold text-gray-900 truncate pr-4">{selectedProperty.title}</h3>
-                          <button onClick={() => setSelectedProperty(null)} className="text-gray-400 hover:text-gray-600 p-1 rounded-md hover:bg-gray-100">
+                          <h3 className="text-xl sm:text-2xl font-bold text-gray-900 truncate pr-4">{selectedVehicle.title}</h3>
+                          <button onClick={() => setSelectedVehicle(null)} className="text-gray-400 hover:text-gray-600 p-1 rounded-md hover:bg-gray-100">
                             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12"/></svg>
                           </button>
                         </div>
                         <div className="mt-3 border-b border-gray-200">
                           <nav className="-mb-px flex gap-4">
                             <button onClick={() => setInfoTab('overview')} className={`px-2 pb-3 text-sm font-semibold ${infoTab==='overview' ? 'border-b-2 border-primary-600 text-primary-600' : 'text-gray-600 hover:text-gray-800'}`}>Overview</button>
-                            <button onClick={() => setInfoTab('amenities')} className={`px-2 pb-3 text-sm font-semibold ${infoTab==='amenities' ? 'border-b-2 border-primary-600 text-primary-600' : 'text-gray-600 hover:text-gray-800'}`}>Amenities</button>
+                            <button onClick={() => setInfoTab('features')} className={`px-2 pb-3 text-sm font-semibold ${infoTab==='features' ? 'border-b-2 border-primary-600 text-primary-600' : 'text-gray-600 hover:text-gray-800'}`}>Features</button>
                             <button onClick={() => setInfoTab('photos')} className={`px-2 pb-3 text-sm font-semibold ${infoTab==='photos' ? 'border-b-2 border-primary-600 text-primary-600' : 'text-gray-600 hover:text-gray-800'}`}>Photos</button>
                           </nav>
                         </div>
@@ -2841,47 +4397,93 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                       <div className="p-5 overflow-y-auto flex-1 min-h-0">
                         {infoTab === 'overview' && (
                           <div>
-                            <div className="rounded-xl overflow-hidden border mb-4">
-                              {selectedProperty.images && selectedProperty.images.length > 0 ? (
-                                <ImageCarousel 
-                                  images={selectedProperty.images} 
-                                  alt={selectedProperty.title}
+                            <div className="mb-4">
+                              {selectedVehicle.images && selectedVehicle.images.length > 0 ? (
+                                <ImageCarousel
+                                  images={selectedVehicle.images}
+                                  alt={selectedVehicle.title}
                                   className="w-full"
-                                  bucket="property-images"
+                                  bucket="vehicle-images"
                                   compact={true}
                                   showThumbnails={false}
+                                  showcase3d
                                 />
                               ) : (
-                                <div className="w-full h-48 flex items-center justify-center text-gray-400">No image</div>
+                                <div className="w-full h-48 flex items-center justify-center text-gray-400 rounded-xl border">
+                                  No image
+                                </div>
                               )}
                             </div>
-                            <div className="text-sm text-gray-600 mb-2">{selectedProperty.location}</div>
-                            <div className="text-gray-700 mb-6">{selectedProperty.description}</div>
+                            <div className="text-sm text-gray-600 mb-2">{selectedVehicle.location}</div>
+                            <div className="text-gray-700 mb-6">{selectedVehicle.description}</div>
+                            {selectedVehicleOutsideBoundary && (
+                              <div
+                                className="mb-4 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-950"
+                                role="alert"
+                              >
+                                <strong>Outside allowed area.</strong> Last GPS is outside the rental boundary. Check
+                                notifications.
+                              </div>
+                            )}
+                            <div className="grid grid-cols-2 gap-3 mb-6">
+                              <div className="rounded-xl bg-blue-50 border border-blue-100 p-3">
+                                <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-blue-700">Boundary</p>
+                                <p className="text-sm font-bold text-gray-900 mt-2">
+                                  {selectedVehicle.boundarySizeMeters.toLocaleString()}m x {selectedVehicle.boundarySizeMeters.toLocaleString()}m
+                                </p>
+                              </div>
+                              <div className="rounded-xl bg-blue-50 border border-blue-100 p-3">
+                                <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-blue-700">Coverage</p>
+                                <p className="text-sm font-bold text-gray-900 mt-2">
+                                  {getSquareArea(selectedVehicle.boundarySizeMeters).toLocaleString()} sq m
+                                </p>
+                              </div>
+                              {(selectedVehicle.outOfBoundaryPenaltyPhp ?? 0) > 0 && (
+                                <div className="col-span-2 rounded-xl border border-amber-200 bg-amber-50 p-3">
+                                  <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-amber-800">
+                                    Out-of-boundary penalty
+                                  </p>
+                                  <p className="text-sm font-bold text-gray-900 mt-2">
+                                    ₱{selectedVehicle.outOfBoundaryPenaltyPhp.toLocaleString()}
+                                  </p>
+                                  <p className="text-xs text-amber-900/80 mt-1">
+                                    Owner-listed fee if GPS leaves the allowed zone during rental.
+                                  </p>
+                                </div>
+                              )}
+                            </div>
                             <div className="flex items-center justify-between">
-                              <div className="text-primary-600 font-bold text-lg">₱{selectedProperty.price.toLocaleString()}</div>
-                              <button onClick={() => { setShowMaps(false); setShowBookingForm(true); }} className="glass-button px-4 py-2 rounded-lg hover:opacity-90">Book</button>
+                              <div className="text-primary-600 font-bold text-lg">₱{selectedVehicle.price.toLocaleString()}</div>
+                              <button onClick={() => openRentalOptions(selectedVehicle, { closeMaps: true })} className="glass-button px-4 py-2 rounded-lg hover:opacity-90">Rent</button>
                             </div>
                           </div>
                         )}
-                        {infoTab === 'amenities' && (
+                        {infoTab === 'features' && (
                           <div>
-                            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-                              {selectedProperty.amenities.map((a, i) => (
-                                <span key={i} className="px-3 py-2 bg-gray-100 rounded-lg text-xs sm:text-sm text-gray-700">{a}</span>
-                              ))}
-                            </div>
+                            {selectedVehicle.features.length > 0 ? (
+                              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                                {selectedVehicle.features.map((a: string, i: number) => (
+                                  <span key={i} className="px-3 py-2 bg-gray-100 rounded-lg text-xs sm:text-sm text-gray-700">{a}</span>
+                                ))}
+                              </div>
+                            ) : (
+                              <div className="rounded-xl border border-dashed border-gray-300 bg-gray-50 p-4 text-sm text-gray-600">
+                                No amenities were listed for this vehicle.
+                              </div>
+                            )}
                           </div>
                         )}
                         {infoTab === 'photos' && (
                           <div>
-                            {selectedProperty.images && selectedProperty.images.length > 0 ? (
-                              <ImageCarousel 
-                                images={selectedProperty.images} 
-                                alt={selectedProperty.title}
+                            {selectedVehicle.images && selectedVehicle.images.length > 0 ? (
+                              <ImageCarousel
+                                images={selectedVehicle.images}
+                                alt={selectedVehicle.title}
                                 className="w-full"
-                                bucket="property-images"
+                                bucket="vehicle-images"
                                 compact={true}
                                 showThumbnails={false}
+                                showcase3d
                               />
                             ) : (
                               <div className="w-full h-48 flex items-center justify-center text-gray-400">No images available</div>
@@ -2909,8 +4511,8 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                     P
                   </div>
                   <div>
-                    <h3 className="text-lg font-bold text-gray-900">Landlord</h3>
-                    <p className="text-xs text-gray-500">Property: {properties.find(p => p.id === activeConversation.property_id)?.title || activeConversation.property_id}</p>
+                    <h3 className="text-lg font-bold text-gray-900">Owner</h3>
+                    <p className="text-xs text-gray-500">Vehicle: {vehicles.find(p => p.id === activeConversation.vehicle_id)?.title || activeConversation.vehicle_id}</p>
                   </div>
                 </div>
                 <button onClick={() => { setChatOpen(false); try { chatChannel?.unsubscribe(); } catch {}; setChatChannel(null); }} className="text-gray-500 hover:text-gray-700">✕</button>
@@ -2944,18 +4546,18 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                 <input
                   value={chatInput}
                   onChange={(e) => setChatInput(e.target.value)}
-                  onKeyDown={async (e) => { if (e.key === 'Enter') { e.preventDefault(); if (!activeConversation) return; const content = chatInput.trim(); if (!content) return; try { const { error } = await supabase.from('messages').insert([{ conversation_id: activeConversation.id, sender_email: activeConversation.client_email, content }]); if (error) throw error; setChatInput(''); } catch (err) { console.error('Send message failed', err); } } }}
+                  onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); void sendClientChatMessage(); } }}
                   placeholder="Type a message..."
                   className="flex-1 px-4 py-3 border border-gray-200 rounded-full focus:outline-none focus:ring-2 focus:ring-primary-500 bg-white"
                 />
-                <button onClick={async () => { if (!activeConversation) return; const content = chatInput.trim(); if (!content) return; try { const { error } = await supabase.from('messages').insert([{ conversation_id: activeConversation.id, sender_email: activeConversation.client_email, content }]); if (error) throw error; setChatInput(''); } catch (err) { console.error('Send message failed', err); } }} className="glass-button px-5 py-3 rounded-full hover:opacity-90">Send</button>
+                <button type="button" onClick={() => void sendClientChatMessage()} className="glass-button px-5 py-3 rounded-full hover:opacity-90">Send</button>
               </div>
             </div>
           </div>
         )}
 
         {/* Review Form Modal */}
-        {showReviewForm && selectedProperty && (
+        {showReviewForm && selectedVehicle && (
           <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-3 sm:p-4 z-50">
             <div className="backdrop-blur-2xl bg-white/80 rounded-3xl max-w-lg w-full shadow-2xl border border-white/40 max-h-[90vh] overflow-y-auto">
               <div className="p-4 sm:p-6">
@@ -2966,8 +4568,8 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                   </button>
                 </div>
                 <div className="mb-4">
-                  <h3 className="font-semibold text-gray-900 mb-2">{selectedProperty.title}</h3>
-                  <p className="text-sm text-gray-600">{selectedProperty.location}</p>
+                  <h3 className="font-semibold text-gray-900 mb-2">{selectedVehicle.title}</h3>
+                  <p className="text-sm text-gray-600">{selectedVehicle.location}</p>
                 </div>
                 <div className="mb-6">
                   <label className="block text-sm font-medium text-gray-700 mb-2">Rating</label>
@@ -3140,6 +4742,14 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                         .eq('email', email)
                         .single();
 
+                      const { data: clientProfile } = user?.id
+                        ? await supabase
+                            .from('client_profiles')
+                            .select('gender, age, citizenship, occupation_status')
+                            .eq('user_id', user.id)
+                            .maybeSingle()
+                        : { data: null };
+
                       const profile = userProfile || appUser;
                       setProfileData({
                         full_name: profile?.full_name || user?.user_metadata?.full_name || '',
@@ -3149,7 +4759,16 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                         city: profile?.city || '',
                         profile_image_url: profile?.profile_image_url || '',
                         id_document_url: profile?.id_document_url || '',
-                        email: user?.email || ''
+                        email: user?.email || '',
+                        gender: String(clientProfile?.gender || '').trim(),
+                        age:
+                          clientProfile?.age != null && clientProfile.age !== ''
+                            ? String(clientProfile.age)
+                            : '',
+                        citizenship: (String(clientProfile?.citizenship || '').trim() ||
+                          '') as '' | 'Filipino' | 'Foreigner',
+                        occupation_status: (String(clientProfile?.occupation_status || '').trim() ||
+                          '') as '' | 'Student' | 'Worker'
                       });
                       setProfileImagePreview(profile?.profile_image_url || null);
                       setIdDocumentPreview(profile?.id_document_url || null);
@@ -3164,7 +4783,11 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                         city: '',
                         profile_image_url: '',
                         id_document_url: '',
-                        email: user?.email || ''
+                        email: user?.email || '',
+                        gender: '',
+                        age: '',
+                        citizenship: '',
+                        occupation_status: ''
                       });
                       setShowEditProfile(true);
                     }
@@ -3320,6 +4943,68 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                     className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
                     placeholder="Enter your city"
                   />
+                </div>
+
+                <div className="rounded-xl border border-amber-100 bg-amber-50/80 p-4 space-y-4">
+                  <p className="text-sm font-semibold text-amber-950">
+                    Renter details (required for vehicle rental requests)
+                  </p>
+                  <div>
+                    <label className="block text-sm font-semibold text-gray-700 mb-2">Gender</label>
+                    <input
+                      type="text"
+                      value={profileData.gender}
+                      onChange={(e) => setProfileData({ ...profileData, gender: e.target.value })}
+                      className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+                      placeholder="e.g. Male, Female, Non-binary"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-semibold text-gray-700 mb-2">Age</label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={120}
+                      value={profileData.age}
+                      onChange={(e) => setProfileData({ ...profileData, age: e.target.value })}
+                      className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+                      placeholder="Your age"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-semibold text-gray-700 mb-2">Citizenship</label>
+                    <select
+                      value={profileData.citizenship}
+                      onChange={(e) =>
+                        setProfileData({
+                          ...profileData,
+                          citizenship: e.target.value as typeof profileData.citizenship
+                        })
+                      }
+                      className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 bg-white"
+                    >
+                      <option value="">Select citizenship</option>
+                      <option value="Filipino">Filipino</option>
+                      <option value="Foreigner">Foreigner</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-sm font-semibold text-gray-700 mb-2">Occupation</label>
+                    <select
+                      value={profileData.occupation_status}
+                      onChange={(e) =>
+                        setProfileData({
+                          ...profileData,
+                          occupation_status: e.target.value as typeof profileData.occupation_status
+                        })
+                      }
+                      className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 bg-white"
+                    >
+                      <option value="">Student or Worker</option>
+                      <option value="Student">Student</option>
+                      <option value="Worker">Worker</option>
+                    </select>
+                  </div>
                 </div>
 
                 {/* ID Document */}
@@ -3663,7 +5348,68 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
 
                       // If at least one succeeded, show success
                       if (!profileError || !appUserError) {
-                        alert('Profile updated successfully!');
+                        const identityForState = {
+                          gender: (profileData.gender || '').trim(),
+                          age: (profileData.age || '').trim(),
+                          citizenship: (profileData.citizenship || '').trim(),
+                          occupation_status: (profileData.occupation_status || '').trim()
+                        };
+
+                        if (user?.id) {
+                          const emailForCp = (
+                            profileData.email ||
+                            email ||
+                            clientEmail ||
+                            user?.email ||
+                            ''
+                          ).trim();
+                          const parsedAge = parseInt(String(profileData.age).trim(), 10);
+                          const ageForCp =
+                            Number.isFinite(parsedAge) && parsedAge > 0 ? parsedAge : null;
+                          const { error: cpUpsertError } = await supabase.from('client_profiles').upsert(
+                            {
+                              user_id: user.id,
+                              email: emailForCp,
+                              full_name: (profileData.full_name || '').trim() || 'Client',
+                              phone: profileData.phone?.trim() || null,
+                              address: profileData.address?.trim() || null,
+                              barangay: profileData.barangay?.trim() || null,
+                              municipality_city: profileData.city?.trim() || null,
+                              gender: identityForState.gender || null,
+                              age: ageForCp,
+                              citizenship: identityForState.citizenship
+                                ? (identityForState.citizenship as 'Filipino' | 'Foreigner')
+                                : null,
+                              occupation_status: identityForState.occupation_status
+                                ? (identityForState.occupation_status as 'Student' | 'Worker')
+                                : null,
+                              profile_image_url: profileImageUrl || null,
+                              updated_at: new Date().toISOString()
+                            },
+                            { onConflict: 'email' }
+                          );
+                          if (cpUpsertError) {
+                            console.error('client_profiles upsert failed:', cpUpsertError);
+                            alert(
+                              `Your contact info was saved, but renter details (gender, age, citizenship, occupation) could not be saved: ${cpUpsertError.message}\n\nAsk your admin to run client_profiles_renter_policies.sql in the Supabase SQL editor if this persists.`
+                            );
+                          } else {
+                            alert('Profile updated successfully!');
+                          }
+                        } else {
+                          alert('Profile updated successfully!');
+                        }
+                        setBookerIdentity({
+                          full_name: (profileData.full_name || '').trim(),
+                          email: (profileData.email || clientEmail || user?.email || '').trim(),
+                          address: (profileData.address || '').trim(),
+                          barangay: (profileData.barangay || '').trim(),
+                          municipality_city: (profileData.city || '').trim(),
+                          gender: identityForState.gender,
+                          age: identityForState.age,
+                          citizenship: identityForState.citizenship,
+                          occupation_status: identityForState.occupation_status
+                        });
                         setShowEditProfile(false);
                         setProfileImageFile(null);
                         setProfileImagePreview(null);
@@ -3688,7 +5434,10 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                               city: updatedProfile.city || '',
                               profile_image_url: updatedProfile.profile_image_url || '',
                               id_document_url: updatedProfile.id_document_url || '',
-                              email: user?.email || ''
+                              email: user?.email || '',
+                              ...identityForState,
+                              citizenship: identityForState.citizenship as typeof profileData.citizenship,
+                              occupation_status: identityForState.occupation_status as typeof profileData.occupation_status
                             });
                             setProfileImagePreview(updatedProfile.profile_image_url || null);
                             setIdDocumentPreview(updatedProfile.id_document_url || null);
@@ -3719,7 +5468,10 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                                 city: appUserData.city || '',
                                 profile_image_url: appUserData.profile_image_url || '',
                                 id_document_url: appUserData.id_document_url || '',
-                                email: user?.email || ''
+                                email: user?.email || '',
+                                ...identityForState,
+                                citizenship: identityForState.citizenship as typeof profileData.citizenship,
+                                occupation_status: identityForState.occupation_status as typeof profileData.occupation_status
                               });
                               setProfileImagePreview(appUserData.profile_image_url || null);
                               setIdDocumentPreview(appUserData.id_document_url || null);
@@ -3784,15 +5536,19 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
           </div>
         )}
 
-        {/* Booking Preview Modal */}
-        {showBookingPreview && bookingPreviewData && (
+        {/* rental Preview Modal */}
+        {showrentalPreview && rentalPreviewData && (
           <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
             <div className="bg-white rounded-2xl max-w-2xl w-full shadow-2xl max-h-[90vh] overflow-y-auto">
               <div className="p-6">
                 <div className="flex items-center justify-between mb-6">
-                  <h2 className="text-2xl font-bold text-gray-900">Booking Request Preview</h2>
+                  <h2 className="text-2xl font-bold text-gray-900">Rent Request Preview</h2>
                   <button
-                    onClick={() => setShowBookingPreview(false)}
+                    type="button"
+                    onClick={() => {
+                      setRentalAgreementAccepted(false);
+                      setShowrentalPreview(false);
+                    }}
                     className="text-gray-400 hover:text-gray-600 transition-colors"
                   >
                     <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -3800,7 +5556,20 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                     </svg>
                   </button>
                 </div>
-                
+
+                {selectedVehicle?.images && selectedVehicle.images.length > 0 && (
+                  <div className="mb-6 max-w-lg mx-auto">
+                    <ImageCarousel
+                      images={selectedVehicle.images}
+                      alt={selectedVehicle.title}
+                      className="w-full"
+                      bucket="vehicle-images"
+                      compact
+                      showcase3d
+                    />
+                  </div>
+                )}
+
                 <div className="space-y-6">
                   {/* Personal Information Section */}
                   <div className="bg-gray-50 rounded-xl p-4">
@@ -3808,27 +5577,35 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       <div>
                         <label className="text-sm font-medium text-gray-600">Full Name</label>
-                        <p className="text-gray-900 font-medium">{bookingPreviewData.fullName}</p>
+                        <p className="text-gray-900 font-medium">{rentalPreviewData.fullName}</p>
                       </div>
                       <div>
                         <label className="text-sm font-medium text-gray-600">Email</label>
-                        <p className="text-gray-900 font-medium">{bookingPreviewData.email}</p>
+                        <p className="text-gray-900 font-medium">{rentalPreviewData.email}</p>
                       </div>
                       <div>
                         <label className="text-sm font-medium text-gray-600">Gender</label>
-                        <p className="text-gray-900 font-medium">{bookingPreviewData.gender}</p>
+                        <p className="text-gray-900 font-medium">{rentalPreviewData.gender}</p>
                       </div>
                       <div>
                         <label className="text-sm font-medium text-gray-600">Age</label>
-                        <p className="text-gray-900 font-medium">{bookingPreviewData.age}</p>
+                        <p className="text-gray-900 font-medium">{rentalPreviewData.age}</p>
                       </div>
                       <div>
                         <label className="text-sm font-medium text-gray-600">Citizenship</label>
-                        <p className="text-gray-900 font-medium">{bookingPreviewData.citizenship}</p>
+                        <p className="text-gray-900 font-medium">{rentalPreviewData.citizenship}</p>
                       </div>
                       <div>
                         <label className="text-sm font-medium text-gray-600">Occupation</label>
-                        <p className="text-gray-900 font-medium">{bookingPreviewData.occupationStatus}</p>
+                        <p className="text-gray-900 font-medium">{rentalPreviewData.occupationStatus}</p>
+                      </div>
+                      <div className="md:col-span-2">
+                        <label className="text-sm font-medium text-gray-600">Driver&apos;s license</label>
+                        <p className="text-gray-900 font-medium font-mono text-sm">
+                          {rentalPreviewData.driverLicense != null && rentalPreviewData.driverLicense !== ''
+                            ? rentalPreviewData.driverLicense
+                            : '—'}
+                        </p>
                       </div>
                     </div>
                   </div>
@@ -3839,75 +5616,158 @@ export default function ClientDashboard({ onBack }: ClientDashboardProps) {
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       <div>
                         <label className="text-sm font-medium text-gray-600">Address</label>
-                        <p className="text-gray-900 font-medium">{bookingPreviewData.address}</p>
+                        <p className="text-gray-900 font-medium">{rentalPreviewData.address}</p>
                       </div>
                       <div>
                         <label className="text-sm font-medium text-gray-600">Barangay</label>
-                        <p className="text-gray-900 font-medium">{bookingPreviewData.barangay}</p>
+                        <p className="text-gray-900 font-medium">{rentalPreviewData.barangay}</p>
                       </div>
                       <div>
                         <label className="text-sm font-medium text-gray-600">Municipality/City</label>
-                        <p className="text-gray-900 font-medium">{bookingPreviewData.municipalityCity}</p>
+                        <p className="text-gray-900 font-medium">{rentalPreviewData.municipalityCity}</p>
                       </div>
                     </div>
                   </div>
 
-                  {/* Property & Room Details Section */}
+                  {/* Vehicle Details Section */}
                   <div className="bg-gray-50 rounded-xl p-4">
-                    <h3 className="text-lg font-semibold text-gray-900 mb-3">Property & Room Details</h3>
+                    <h3 className="text-lg font-semibold text-gray-900 mb-3">Vehicle Details</h3>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       <div>
-                        <label className="text-sm font-medium text-gray-600">Property</label>
-                        <p className="text-gray-900 font-medium">{bookingPreviewData.propertyTitle}</p>
+                        <label className="text-sm font-medium text-gray-600">Pick-up date</label>
+                        <p className="text-gray-900 font-medium">
+                          {formatYmdMedium(rentalPreviewData.checkInDate)}
+                        </p>
+                      </div>
+                      <div>
+                        <label className="text-sm font-medium text-gray-600">Return date</label>
+                        <p className="text-gray-900 font-medium">
+                          {formatYmdMedium(rentalPreviewData.checkOutDate)}
+                        </p>
+                      </div>
+                      {rentalPreviewData.rentalUnit === 'hour' &&
+                        rentalPreviewData.pickUpTime != null &&
+                        rentalPreviewData.returnTime != null && (
+                          <>
+                            <div>
+                              <label className="text-sm font-medium text-gray-600">Pick-up time</label>
+                              <p className="text-gray-900 font-medium">{rentalPreviewData.pickUpTime}</p>
+                            </div>
+                            <div>
+                              <label className="text-sm font-medium text-gray-600">Return time</label>
+                              <p className="text-gray-900 font-medium">{rentalPreviewData.returnTime}</p>
+                            </div>
+                          </>
+                        )}
+                      <div>
+                        <label className="text-sm font-medium text-gray-600">vehicle</label>
+                        <p className="text-gray-900 font-medium">{rentalPreviewData.vehicleTitle}</p>
                       </div>
                       <div>
                         <label className="text-sm font-medium text-gray-600">Location</label>
-                        <p className="text-gray-900 font-medium">{bookingPreviewData.propertyLocation}</p>
+                        <p className="text-gray-900 font-medium">{rentalPreviewData.vehicleLocation}</p>
                       </div>
                       <div>
-                        <label className="text-sm font-medium text-gray-600">Room Number</label>
-                        <p className="text-gray-900 font-medium">{bookingPreviewData.roomNumber}</p>
+                        <label className="text-sm font-medium text-gray-600">Rent Plan</label>
+                        <p className="text-gray-900 font-medium">{rentalPreviewData.rentalLabel}</p>
                       </div>
                       <div>
-                        <label className="text-sm font-medium text-gray-600">Room Name</label>
-                        <p className="text-gray-900 font-medium">{bookingPreviewData.roomName}</p>
+                        <label className="text-sm font-medium text-gray-600">Quoted Amount</label>
+                        <p className="text-gray-900 font-medium">₱{rentalPreviewData.price.toLocaleString()}</p>
+                        {rentalPreviewData.rentalUnit === 'hour' &&
+                          rentalPreviewData.billableHours != null &&
+                          rentalPreviewData.hourlyRate != null && (
+                            <p className="text-sm text-gray-600 mt-1">
+                              {rentalPreviewData.billableHours} hour
+                              {rentalPreviewData.billableHours !== 1 ? 's' : ''} × ₱
+                              {Number(rentalPreviewData.hourlyRate).toLocaleString()}/hr
+                            </p>
+                          )}
                       </div>
                       <div>
-                        <label className="text-sm font-medium text-gray-600">Bed Number</label>
-                        <p className="text-gray-900 font-medium">{bookingPreviewData.bedNumber}</p>
+                        <label className="text-sm font-medium text-gray-600">Payment Method</label>
+                        <p className="text-gray-900 font-medium">{rentalPreviewData.paymentMethod || 'Cash'}</p>
                       </div>
-                      <div>
-                        <label className="text-sm font-medium text-gray-600">Bed Type</label>
-                        <p className="text-gray-900 font-medium">{bookingPreviewData.bedType}</p>
-                      </div>
-                      <div>
-                        <label className="text-sm font-medium text-gray-600">Price</label>
-                        <p className="text-gray-900 font-medium">₱{bookingPreviewData.price.toLocaleString()}</p>
-                      </div>
+                      {selectedVehicle && (
+                        <div className="md:col-span-2">
+                          <label className="text-sm font-medium text-gray-600">Rental GPS boundary</label>
+                          <div className="mt-2">
+                            <RentalBoundaryRentCallout vehicle={selectedVehicle} compact />
+                          </div>
+                        </div>
+                      )}
                     </div>
                   </div>
 
                   {/* Message Section */}
-                  {bookingPreviewData.message && (
+                  {rentalPreviewData.message && (
                     <div className="bg-gray-50 rounded-xl p-4">
                       <h3 className="text-lg font-semibold text-gray-900 mb-3">Additional Message</h3>
-                      <p className="text-gray-900">{bookingPreviewData.message}</p>
+                      <p className="text-gray-900">{rentalPreviewData.message}</p>
                     </div>
                   )}
+
+                  <div className="border border-amber-200 bg-amber-50/80 rounded-xl p-4">
+                    <h3 className="text-lg font-semibold text-gray-900 mb-2">Agreement &amp; conditions</h3>
+                    <p className="text-sm text-gray-600 mb-3">
+                      By submitting a rental request, you acknowledge the following:
+                    </p>
+                    <div className="max-h-44 overflow-y-auto rounded-lg bg-white/90 border border-amber-100 p-3 text-sm text-gray-800 space-y-2">
+                      <p>
+                        <strong>Cancellations and refunds.</strong> If the rental is canceled, it will be automatically
+                        refunded according to our rules (for example, timing may depend on how close the cancellation is to
+                        the rental start and how payment was made).
+                      </p>
+                      <p>
+                        <strong>Damages and liability.</strong> However, <strong>damages are not covered by our system</strong>.
+                        Vehicle damage, loss, theft, misuse, fines, tolls, fuel, cleaning, and similar costs are your
+                        responsibility and may be handled directly with the vehicle owner under their policy and applicable
+                        law.
+                      </p>
+                      <p>
+                        <strong>Your relationship with the owner.</strong> This platform helps you find and request
+                        rentals; the rental agreement is between you and the vehicle owner. Follow their instructions,
+                        return the vehicle on time, and keep all required documents valid.
+                      </p>
+                      <p>
+                        <strong>Accuracy.</strong> The information you provided is true to the best of your knowledge.
+                        False or misleading details may lead to cancellation of the request or your account being reviewed.
+                      </p>
+                    </div>
+                    <label className="mt-4 flex items-start gap-3 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        className="mt-1 h-4 w-4 rounded border-gray-300 text-primary-600 focus:ring-primary-500"
+                        checked={rentalAgreementAccepted}
+                        onChange={(e) => setRentalAgreementAccepted(e.target.checked)}
+                      />
+                      <span className="text-sm text-gray-800">
+                        I have read and agree to the agreement &amp; conditions above.
+                      </span>
+                    </label>
+                  </div>
                 </div>
 
                 <div className="flex gap-4 mt-8">
                   <button
-                    onClick={() => setShowBookingPreview(false)}
+                    onClick={() => {
+                      setRentalAgreementAccepted(false);
+                      setShowrentalPreview(false);
+                    }}
                     className="flex-1 bg-gray-300 text-gray-700 py-3 rounded-xl hover:bg-gray-400 transition-all duration-200 font-semibold"
                   >
                     Edit Details
                   </button>
                   <button
-                    onClick={handleBookProperty}
-                    className="flex-1 bg-gradient-to-r from-primary-600 to-primary-700 text-white py-3 rounded-xl hover:from-primary-700 hover:to-primary-800 transition-all duration-200 font-semibold shadow-lg hover:shadow-xl"
+                    onClick={handleBookvehicle}
+                    disabled={!rentalAgreementAccepted}
+                    className={`flex-1 py-3 rounded-xl transition-all duration-200 font-semibold shadow-lg ${
+                      rentalAgreementAccepted
+                        ? 'bg-gradient-to-r from-primary-600 to-primary-700 text-white hover:from-primary-700 hover:to-primary-800 hover:shadow-xl'
+                        : 'bg-gray-200 text-gray-500 cursor-not-allowed shadow-none'
+                    }`}
                   >
-                    Confirm & Submit Booking
+                    Confirm & Submit rental
                   </button>
                 </div>
               </div>

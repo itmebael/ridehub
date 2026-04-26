@@ -215,7 +215,10 @@ export default function LoginScreen({ userType, onCreateAccount, onLoginSuccess,
   };
 
   return (
-    <div className="glass-strong rounded-3xl p-8 text-center relative overflow-hidden">
+    <div className="min-h-screen p-8">
+      {/* Background overlay */}
+      <div className="absolute inset-0 bg-black/20"></div>
+      
       {/* Glassmorphism shine effect */}
       <div className="absolute inset-0 bg-gradient-to-br from-primary-50/50 via-primary-100/50 to-primary-200/50 pointer-events-none"></div>
       <div className="absolute inset-0 bg-gradient-to-t from-transparent via-white/25 to-white/35 pointer-events-none"></div>
@@ -229,15 +232,18 @@ export default function LoginScreen({ userType, onCreateAccount, onLoginSuccess,
         ←
       </button>
 
-      {/* Illustration */}
-      <div className="mb-8 flex justify-center relative z-10">
-        <div className="w-32 h-32 glass rounded-2xl flex items-center justify-center overflow-hidden shadow-2xl">
-          <img src="/door.png" alt="Door" className="w-full h-full object-cover" />
+      {/* Logo and City Seal */}
+      <div className="mb-6 flex justify-center items-center space-x-4 relative z-10">
+        <div className="glass rounded-2xl flex items-center justify-center overflow-hidden shadow-2xl p-2">
+          <img src="/logo.png" alt="RIDEHUB Logo" className="max-w-full max-h-12 object-contain" />
+        </div>
+        <div className="glass rounded-2xl flex items-center justify-center overflow-hidden shadow-2xl p-2">
+          <img src="/Catbalogan_City_Seal.png" alt="Catbalogan City Seal" className="max-w-full max-h-12 object-contain" />
         </div>
       </div>
       
       {/* Title */}
-      <h1 className="text-4xl font-bold text-gray-900 mb-8 relative z-10 drop-shadow-lg">
+      <h1 className="text-4xl font-bold text-white mb-8 relative z-10 drop-shadow-lg">
         Login
       </h1>
       

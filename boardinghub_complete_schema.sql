@@ -1,19 +1,19 @@
--- ============================================================================
+﻿-- ============================================================================
 -- BoardingHub Complete Database Schema
--- Modern boarding house booking platform with comprehensive features
+-- Modern boarding house rental platform with comprehensive features
 -- ============================================================================
 
 -- ============================================================================
 -- MIGRATION: Handle existing schema compatibility
 -- ============================================================================
 
--- Check if old 'properties' table exists and create mapping
+-- Check if old 'Vehicles' table exists and create mapping
 DO $$ 
 BEGIN
-    -- If 'properties' table exists but 'boarding_houses' doesn't, create a view mapping
-    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'properties')
+    -- If 'Vehicles' table exists but 'boarding_houses' doesn't, create a view mapping
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'Vehicles')
        AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'boarding_houses') THEN
-        -- Create a view that maps properties to boarding_houses structure
+        -- Create a view that maps Vehicles to boarding_houses structure
         EXECUTE '
         CREATE OR REPLACE VIEW boarding_houses AS
         SELECT 
@@ -41,41 +41,41 @@ BEGIN
             END as status,
             COALESCE(rating, 0.0) as rating,
             COALESCE(total_reviews, 0) as total_reviews,
-            0 as total_bookings,
+            0 as total_Rentals,
             FALSE as is_featured,
             NULL::TEXT as admin_notes,
             created_at,
             created_at as updated_at
-        FROM properties';
+        FROM Vehicles';
     END IF;
 END $$;
 
--- Migrate old bookings structure to new structure
+-- Migrate old Rentals structure to new structure
 DO $$ 
 BEGIN
-    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'bookings') THEN
-        -- Check if this is the old schema (has property_id, client_name, etc.)
-        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'property_id')
-           AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'client_name') THEN
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'Rentals') THEN
+        -- Check if this is the old schema (has vehicle_id, client_name, etc.)
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'vehicle_id')
+           AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'client_name') THEN
             -- Map old columns to new columns
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'boarding_house_id') THEN
-                ALTER TABLE bookings ADD COLUMN boarding_house_id UUID;
-                UPDATE bookings SET boarding_house_id = property_id WHERE boarding_house_id IS NULL;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'boarding_house_id') THEN
+                ALTER TABLE Rentals ADD COLUMN boarding_house_id UUID;
+                UPDATE Rentals SET boarding_house_id = vehicle_id WHERE boarding_house_id IS NULL;
             END IF;
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'full_name') THEN
-                ALTER TABLE bookings ADD COLUMN full_name VARCHAR(255);
-                UPDATE bookings SET full_name = client_name WHERE full_name IS NULL;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'full_name') THEN
+                ALTER TABLE Rentals ADD COLUMN full_name VARCHAR(255);
+                UPDATE Rentals SET full_name = client_name WHERE full_name IS NULL;
             END IF;
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'tenant_email') THEN
-                ALTER TABLE bookings ADD COLUMN tenant_email VARCHAR(255);
-                UPDATE bookings SET tenant_email = client_email WHERE tenant_email IS NULL;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'tenant_email') THEN
+                ALTER TABLE Rentals ADD COLUMN tenant_email VARCHAR(255);
+                UPDATE Rentals SET tenant_email = client_email WHERE tenant_email IS NULL;
             END IF;
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'special_requests') THEN
-                ALTER TABLE bookings ADD COLUMN special_requests TEXT;
-                UPDATE bookings SET special_requests = message WHERE special_requests IS NULL;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'special_requests') THEN
+                ALTER TABLE Rentals ADD COLUMN special_requests TEXT;
+                UPDATE Rentals SET special_requests = message WHERE special_requests IS NULL;
             END IF;
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'total_amount') THEN
-                ALTER TABLE bookings ADD COLUMN total_amount DECIMAL(10,2) DEFAULT 0;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'total_amount') THEN
+                ALTER TABLE Rentals ADD COLUMN total_amount DECIMAL(10,2) DEFAULT 0;
             END IF;
         END IF;
     END IF;
@@ -185,7 +185,7 @@ CREATE TABLE IF NOT EXISTS boarding_houses (
     status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'active', 'inactive', 'suspended')),
     rating DECIMAL(3,2) DEFAULT 0.0 CHECK (rating >= 0 AND rating <= 5),
     total_reviews INTEGER DEFAULT 0,
-    total_bookings INTEGER DEFAULT 0, -- For priority listing
+    total_Rentals INTEGER DEFAULT 0, -- For priority listing
     is_featured BOOLEAN DEFAULT FALSE,
     admin_notes TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -200,7 +200,7 @@ CREATE TABLE IF NOT EXISTS landlord_permits (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     landlord_id UUID REFERENCES landlord_profiles(id) ON DELETE CASCADE,
     boarding_house_id UUID, -- FK constraint added separately (only if boarding_houses is a table)
-    property_id UUID, -- Fallback for old schema
+    vehicle_id UUID, -- Fallback for old schema
     permit_type VARCHAR(50) NOT NULL CHECK (permit_type IN ('business_permit', 'boarding_house_permit')),
     permit_number VARCHAR(100),
     permit_file_url TEXT NOT NULL,
@@ -220,7 +220,7 @@ CREATE TABLE IF NOT EXISTS landlord_permits (
 CREATE TABLE IF NOT EXISTS rooms (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     boarding_house_id UUID, -- FK constraint added separately
-    property_id UUID, -- Fallback for old schema
+    vehicle_id UUID, -- Fallback for old schema
     room_number VARCHAR(50) NOT NULL,
     room_name VARCHAR(255),
     description TEXT,
@@ -244,13 +244,13 @@ BEGIN
         ) THEN
             ALTER TABLE rooms ADD CONSTRAINT rooms_boarding_house_room_unique UNIQUE(boarding_house_id, room_number);
         END IF;
-    ELSIF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'rooms' AND column_name = 'property_id') THEN
+    ELSIF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'rooms' AND column_name = 'vehicle_id') THEN
         IF NOT EXISTS (
             SELECT 1 FROM information_schema.table_constraints 
-            WHERE constraint_name = 'rooms_property_room_unique' 
+            WHERE constraint_name = 'rooms_vehicle_room_unique' 
             AND table_name = 'rooms'
         ) THEN
-            ALTER TABLE rooms ADD CONSTRAINT rooms_property_room_unique UNIQUE(property_id, room_number);
+            ALTER TABLE rooms ADD CONSTRAINT rooms_vehicle_room_unique UNIQUE(vehicle_id, room_number);
         END IF;
     END IF;
 END $$;
@@ -326,13 +326,13 @@ BEGIN
 END $$;
 
 -- ============================================================================
--- 8. PROPERTY IMAGES (Categorized: CR and Available Rooms)
+-- 8. vehicle IMAGES (Categorized: CR and Available Rooms)
 -- ============================================================================
 
-CREATE TABLE IF NOT EXISTS property_images (
+CREATE TABLE IF NOT EXISTS vehicle_images (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     boarding_house_id UUID, -- FK constraint added separately
-    property_id UUID, -- Fallback for old schema
+    vehicle_id UUID, -- Fallback for old schema
     room_id UUID, -- FK constraint added separately
     image_url TEXT NOT NULL,
     image_category VARCHAR(50) NOT NULL CHECK (image_category IN ('comfort_room', 'available_room', 'common_area', 'exterior', 'other')),
@@ -364,116 +364,116 @@ CREATE TABLE IF NOT EXISTS tenant_profiles (
 );
 
 -- ============================================================================
--- 10. BOOKINGS (With Complete Form Data)
+-- 10. Rentals (With Complete Form Data)
 -- ============================================================================
 
--- Add missing columns if bookings table exists (handle old schema migration)
+-- Add missing columns if Rentals table exists (handle old schema migration)
 DO $$ 
 BEGIN
-    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'bookings') THEN
-        -- Check if this is the old schema (has property_id, client_name, etc.)
-        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'property_id')
-           AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'client_name') THEN
-            -- Migrate old bookings structure
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'Rentals') THEN
+        -- Check if this is the old schema (has vehicle_id, client_name, etc.)
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'vehicle_id')
+           AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'client_name') THEN
+            -- Migrate old Rentals structure
             -- Add new columns
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'boarding_house_id') THEN
-                ALTER TABLE bookings ADD COLUMN boarding_house_id UUID;
-                -- Copy property_id to boarding_house_id
-                UPDATE bookings SET boarding_house_id = property_id WHERE boarding_house_id IS NULL;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'boarding_house_id') THEN
+                ALTER TABLE Rentals ADD COLUMN boarding_house_id UUID;
+                -- Copy vehicle_id to boarding_house_id
+                UPDATE Rentals SET boarding_house_id = vehicle_id WHERE boarding_house_id IS NULL;
             END IF;
             -- Map client_name to full_name
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'full_name') THEN
-                ALTER TABLE bookings ADD COLUMN full_name VARCHAR(255);
-                UPDATE bookings SET full_name = client_name WHERE full_name IS NULL;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'full_name') THEN
+                ALTER TABLE Rentals ADD COLUMN full_name VARCHAR(255);
+                UPDATE Rentals SET full_name = client_name WHERE full_name IS NULL;
             END IF;
             -- Map client_email to tenant_email (if not exists)
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'tenant_email') THEN
-                ALTER TABLE bookings ADD COLUMN tenant_email VARCHAR(255);
-                UPDATE bookings SET tenant_email = client_email WHERE tenant_email IS NULL;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'tenant_email') THEN
+                ALTER TABLE Rentals ADD COLUMN tenant_email VARCHAR(255);
+                UPDATE Rentals SET tenant_email = client_email WHERE tenant_email IS NULL;
             END IF;
             -- Map message to special_requests
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'special_requests') THEN
-                ALTER TABLE bookings ADD COLUMN special_requests TEXT;
-                UPDATE bookings SET special_requests = message WHERE special_requests IS NULL;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'special_requests') THEN
+                ALTER TABLE Rentals ADD COLUMN special_requests TEXT;
+                UPDATE Rentals SET special_requests = message WHERE special_requests IS NULL;
             END IF;
         END IF;
         -- Add tenant_id if missing
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'tenant_id') THEN
-            ALTER TABLE bookings ADD COLUMN tenant_id UUID;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'tenant_id') THEN
+            ALTER TABLE Rentals ADD COLUMN tenant_id UUID;
         END IF;
         -- Add boarding_house_id if missing (for new schema)
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'boarding_house_id') THEN
-            ALTER TABLE bookings ADD COLUMN boarding_house_id UUID;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'boarding_house_id') THEN
+            ALTER TABLE Rentals ADD COLUMN boarding_house_id UUID;
         END IF;
-        -- Ensure property_id exists (for old schema compatibility)
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'property_id') THEN
-            ALTER TABLE bookings ADD COLUMN property_id UUID;
+        -- Ensure vehicle_id exists (for old schema compatibility)
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'vehicle_id') THEN
+            ALTER TABLE Rentals ADD COLUMN vehicle_id UUID;
         END IF;
         -- Add room_id if missing
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'room_id') THEN
-            ALTER TABLE bookings ADD COLUMN room_id UUID;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'room_id') THEN
+            ALTER TABLE Rentals ADD COLUMN room_id UUID;
         END IF;
         -- Add bed_id if missing
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'bed_id') THEN
-            ALTER TABLE bookings ADD COLUMN bed_id UUID;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'bed_id') THEN
+            ALTER TABLE Rentals ADD COLUMN bed_id UUID;
         END IF;
-        -- Add tenant_email if missing (critical column - add for all bookings tables)
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'tenant_email') THEN
-            ALTER TABLE bookings ADD COLUMN tenant_email VARCHAR(255);
+        -- Add tenant_email if missing (critical column - add for all Rentals tables)
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'tenant_email') THEN
+            ALTER TABLE Rentals ADD COLUMN tenant_email VARCHAR(255);
             -- Try to populate from client_email if it exists
-            IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'client_email') THEN
-                UPDATE bookings SET tenant_email = client_email WHERE tenant_email IS NULL;
+            IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'client_email') THEN
+                UPDATE Rentals SET tenant_email = client_email WHERE tenant_email IS NULL;
             END IF;
         END IF;
-        -- Add booking form fields if missing
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'full_name') THEN
-            ALTER TABLE bookings ADD COLUMN full_name VARCHAR(255);
+        -- Add rental form fields if missing
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'full_name') THEN
+            ALTER TABLE Rentals ADD COLUMN full_name VARCHAR(255);
             -- Try to populate from client_name if it exists
-            IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'client_name') THEN
-                UPDATE bookings SET full_name = client_name WHERE full_name IS NULL;
+            IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'client_name') THEN
+                UPDATE Rentals SET full_name = client_name WHERE full_name IS NULL;
             END IF;
         END IF;
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'address') THEN
-            ALTER TABLE bookings ADD COLUMN address TEXT;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'address') THEN
+            ALTER TABLE Rentals ADD COLUMN address TEXT;
         END IF;
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'barangay') THEN
-            ALTER TABLE bookings ADD COLUMN barangay VARCHAR(100);
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'barangay') THEN
+            ALTER TABLE Rentals ADD COLUMN barangay VARCHAR(100);
         END IF;
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'municipality_city') THEN
-            ALTER TABLE bookings ADD COLUMN municipality_city VARCHAR(100);
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'municipality_city') THEN
+            ALTER TABLE Rentals ADD COLUMN municipality_city VARCHAR(100);
         END IF;
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'gender') THEN
-            ALTER TABLE bookings ADD COLUMN gender VARCHAR(20);
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'gender') THEN
+            ALTER TABLE Rentals ADD COLUMN gender VARCHAR(20);
         END IF;
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'age') THEN
-            ALTER TABLE bookings ADD COLUMN age INTEGER;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'age') THEN
+            ALTER TABLE Rentals ADD COLUMN age INTEGER;
         END IF;
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'citizenship') THEN
-            ALTER TABLE bookings ADD COLUMN citizenship VARCHAR(20);
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'citizenship') THEN
+            ALTER TABLE Rentals ADD COLUMN citizenship VARCHAR(20);
         END IF;
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'occupation_status') THEN
-            ALTER TABLE bookings ADD COLUMN occupation_status VARCHAR(20);
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'occupation_status') THEN
+            ALTER TABLE Rentals ADD COLUMN occupation_status VARCHAR(20);
         END IF;
-        -- Add booking dates if missing
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'check_in_date') THEN
-            ALTER TABLE bookings ADD COLUMN check_in_date DATE;
+        -- Add rental dates if missing
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'check_in_date') THEN
+            ALTER TABLE Rentals ADD COLUMN check_in_date DATE;
         END IF;
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'check_out_date') THEN
-            ALTER TABLE bookings ADD COLUMN check_out_date DATE;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'check_out_date') THEN
+            ALTER TABLE Rentals ADD COLUMN check_out_date DATE;
         END IF;
     END IF;
 END $$;
 
-CREATE TABLE IF NOT EXISTS bookings (
+CREATE TABLE IF NOT EXISTS Rentals (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id UUID,
     tenant_email VARCHAR(255), -- NOT NULL constraint added separately if column exists
     boarding_house_id UUID, -- Will add FK constraint separately if table exists
-    property_id UUID, -- Fallback for old schema
+    vehicle_id UUID, -- Fallback for old schema
     room_id UUID, -- Will add FK constraint separately if table exists
     bed_id UUID, -- Will add FK constraint separately if table exists
     
-    -- Booking Form Data (Required Fields)
+    -- rental Form Data (Required Fields)
     full_name VARCHAR(255) NOT NULL,
     address TEXT NOT NULL,
     barangay VARCHAR(100) NOT NULL,
@@ -483,7 +483,7 @@ CREATE TABLE IF NOT EXISTS bookings (
     citizenship VARCHAR(20) NOT NULL CHECK (citizenship IN ('Filipino', 'Foreigner')),
     occupation_status VARCHAR(20) NOT NULL CHECK (occupation_status IN ('Student', 'Worker')),
     
-    -- Booking Details
+    -- rental Details
     check_in_date DATE,
     check_out_date DATE,
     total_amount DECIMAL(10,2) NOT NULL,
@@ -508,14 +508,14 @@ DO $$
 BEGIN
     -- Add tenant_id FK if tenant_profiles exists AND column exists
     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'tenant_profiles') THEN
-        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'tenant_id') THEN
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'tenant_id') THEN
             IF NOT EXISTS (
                 SELECT 1 FROM information_schema.table_constraints 
-                WHERE constraint_name = 'bookings_tenant_id_fkey' 
-                AND table_name = 'bookings'
+                WHERE constraint_name = 'Rentals_tenant_id_fkey' 
+                AND table_name = 'Rentals'
             ) THEN
-                ALTER TABLE bookings 
-                ADD CONSTRAINT bookings_tenant_id_fkey 
+                ALTER TABLE Rentals 
+                ADD CONSTRAINT Rentals_tenant_id_fkey 
                 FOREIGN KEY (tenant_id) REFERENCES tenant_profiles(id) ON DELETE SET NULL;
             END IF;
         END IF;
@@ -527,14 +527,14 @@ BEGIN
         WHERE table_name = 'boarding_houses' 
         AND table_type = 'BASE TABLE'
     ) THEN
-        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'boarding_house_id') THEN
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'boarding_house_id') THEN
             IF NOT EXISTS (
                 SELECT 1 FROM information_schema.table_constraints 
-                WHERE constraint_name = 'bookings_boarding_house_id_fkey' 
-                AND table_name = 'bookings'
+                WHERE constraint_name = 'Rentals_boarding_house_id_fkey' 
+                AND table_name = 'Rentals'
             ) THEN
-                ALTER TABLE bookings 
-                ADD CONSTRAINT bookings_boarding_house_id_fkey 
+                ALTER TABLE Rentals 
+                ADD CONSTRAINT Rentals_boarding_house_id_fkey 
                 FOREIGN KEY (boarding_house_id) REFERENCES boarding_houses(id) ON DELETE CASCADE;
             END IF;
         END IF;
@@ -542,14 +542,14 @@ BEGIN
     
     -- Add room_id FK if rooms exists AND column exists
     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'rooms') THEN
-        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'room_id') THEN
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'room_id') THEN
             IF NOT EXISTS (
                 SELECT 1 FROM information_schema.table_constraints 
-                WHERE constraint_name = 'bookings_room_id_fkey' 
-                AND table_name = 'bookings'
+                WHERE constraint_name = 'Rentals_room_id_fkey' 
+                AND table_name = 'Rentals'
             ) THEN
-                ALTER TABLE bookings 
-                ADD CONSTRAINT bookings_room_id_fkey 
+                ALTER TABLE Rentals 
+                ADD CONSTRAINT Rentals_room_id_fkey 
                 FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE SET NULL;
             END IF;
         END IF;
@@ -557,14 +557,14 @@ BEGIN
     
     -- Add bed_id FK if beds exists AND column exists
     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'beds') THEN
-        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'bed_id') THEN
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'bed_id') THEN
             IF NOT EXISTS (
                 SELECT 1 FROM information_schema.table_constraints 
-                WHERE constraint_name = 'bookings_bed_id_fkey' 
-                AND table_name = 'bookings'
+                WHERE constraint_name = 'Rentals_bed_id_fkey' 
+                AND table_name = 'Rentals'
             ) THEN
-                ALTER TABLE bookings 
-                ADD CONSTRAINT bookings_bed_id_fkey 
+                ALTER TABLE Rentals 
+                ADD CONSTRAINT Rentals_bed_id_fkey 
                 FOREIGN KEY (bed_id) REFERENCES beds(id) ON DELETE SET NULL;
             END IF;
         END IF;
@@ -604,53 +604,53 @@ BEGIN
         END IF;
     END IF;
     
-    -- Add FK constraints for property_images if boarding_houses exists as a TABLE (not view) AND column exists
+    -- Add FK constraints for vehicle_images if boarding_houses exists as a TABLE (not view) AND column exists
     IF EXISTS (
         SELECT 1 FROM information_schema.tables 
         WHERE table_name = 'boarding_houses' 
         AND table_type = 'BASE TABLE'
     ) THEN
-        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'property_images' AND column_name = 'boarding_house_id') THEN
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'vehicle_images' AND column_name = 'boarding_house_id') THEN
             IF NOT EXISTS (
                 SELECT 1 FROM information_schema.table_constraints 
-                WHERE constraint_name = 'property_images_boarding_house_id_fkey' 
-                AND table_name = 'property_images'
+                WHERE constraint_name = 'vehicle_images_boarding_house_id_fkey' 
+                AND table_name = 'vehicle_images'
             ) THEN
-                ALTER TABLE property_images 
-                ADD CONSTRAINT property_images_boarding_house_id_fkey 
+                ALTER TABLE vehicle_images 
+                ADD CONSTRAINT vehicle_images_boarding_house_id_fkey 
                 FOREIGN KEY (boarding_house_id) REFERENCES boarding_houses(id) ON DELETE CASCADE;
             END IF;
         END IF;
     END IF;
     
     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'rooms') THEN
-        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'property_images' AND column_name = 'room_id') THEN
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'vehicle_images' AND column_name = 'room_id') THEN
             IF NOT EXISTS (
                 SELECT 1 FROM information_schema.table_constraints 
-                WHERE constraint_name = 'property_images_room_id_fkey' 
-                AND table_name = 'property_images'
+                WHERE constraint_name = 'vehicle_images_room_id_fkey' 
+                AND table_name = 'vehicle_images'
             ) THEN
-                ALTER TABLE property_images 
-                ADD CONSTRAINT property_images_room_id_fkey 
+                ALTER TABLE vehicle_images 
+                ADD CONSTRAINT vehicle_images_room_id_fkey 
                 FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE SET NULL;
             END IF;
         END IF;
     END IF;
     
-    -- Add FK constraint for booking_analytics if boarding_houses exists as a TABLE (not view) AND column exists
+    -- Add FK constraint for rental_analytics if boarding_houses exists as a TABLE (not view) AND column exists
     IF EXISTS (
         SELECT 1 FROM information_schema.tables 
         WHERE table_name = 'boarding_houses' 
         AND table_type = 'BASE TABLE'
     ) THEN
-        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'booking_analytics' AND column_name = 'boarding_house_id') THEN
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'rental_analytics' AND column_name = 'boarding_house_id') THEN
             IF NOT EXISTS (
                 SELECT 1 FROM information_schema.table_constraints 
-                WHERE constraint_name = 'booking_analytics_boarding_house_id_fkey' 
-                AND table_name = 'booking_analytics'
+                WHERE constraint_name = 'rental_analytics_boarding_house_id_fkey' 
+                AND table_name = 'rental_analytics'
             ) THEN
-                ALTER TABLE booking_analytics 
-                ADD CONSTRAINT booking_analytics_boarding_house_id_fkey 
+                ALTER TABLE rental_analytics 
+                ADD CONSTRAINT rental_analytics_boarding_house_id_fkey 
                 FOREIGN KEY (boarding_house_id) REFERENCES boarding_houses(id) ON DELETE CASCADE;
             END IF;
         END IF;
@@ -677,16 +677,16 @@ BEGIN
 END $$;
 
 -- ============================================================================
--- 11. REVIEWS (Only After Booking Approval)
+-- 11. REVIEWS (Only After rental Approval)
 -- ============================================================================
 
 -- Add missing columns if reviews table exists
 DO $$ 
 BEGIN
     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'reviews') THEN
-        -- Add booking_id if missing (critical column)
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'reviews' AND column_name = 'booking_id') THEN
-            ALTER TABLE reviews ADD COLUMN booking_id UUID;
+        -- Add rental_id if missing (critical column)
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'reviews' AND column_name = 'rental_id') THEN
+            ALTER TABLE reviews ADD COLUMN rental_id UUID;
         END IF;
         -- Add tenant_id if missing
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'reviews' AND column_name = 'tenant_id') THEN
@@ -696,9 +696,9 @@ BEGIN
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'reviews' AND column_name = 'boarding_house_id') THEN
             ALTER TABLE reviews ADD COLUMN boarding_house_id UUID;
         END IF;
-        -- Ensure property_id exists (for old schema compatibility)
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'reviews' AND column_name = 'property_id') THEN
-            ALTER TABLE reviews ADD COLUMN property_id UUID;
+        -- Ensure vehicle_id exists (for old schema compatibility)
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'reviews' AND column_name = 'vehicle_id') THEN
+            ALTER TABLE reviews ADD COLUMN vehicle_id UUID;
         END IF;
         -- Add is_verified if missing
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'reviews' AND column_name = 'is_verified') THEN
@@ -711,15 +711,15 @@ BEGIN
         -- Add tenant_email if missing (critical column)
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'reviews' AND column_name = 'tenant_email') THEN
             ALTER TABLE reviews ADD COLUMN tenant_email VARCHAR(255);
-            -- Try to populate from bookings if possible
-            IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'tenant_email') THEN
+            -- Try to populate from Rentals if possible
+            IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'tenant_email') THEN
                 UPDATE reviews SET tenant_email = (
-                    SELECT tenant_email FROM bookings WHERE bookings.id = reviews.booking_id
-                ) WHERE tenant_email IS NULL AND booking_id IS NOT NULL;
-            ELSIF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'client_email') THEN
+                    SELECT tenant_email FROM Rentals WHERE Rentals.id = reviews.rental_id
+                ) WHERE tenant_email IS NULL AND rental_id IS NOT NULL;
+            ELSIF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'client_email') THEN
                 UPDATE reviews SET tenant_email = (
-                    SELECT client_email FROM bookings WHERE bookings.id = reviews.booking_id
-                ) WHERE tenant_email IS NULL AND booking_id IS NOT NULL;
+                    SELECT client_email FROM Rentals WHERE Rentals.id = reviews.rental_id
+                ) WHERE tenant_email IS NULL AND rental_id IS NOT NULL;
             END IF;
         END IF;
     END IF;
@@ -727,29 +727,29 @@ END $$;
 
 CREATE TABLE IF NOT EXISTS reviews (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    booking_id UUID, -- FK constraint added separately
+    rental_id UUID, -- FK constraint added separately
     tenant_id UUID,
     tenant_email VARCHAR(255), -- NOT NULL constraint added separately if column exists
     boarding_house_id UUID, -- Will add FK constraint separately if table exists
-    property_id UUID, -- Fallback for old schema
+    vehicle_id UUID, -- Fallback for old schema
     rating INTEGER NOT NULL CHECK (rating >= 1 AND rating <= 5),
     review_text TEXT,
-    is_verified BOOLEAN DEFAULT FALSE, -- Verified if booking was approved
+    is_verified BOOLEAN DEFAULT FALSE, -- Verified if rental was approved
     is_visible BOOLEAN DEFAULT TRUE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Add UNIQUE constraint for reviews (only one review per booking) conditionally
+-- Add UNIQUE constraint for reviews (only one review per rental) conditionally
 DO $$ 
 BEGIN
-    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'reviews' AND column_name = 'booking_id') THEN
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'reviews' AND column_name = 'rental_id') THEN
         IF NOT EXISTS (
             SELECT 1 FROM information_schema.table_constraints 
-            WHERE constraint_name = 'reviews_booking_id_unique' 
+            WHERE constraint_name = 'reviews_rental_id_unique' 
             AND table_name = 'reviews'
         ) THEN
-            ALTER TABLE reviews ADD CONSTRAINT reviews_booking_id_unique UNIQUE(booking_id);
+            ALTER TABLE reviews ADD CONSTRAINT reviews_rental_id_unique UNIQUE(rental_id);
         END IF;
     END IF;
 END $$;
@@ -757,17 +757,17 @@ END $$;
 -- Add foreign key constraints for reviews conditionally
 DO $$ 
 BEGIN
-    -- Add booking_id FK if bookings exists AND column exists
-    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'bookings') THEN
-        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'reviews' AND column_name = 'booking_id') THEN
+    -- Add rental_id FK if Rentals exists AND column exists
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'Rentals') THEN
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'reviews' AND column_name = 'rental_id') THEN
             IF NOT EXISTS (
                 SELECT 1 FROM information_schema.table_constraints 
-                WHERE constraint_name = 'reviews_booking_id_fkey' 
+                WHERE constraint_name = 'reviews_rental_id_fkey' 
                 AND table_name = 'reviews'
             ) THEN
                 ALTER TABLE reviews 
-                ADD CONSTRAINT reviews_booking_id_fkey 
-                FOREIGN KEY (booking_id) REFERENCES bookings(id) ON DELETE CASCADE;
+                ADD CONSTRAINT reviews_rental_id_fkey 
+                FOREIGN KEY (rental_id) REFERENCES Rentals(id) ON DELETE CASCADE;
             END IF;
         END IF;
     END IF;
@@ -807,7 +807,7 @@ BEGIN
     END IF;
 END $$;
 
--- Note: Reviews can only be submitted if booking is approved
+-- Note: Reviews can only be submitted if rental is approved
 -- This is enforced via the verify_review_eligibility() trigger function below
 -- (PostgreSQL CHECK constraints cannot contain subqueries)
 
@@ -815,14 +815,14 @@ END $$;
 -- 12. ANALYTICS & REPORTING
 -- ============================================================================
 
--- Booking Analytics (for priority listing)
-CREATE TABLE IF NOT EXISTS booking_analytics (
+-- rental Analytics (for priority listing)
+CREATE TABLE IF NOT EXISTS rental_analytics (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     boarding_house_id UUID, -- FK constraint added separately (only if boarding_houses is a table)
-    property_id UUID, -- Fallback for old schema
+    vehicle_id UUID, -- Fallback for old schema
     date DATE NOT NULL,
-    total_bookings INTEGER DEFAULT 0,
-    approved_bookings INTEGER DEFAULT 0,
+    total_Rentals INTEGER DEFAULT 0,
+    approved_Rentals INTEGER DEFAULT 0,
     total_revenue DECIMAL(10,2) DEFAULT 0.0,
     occupancy_rate DECIMAL(5,2) DEFAULT 0.0,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -832,7 +832,7 @@ CREATE TABLE IF NOT EXISTS booking_analytics (
 -- Admin Reports (for report generation module)
 CREATE TABLE IF NOT EXISTS admin_reports (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    report_type VARCHAR(50) NOT NULL CHECK (report_type IN ('bookings', 'landlords', 'tenants', 'revenue', 'custom')),
+    report_type VARCHAR(50) NOT NULL CHECK (report_type IN ('Rentals', 'landlords', 'tenants', 'revenue', 'custom')),
     filters JSONB, -- Store filter criteria (boarding_house_id, date_range, etc.)
     generated_by UUID REFERENCES auth.users(id),
     generated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -876,7 +876,7 @@ BEGIN
         CREATE INDEX IF NOT EXISTS idx_boarding_houses_landlord ON boarding_houses(landlord_id);
         CREATE INDEX IF NOT EXISTS idx_boarding_houses_status ON boarding_houses(status);
         CREATE INDEX IF NOT EXISTS idx_boarding_houses_rating ON boarding_houses(rating DESC);
-        CREATE INDEX IF NOT EXISTS idx_boarding_houses_bookings ON boarding_houses(total_bookings DESC); -- For priority listing
+        CREATE INDEX IF NOT EXISTS idx_boarding_houses_Rentals ON boarding_houses(total_Rentals DESC); -- For priority listing
         CREATE INDEX IF NOT EXISTS idx_boarding_houses_location ON boarding_houses(lat, lng);
         CREATE INDEX IF NOT EXISTS idx_boarding_houses_featured ON boarding_houses(is_featured);
     END IF;
@@ -890,8 +890,8 @@ BEGIN
     IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'landlord_permits' AND column_name = 'boarding_house_id') THEN
         CREATE INDEX IF NOT EXISTS idx_permits_boarding_house ON landlord_permits(boarding_house_id);
     END IF;
-    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'landlord_permits' AND column_name = 'property_id') THEN
-        CREATE INDEX IF NOT EXISTS idx_permits_property ON landlord_permits(property_id);
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'landlord_permits' AND column_name = 'vehicle_id') THEN
+        CREATE INDEX IF NOT EXISTS idx_permits_vehicle ON landlord_permits(vehicle_id);
     END IF;
 END $$;
 CREATE INDEX IF NOT EXISTS idx_permits_verification ON landlord_permits(verification_status);
@@ -907,37 +907,37 @@ CREATE INDEX IF NOT EXISTS idx_beds_type ON beds(bed_type);
 CREATE INDEX IF NOT EXISTS idx_beds_parent ON beds(parent_bed_id);
 
 -- Images indexes
-CREATE INDEX IF NOT EXISTS idx_images_boarding_house ON property_images(boarding_house_id);
-CREATE INDEX IF NOT EXISTS idx_images_room ON property_images(room_id);
-CREATE INDEX IF NOT EXISTS idx_images_category ON property_images(image_category);
-CREATE INDEX IF NOT EXISTS idx_images_display_order ON property_images(display_order);
+CREATE INDEX IF NOT EXISTS idx_images_boarding_house ON vehicle_images(boarding_house_id);
+CREATE INDEX IF NOT EXISTS idx_images_room ON vehicle_images(room_id);
+CREATE INDEX IF NOT EXISTS idx_images_category ON vehicle_images(image_category);
+CREATE INDEX IF NOT EXISTS idx_images_display_order ON vehicle_images(display_order);
 
 -- Tenant profiles indexes
 CREATE INDEX IF NOT EXISTS idx_tenant_profiles_user_id ON tenant_profiles(user_id);
 CREATE INDEX IF NOT EXISTS idx_tenant_profiles_email ON tenant_profiles(email);
 
--- Bookings indexes
-CREATE INDEX IF NOT EXISTS idx_bookings_tenant ON bookings(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_bookings_boarding_house ON bookings(boarding_house_id);
-CREATE INDEX IF NOT EXISTS idx_bookings_room ON bookings(room_id);
-CREATE INDEX IF NOT EXISTS idx_bookings_bed ON bookings(bed_id);
-CREATE INDEX IF NOT EXISTS idx_bookings_status ON bookings(status);
+-- Rentals indexes
+CREATE INDEX IF NOT EXISTS idx_Rentals_tenant ON Rentals(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_Rentals_boarding_house ON Rentals(boarding_house_id);
+CREATE INDEX IF NOT EXISTS idx_Rentals_room ON Rentals(room_id);
+CREATE INDEX IF NOT EXISTS idx_Rentals_bed ON Rentals(bed_id);
+CREATE INDEX IF NOT EXISTS idx_Rentals_status ON Rentals(status);
 -- Only create dates index if columns exist
 DO $$ 
 BEGIN
-    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'check_in_date') 
-       AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'check_out_date') THEN
-        CREATE INDEX IF NOT EXISTS idx_bookings_dates ON bookings(check_in_date, check_out_date);
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'check_in_date') 
+       AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'check_out_date') THEN
+        CREATE INDEX IF NOT EXISTS idx_Rentals_dates ON Rentals(check_in_date, check_out_date);
     END IF;
 END $$;
-CREATE INDEX IF NOT EXISTS idx_bookings_created ON bookings(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_Rentals_created ON Rentals(created_at DESC);
 
 -- Reviews indexes (conditional)
--- Only create booking_id index if column exists
+-- Only create rental_id index if column exists
 DO $$ 
 BEGIN
-    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'reviews' AND column_name = 'booking_id') THEN
-        CREATE INDEX IF NOT EXISTS idx_reviews_booking ON reviews(booking_id);
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'reviews' AND column_name = 'rental_id') THEN
+        CREATE INDEX IF NOT EXISTS idx_reviews_rental ON reviews(rental_id);
     END IF;
 END $$;
 DO $$ 
@@ -950,9 +950,9 @@ BEGIN
     IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'reviews' AND column_name = 'boarding_house_id') THEN
         CREATE INDEX IF NOT EXISTS idx_reviews_boarding_house ON reviews(boarding_house_id);
     END IF;
-    -- property_id index (for backward compatibility)
-    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'reviews' AND column_name = 'property_id') THEN
-        CREATE INDEX IF NOT EXISTS idx_reviews_property ON reviews(property_id);
+    -- vehicle_id index (for backward compatibility)
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'reviews' AND column_name = 'vehicle_id') THEN
+        CREATE INDEX IF NOT EXISTS idx_reviews_vehicle ON reviews(vehicle_id);
     END IF;
 END $$;
 CREATE INDEX IF NOT EXISTS idx_reviews_rating ON reviews(rating);
@@ -971,14 +971,14 @@ END $$;
 -- Analytics indexes (conditional)
 DO $$ 
 BEGIN
-    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'booking_analytics' AND column_name = 'boarding_house_id') THEN
-        CREATE INDEX IF NOT EXISTS idx_analytics_boarding_house ON booking_analytics(boarding_house_id);
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'rental_analytics' AND column_name = 'boarding_house_id') THEN
+        CREATE INDEX IF NOT EXISTS idx_analytics_boarding_house ON rental_analytics(boarding_house_id);
     END IF;
-    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'booking_analytics' AND column_name = 'property_id') THEN
-        CREATE INDEX IF NOT EXISTS idx_analytics_property ON booking_analytics(property_id);
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'rental_analytics' AND column_name = 'vehicle_id') THEN
+        CREATE INDEX IF NOT EXISTS idx_analytics_vehicle ON rental_analytics(vehicle_id);
     END IF;
 END $$;
-CREATE INDEX IF NOT EXISTS idx_analytics_date ON booking_analytics(date DESC);
+CREATE INDEX IF NOT EXISTS idx_analytics_date ON rental_analytics(date DESC);
 
 -- ============================================================================
 -- 13. TRIGGERS & FUNCTIONS
@@ -1029,9 +1029,9 @@ CREATE TRIGGER update_beds_updated_at
     BEFORE UPDATE ON beds
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_bookings_updated_at ON bookings;
-CREATE TRIGGER update_bookings_updated_at 
-    BEFORE UPDATE ON bookings
+DROP TRIGGER IF EXISTS update_Rentals_updated_at ON Rentals;
+CREATE TRIGGER update_Rentals_updated_at 
+    BEFORE UPDATE ON Rentals
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 DROP TRIGGER IF EXISTS update_reviews_updated_at ON reviews;
@@ -1044,8 +1044,8 @@ CREATE TRIGGER update_tenant_profiles_updated_at
     BEFORE UPDATE ON tenant_profiles
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
--- Function to update bed status when booking is approved/rejected
-CREATE OR REPLACE FUNCTION update_bed_status_on_booking()
+-- Function to update bed status when rental is approved/rejected
+CREATE OR REPLACE FUNCTION update_bed_status_on_rental()
 RETURNS TRIGGER AS $$
 BEGIN
     IF NEW.status = 'approved' AND OLD.status != 'approved' THEN
@@ -1053,14 +1053,14 @@ BEGIN
         UPDATE beds SET status = 'occupied' WHERE id = NEW.bed_id;
         -- Update room occupancy
         UPDATE rooms SET current_occupancy = current_occupancy + 1 WHERE id = NEW.room_id;
-        -- Update boarding house booking count (only if boarding_houses is a table)
+        -- Update boarding house rental count (only if boarding_houses is a table)
         IF EXISTS (
             SELECT 1 FROM information_schema.tables 
             WHERE table_name = 'boarding_houses' 
             AND table_type = 'BASE TABLE'
         ) THEN
-            UPDATE boarding_houses SET total_bookings = total_bookings + 1 
-            WHERE id = COALESCE(NEW.boarding_house_id, NEW.property_id);
+            UPDATE boarding_houses SET total_Rentals = total_Rentals + 1 
+            WHERE id = COALESCE(NEW.boarding_house_id, NEW.vehicle_id);
         END IF;
     ELSIF NEW.status IN ('rejected', 'cancelled') AND OLD.status = 'approved' THEN
         -- Mark bed as available
@@ -1072,10 +1072,10 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS update_bed_status_trigger ON bookings;
+DROP TRIGGER IF EXISTS update_bed_status_trigger ON Rentals;
 CREATE TRIGGER update_bed_status_trigger
-    AFTER UPDATE ON bookings
-    FOR EACH ROW EXECUTE FUNCTION update_bed_status_on_booking();
+    AFTER UPDATE ON Rentals
+    FOR EACH ROW EXECUTE FUNCTION update_bed_status_on_rental();
 
 -- Function to update boarding house rating when review is added/updated
 CREATE OR REPLACE FUNCTION update_boarding_house_rating()
@@ -1084,7 +1084,7 @@ DECLARE
     bh_id UUID;
 BEGIN
     -- Get the boarding_house_id (support both new and old schema)
-    bh_id := COALESCE(NEW.boarding_house_id, NEW.property_id, OLD.boarding_house_id, OLD.property_id);
+    bh_id := COALESCE(NEW.boarding_house_id, NEW.vehicle_id, OLD.boarding_house_id, OLD.vehicle_id);
     
     -- Only update if boarding_houses is a table (not a view) and bh_id exists
     IF EXISTS (
@@ -1098,14 +1098,14 @@ BEGIN
                 rating = (
                     SELECT COALESCE(AVG(rating), 0) 
                     FROM reviews 
-                    WHERE COALESCE(boarding_house_id, property_id) = bh_id 
+                    WHERE COALESCE(boarding_house_id, vehicle_id) = bh_id 
                     AND (is_verified = TRUE OR is_verified IS NULL)
                     AND (is_visible = TRUE OR is_visible IS NULL)
                 ),
                 total_reviews = (
                     SELECT COUNT(*) 
                     FROM reviews 
-                    WHERE COALESCE(boarding_house_id, property_id) = bh_id 
+                    WHERE COALESCE(boarding_house_id, vehicle_id) = bh_id 
                     AND (is_verified = TRUE OR is_verified IS NULL)
                     AND (is_visible = TRUE OR is_visible IS NULL)
                 )
@@ -1117,14 +1117,14 @@ BEGIN
                 rating = (
                     SELECT COALESCE(AVG(rating), 0) 
                     FROM reviews 
-                    WHERE COALESCE(boarding_house_id, property_id) = bh_id 
+                    WHERE COALESCE(boarding_house_id, vehicle_id) = bh_id 
                     AND (is_verified = TRUE OR is_verified IS NULL)
                     AND (is_visible = TRUE OR is_visible IS NULL)
                 ),
                 total_reviews = (
                     SELECT COUNT(*) 
                     FROM reviews 
-                    WHERE COALESCE(boarding_house_id, property_id) = bh_id 
+                    WHERE COALESCE(boarding_house_id, vehicle_id) = bh_id 
                     AND (is_verified = TRUE OR is_verified IS NULL)
                     AND (is_visible = TRUE OR is_visible IS NULL)
                 )
@@ -1142,22 +1142,22 @@ CREATE TRIGGER update_boarding_house_rating_trigger
     AFTER INSERT OR UPDATE OR DELETE ON reviews
     FOR EACH ROW EXECUTE FUNCTION update_boarding_house_rating();
 
--- Function to verify review eligibility (booking must be approved)
+-- Function to verify review eligibility (rental must be approved)
 CREATE OR REPLACE FUNCTION verify_review_eligibility()
 RETURNS TRIGGER AS $$
 BEGIN
-    -- If booking_id is provided, verify the booking is approved
-    -- Allow NULL booking_id for backward compatibility with old reviews
-    IF NEW.booking_id IS NOT NULL THEN
+    -- If rental_id is provided, verify the rental is approved
+    -- Allow NULL rental_id for backward compatibility with old reviews
+    IF NEW.rental_id IS NOT NULL THEN
         IF NOT EXISTS (
-            SELECT 1 FROM bookings 
-            WHERE id = NEW.booking_id 
+            SELECT 1 FROM Rentals 
+            WHERE id = NEW.rental_id 
             AND status = 'approved'
         ) THEN
-            RAISE EXCEPTION 'Review can only be submitted for approved bookings';
+            RAISE EXCEPTION 'Review can only be submitted for approved Rentals';
         END IF;
         
-        -- Mark review as verified since booking is approved
+        -- Mark review as verified since rental is approved
         NEW.is_verified = TRUE;
     END IF;
     
@@ -1275,32 +1275,32 @@ BEGIN
             bh.status,
             bh.rating,
             bh.total_reviews,
-            bh.total_bookings,
+            bh.total_Rentals,
             bh.is_featured,
             bh.admin_notes,
             bh.created_at,
             bh.updated_at,
             lp.full_name as landlord_name,
             lp.email as landlord_email,
-            COUNT(DISTINCT b.id) as recent_bookings_count,
+            COUNT(DISTINCT b.id) as recent_Rentals_count,
             COUNT(DISTINCT r.id) as total_reviews_count,
             COALESCE(AVG(r.rating), 0) as calculated_rating
         FROM boarding_houses bh
         LEFT JOIN landlord_profiles lp ON bh.landlord_id = lp.id
-        LEFT JOIN bookings b ON COALESCE(b.boarding_house_id, b.property_id) = bh.id 
+        LEFT JOIN Rentals b ON COALESCE(b.boarding_house_id, b.vehicle_id) = bh.id 
             AND b.created_at >= NOW() - INTERVAL ''30 days''
-        LEFT JOIN reviews r ON COALESCE(r.boarding_house_id, r.property_id) = bh.id 
+        LEFT JOIN reviews r ON COALESCE(r.boarding_house_id, r.vehicle_id) = bh.id 
             AND (r.is_visible = TRUE OR r.is_visible IS NULL)
         WHERE bh.status = ''active''
         GROUP BY bh.id, bh.landlord_id, bh.landlord_email, bh.name, bh.description, bh.address, bh.barangay, 
                  bh.municipality_city, bh.province, bh.lat, bh.lng, bh.price_per_bed, 
                  bh.amenities, bh.house_rules, bh.contact_phone, bh.contact_email, 
-                 bh.status, bh.rating, bh.total_reviews, bh.total_bookings, 
+                 bh.status, bh.rating, bh.total_reviews, bh.total_Rentals, 
                  bh.is_featured, bh.admin_notes, bh.created_at, bh.updated_at,
                  lp.full_name, lp.email
         ORDER BY 
-            bh.total_bookings DESC,
-            recent_bookings_count DESC,
+            bh.total_Rentals DESC,
+            recent_Rentals_count DESC,
             calculated_rating DESC';
     ELSE
         -- Create view without is_visible check if column doesn't exist
@@ -1326,31 +1326,31 @@ BEGIN
             bh.status,
             bh.rating,
             bh.total_reviews,
-            bh.total_bookings,
+            bh.total_Rentals,
             bh.is_featured,
             bh.admin_notes,
             bh.created_at,
             bh.updated_at,
             lp.full_name as landlord_name,
             lp.email as landlord_email,
-            COUNT(DISTINCT b.id) as recent_bookings_count,
+            COUNT(DISTINCT b.id) as recent_Rentals_count,
             COUNT(DISTINCT r.id) as total_reviews_count,
             COALESCE(AVG(r.rating), 0) as calculated_rating
         FROM boarding_houses bh
         LEFT JOIN landlord_profiles lp ON bh.landlord_id = lp.id
-        LEFT JOIN bookings b ON COALESCE(b.boarding_house_id, b.property_id) = bh.id 
+        LEFT JOIN Rentals b ON COALESCE(b.boarding_house_id, b.vehicle_id) = bh.id 
             AND b.created_at >= NOW() - INTERVAL ''30 days''
-        LEFT JOIN reviews r ON COALESCE(r.boarding_house_id, r.property_id) = bh.id
+        LEFT JOIN reviews r ON COALESCE(r.boarding_house_id, r.vehicle_id) = bh.id
         WHERE bh.status = ''active''
         GROUP BY bh.id, bh.landlord_id, bh.landlord_email, bh.name, bh.description, bh.address, bh.barangay, 
                  bh.municipality_city, bh.province, bh.lat, bh.lng, bh.price_per_bed, 
                  bh.amenities, bh.house_rules, bh.contact_phone, bh.contact_email, 
-                 bh.status, bh.rating, bh.total_reviews, bh.total_bookings, 
+                 bh.status, bh.rating, bh.total_reviews, bh.total_Rentals, 
                  bh.is_featured, bh.admin_notes, bh.created_at, bh.updated_at,
                  lp.full_name, lp.email
         ORDER BY 
-            bh.total_bookings DESC,
-            recent_bookings_count DESC,
+            bh.total_Rentals DESC,
+            recent_Rentals_count DESC,
             calculated_rating DESC';
     END IF;
 END $$;
@@ -1385,9 +1385,9 @@ SELECT
     COUNT(DISTINCT lp.id) as total_landlords,
     COUNT(DISTINCT tp.id) as total_tenants,
     COUNT(DISTINCT bh.id) as total_boarding_houses,
-    COUNT(DISTINCT b.id) as total_bookings,
-    COUNT(DISTINCT CASE WHEN b.status = 'approved' THEN b.id END) as approved_bookings,
-    COUNT(DISTINCT CASE WHEN b.status = 'pending' THEN b.id END) as pending_bookings,
+    COUNT(DISTINCT b.id) as total_Rentals,
+    COUNT(DISTINCT CASE WHEN b.status = 'approved' THEN b.id END) as approved_Rentals,
+    COUNT(DISTINCT CASE WHEN b.status = 'pending' THEN b.id END) as pending_Rentals,
     COALESCE(SUM(CASE WHEN b.status = 'approved' THEN b.total_amount ELSE 0 END), 0) as total_revenue,
     COUNT(DISTINCT r.id) as total_reviews,
     COUNT(DISTINCT CASE WHEN lp.verification_status = 'pending' THEN lp.id END) as pending_landlord_verifications,
@@ -1395,7 +1395,7 @@ SELECT
 FROM landlord_profiles lp
 FULL OUTER JOIN tenant_profiles tp ON 1=1
 FULL OUTER JOIN boarding_houses bh ON 1=1
-FULL OUTER JOIN bookings b ON 1=1
+FULL OUTER JOIN Rentals b ON 1=1
 FULL OUTER JOIN reviews r ON 1=1
 FULL OUTER JOIN landlord_permits p ON 1=1;
 
@@ -1407,34 +1407,34 @@ SELECT
     lp.email as landlord_email,
     bh.id as boarding_house_id,
     bh.name as boarding_house_name,
-    COUNT(DISTINCT b.id) as total_bookings,
-    COUNT(DISTINCT CASE WHEN b.status = 'approved' THEN b.id END) as approved_bookings,
+    COUNT(DISTINCT b.id) as total_Rentals,
+    COUNT(DISTINCT CASE WHEN b.status = 'approved' THEN b.id END) as approved_Rentals,
     COUNT(DISTINCT r.id) as booked_rooms,
     COUNT(DISTINCT b.bed_id) as booked_bed_spaces,
     COALESCE(SUM(CASE WHEN b.status = 'approved' THEN b.total_amount ELSE 0 END), 0) as total_revenue,
-    COALESCE(AVG(CASE WHEN b.status = 'approved' THEN b.total_amount END), 0) as avg_booking_amount
+    COALESCE(AVG(CASE WHEN b.status = 'approved' THEN b.total_amount END), 0) as avg_rental_amount
 FROM landlord_profiles lp
 JOIN boarding_houses bh ON lp.id = bh.landlord_id
-LEFT JOIN bookings b ON bh.id = b.boarding_house_id
+LEFT JOIN Rentals b ON bh.id = b.boarding_house_id
 LEFT JOIN rooms r ON b.room_id = r.id
 GROUP BY lp.id, lp.full_name, lp.email, bh.id, bh.name;
 
--- View: Tenant booking details (for admin) - Created conditionally
+-- View: Tenant rental details (for admin) - Created conditionally
 DO $$ 
 BEGIN
     -- Drop view if it exists (to recreate with correct columns)
-    DROP VIEW IF EXISTS tenant_booking_details;
+    DROP VIEW IF EXISTS tenant_rental_details;
     
     -- Check if required columns exist before creating view
     IF EXISTS (
         SELECT 1 FROM information_schema.columns 
-        WHERE table_name = 'bookings' 
+        WHERE table_name = 'Rentals' 
         AND column_name IN ('check_in_date', 'check_out_date', 'full_name', 'tenant_email')
     ) THEN
         EXECUTE '
-        CREATE VIEW tenant_booking_details AS
+        CREATE VIEW tenant_rental_details AS
         SELECT 
-            b.id as booking_id,
+            b.id as rental_id,
             COALESCE(b.full_name, '''') as tenant_full_name,
             COALESCE(b.address, '''') as address,
             COALESCE(b.barangay, '''') as barangay,
@@ -1443,7 +1443,7 @@ BEGIN
             COALESCE(b.age, 0) as age,
             COALESCE(b.citizenship, '''') as citizenship,
             COALESCE(b.occupation_status, '''') as occupation_status,
-            b.status as booking_status,
+            b.status as rental_status,
             b.check_in_date,
             b.check_out_date,
             COALESCE(b.total_amount, 0) as total_amount,
@@ -1451,9 +1451,9 @@ BEGIN
             r.room_number,
             bed.bed_number,
             bed.bed_type,
-            b.created_at as booking_date
-        FROM bookings b
-        LEFT JOIN boarding_houses bh ON COALESCE(b.boarding_house_id, b.property_id) = bh.id
+            b.created_at as rental_date
+        FROM Rentals b
+        LEFT JOIN boarding_houses bh ON COALESCE(b.boarding_house_id, b.vehicle_id) = bh.id
         LEFT JOIN rooms r ON b.room_id = r.id
         LEFT JOIN beds bed ON b.bed_id = bed.id';
     END IF;
@@ -1481,37 +1481,37 @@ END $$;
 ALTER TABLE landlord_permits ENABLE ROW LEVEL SECURITY;
 ALTER TABLE rooms ENABLE ROW LEVEL SECURITY;
 ALTER TABLE beds ENABLE ROW LEVEL SECURITY;
-ALTER TABLE property_images ENABLE ROW LEVEL SECURITY;
+ALTER TABLE vehicle_images ENABLE ROW LEVEL SECURITY;
 ALTER TABLE tenant_profiles ENABLE ROW LEVEL SECURITY;
-ALTER TABLE bookings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE Rentals ENABLE ROW LEVEL SECURITY;
 ALTER TABLE reviews ENABLE ROW LEVEL SECURITY;
-ALTER TABLE booking_analytics ENABLE ROW LEVEL SECURITY;
+ALTER TABLE rental_analytics ENABLE ROW LEVEL SECURITY;
 ALTER TABLE admin_reports ENABLE ROW LEVEL SECURITY;
 
--- Properties: Enable RLS if table exists
+-- Vehicles: Enable RLS if table exists
 DO $$ 
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.tables 
-        WHERE table_name = 'properties' 
+        WHERE table_name = 'Vehicles' 
         AND table_type = 'BASE TABLE'
     ) THEN
-        ALTER TABLE properties ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE Vehicles ENABLE ROW LEVEL SECURITY;
     END IF;
 END $$;
 
--- Properties: RLS Policies (only if properties table exists)
+-- Vehicles: RLS Policies (only if Vehicles table exists)
 DO $$ 
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.tables 
-        WHERE table_name = 'properties' 
+        WHERE table_name = 'Vehicles' 
         AND table_type = 'BASE TABLE'
     ) THEN
-        -- Everyone can view available/active properties (works for both authenticated and anonymous users)
-        -- This policy allows viewing properties with status 'available', 'active', or NULL (for backward compatibility)
-        DROP POLICY IF EXISTS "Everyone can view available properties" ON properties;
-        CREATE POLICY "Everyone can view available properties" ON properties
+        -- Everyone can view available/active Vehicles (works for both authenticated and anonymous users)
+        -- This policy allows viewing Vehicles with status 'available', 'active', or NULL (for backward compatibility)
+        DROP POLICY IF EXISTS "Everyone can view available Vehicles" ON Vehicles;
+        CREATE POLICY "Everyone can view available Vehicles" ON Vehicles
             FOR SELECT 
             USING (
                 status = 'available' 
@@ -1561,13 +1561,13 @@ CREATE POLICY "Everyone can view rooms" ON rooms
             AND boarding_houses.status = 'active'
         )
         OR EXISTS (
-            SELECT 1 FROM properties 
-            WHERE properties.id = rooms.property_id 
-            AND properties.status = 'available'
+            SELECT 1 FROM Vehicles 
+            WHERE Vehicles.id = rooms.vehicle_id 
+            AND Vehicles.status = 'available'
         )
     );
 
--- Rooms: Landlords can manage rooms for their own properties
+-- Rooms: Landlords can manage rooms for their own Vehicles
 DROP POLICY IF EXISTS "Landlords can manage own rooms" ON rooms;
 CREATE POLICY "Landlords can manage own rooms" ON rooms
     FOR ALL USING (
@@ -1578,11 +1578,11 @@ CREATE POLICY "Landlords can manage own rooms" ON rooms
             WHERE bh.id = rooms.boarding_house_id
             AND lp.user_id = auth.uid()
         )
-        -- Check via properties and landlord_profiles using email
+        -- Check via Vehicles and landlord_profiles using email
         OR EXISTS (
-            SELECT 1 FROM properties p
+            SELECT 1 FROM Vehicles p
             JOIN landlord_profiles lp ON p.owner_email = lp.email
-            WHERE p.id = rooms.property_id
+            WHERE p.id = rooms.vehicle_id
             AND (lp.user_id = auth.uid() OR lp.email = (SELECT email FROM auth.users WHERE id = auth.uid()))
         )
         -- Fallback: check via current_setting if available
@@ -1593,9 +1593,9 @@ CREATE POLICY "Landlords can manage own rooms" ON rooms
             AND lp.email = current_setting('app.current_user_email', true)
         )
         OR EXISTS (
-            SELECT 1 FROM properties p
+            SELECT 1 FROM Vehicles p
             JOIN landlord_profiles lp ON p.owner_email = lp.email
-            WHERE p.id = rooms.property_id
+            WHERE p.id = rooms.vehicle_id
             AND lp.email = current_setting('app.current_user_email', true)
         )
     );
@@ -1612,13 +1612,13 @@ CREATE POLICY "Everyone can view beds" ON beds
         )
         OR EXISTS (
             SELECT 1 FROM rooms 
-            JOIN properties ON rooms.property_id = properties.id
+            JOIN Vehicles ON rooms.vehicle_id = Vehicles.id
             WHERE rooms.id = beds.room_id 
-            AND properties.status = 'available'
+            AND Vehicles.status = 'available'
         )
     );
 
--- Beds: Landlords can manage beds for their own properties
+-- Beds: Landlords can manage beds for their own Vehicles
 DROP POLICY IF EXISTS "Landlords can manage own beds" ON beds;
 CREATE POLICY "Landlords can manage own beds" ON beds
     FOR ALL USING (
@@ -1630,10 +1630,10 @@ CREATE POLICY "Landlords can manage own beds" ON beds
             WHERE r.id = beds.room_id
             AND lp.user_id = auth.uid()
         )
-        -- Check via properties and landlord_profiles using email
+        -- Check via Vehicles and landlord_profiles using email
         OR EXISTS (
             SELECT 1 FROM rooms r
-            JOIN properties p ON r.property_id = p.id
+            JOIN Vehicles p ON r.vehicle_id = p.id
             JOIN landlord_profiles lp ON p.owner_email = lp.email
             WHERE r.id = beds.room_id
             AND (lp.user_id = auth.uid() OR lp.email = (SELECT email FROM auth.users WHERE id = auth.uid()))
@@ -1648,34 +1648,34 @@ CREATE POLICY "Landlords can manage own beds" ON beds
         )
         OR EXISTS (
             SELECT 1 FROM rooms r
-            JOIN properties p ON r.property_id = p.id
+            JOIN Vehicles p ON r.vehicle_id = p.id
             JOIN landlord_profiles lp ON p.owner_email = lp.email
             WHERE r.id = beds.room_id
             AND lp.email = current_setting('app.current_user_email', true)
         )
     );
 
--- Bookings: RLS Policies (conditional - only if tenant_email column exists)
+-- Rentals: RLS Policies (conditional - only if tenant_email column exists)
 DO $$ 
 BEGIN
-    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'tenant_email') THEN
-        -- Tenants can view their own bookings
-        DROP POLICY IF EXISTS "Tenants can view own bookings" ON bookings;
-        CREATE POLICY "Tenants can view own bookings" ON bookings
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'tenant_email') THEN
+        -- Tenants can view their own Rentals
+        DROP POLICY IF EXISTS "Tenants can view own Rentals" ON Rentals;
+        CREATE POLICY "Tenants can view own Rentals" ON Rentals
             FOR SELECT USING (tenant_email = current_setting('app.current_user_email', true));
 
-        -- Tenants can create bookings
-        DROP POLICY IF EXISTS "Tenants can create bookings" ON bookings;
-        CREATE POLICY "Tenants can create bookings" ON bookings
+        -- Tenants can create Rentals
+        DROP POLICY IF EXISTS "Tenants can create Rentals" ON Rentals;
+        CREATE POLICY "Tenants can create Rentals" ON Rentals
             FOR INSERT WITH CHECK (tenant_email = current_setting('app.current_user_email', true));
-    ELSIF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'client_email') THEN
+    ELSIF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'client_email') THEN
         -- Fallback to client_email for old schema
-        DROP POLICY IF EXISTS "Tenants can view own bookings" ON bookings;
-        CREATE POLICY "Tenants can view own bookings" ON bookings
+        DROP POLICY IF EXISTS "Tenants can view own Rentals" ON Rentals;
+        CREATE POLICY "Tenants can view own Rentals" ON Rentals
             FOR SELECT USING (client_email = current_setting('app.current_user_email', true));
 
-        DROP POLICY IF EXISTS "Tenants can create bookings" ON bookings;
-        CREATE POLICY "Tenants can create bookings" ON bookings
+        DROP POLICY IF EXISTS "Tenants can create Rentals" ON Rentals;
+        CREATE POLICY "Tenants can create Rentals" ON Rentals
             FOR INSERT WITH CHECK (client_email = current_setting('app.current_user_email', true));
     END IF;
 END $$;
@@ -1692,34 +1692,34 @@ BEGIN
     END IF;
 END $$;
 
--- Reviews: Tenants can create reviews for their approved bookings (conditional)
+-- Reviews: Tenants can create reviews for their approved Rentals (conditional)
 DO $$ 
 BEGIN
     IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'reviews' AND column_name = 'tenant_email')
-       AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'tenant_email') THEN
+       AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'tenant_email') THEN
         DROP POLICY IF EXISTS "Tenants can create reviews" ON reviews;
         CREATE POLICY "Tenants can create reviews" ON reviews
             FOR INSERT WITH CHECK (
                 tenant_email = current_setting('app.current_user_email', true)
                 AND EXISTS (
-                    SELECT 1 FROM bookings 
-                    WHERE bookings.id = reviews.booking_id 
-                    AND bookings.tenant_email = current_setting('app.current_user_email', true)
-                    AND bookings.status = 'approved'
+                    SELECT 1 FROM Rentals 
+                    WHERE Rentals.id = reviews.rental_id 
+                    AND Rentals.tenant_email = current_setting('app.current_user_email', true)
+                    AND Rentals.status = 'approved'
                 )
             );
     ELSIF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'reviews' AND column_name = 'tenant_email')
-       AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'client_email') THEN
+       AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'Rentals' AND column_name = 'client_email') THEN
         -- Fallback to client_email for old schema
         DROP POLICY IF EXISTS "Tenants can create reviews" ON reviews;
         CREATE POLICY "Tenants can create reviews" ON reviews
             FOR INSERT WITH CHECK (
                 tenant_email = current_setting('app.current_user_email', true)
                 AND EXISTS (
-                    SELECT 1 FROM bookings 
-                    WHERE bookings.id = reviews.booking_id 
-                    AND bookings.client_email = current_setting('app.current_user_email', true)
-                    AND bookings.status = 'approved'
+                    SELECT 1 FROM Rentals 
+                    WHERE Rentals.id = reviews.rental_id 
+                    AND Rentals.client_email = current_setting('app.current_user_email', true)
+                    AND Rentals.status = 'approved'
                 )
             );
     END IF;
@@ -1769,4 +1769,5 @@ ON CONFLICT (email) DO NOTHING;
 -- ============================================================================
 -- END OF SCHEMA
 -- ============================================================================
+
 

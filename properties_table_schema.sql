@@ -1,11 +1,11 @@
--- Properties Table Schema
--- This creates the properties table with the exact structure provided
+﻿-- Vehicles Table Schema
+-- This creates the Vehicles table with the exact structure provided
 
--- Drop existing properties table if it exists (be careful in production!)
-DROP TABLE IF EXISTS public.properties CASCADE;
+-- Drop existing Vehicles table if it exists (be careful in production!)
+DROP TABLE IF EXISTS public.Vehicles CASCADE;
 
--- Create the properties table with the exact structure
-CREATE TABLE public.properties (
+-- Create the Vehicles table with the exact structure
+CREATE TABLE public.Vehicles (
   id uuid NOT NULL DEFAULT gen_random_uuid(),
   owner_id uuid NULL,
   title text NOT NULL,
@@ -19,31 +19,31 @@ CREATE TABLE public.properties (
   status text NOT NULL DEFAULT 'available'::text,
   created_at timestamp with time zone NOT NULL DEFAULT now(),
   owner_email text NULL,
-  CONSTRAINT properties_pkey PRIMARY KEY (id),
-  CONSTRAINT properties_status_check CHECK (
+  CONSTRAINT Vehicles_pkey PRIMARY KEY (id),
+  CONSTRAINT Vehicles_status_check CHECK (
     (status = ANY (ARRAY['available'::text, 'full'::text]))
   )
 ) TABLESPACE pg_default;
 
 -- Add indexes for better performance
-CREATE INDEX IF NOT EXISTS idx_properties_status ON public.properties(status);
-CREATE INDEX IF NOT EXISTS idx_properties_owner_email ON public.properties(owner_email);
-CREATE INDEX IF NOT EXISTS idx_properties_created_at ON public.properties(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_properties_location ON public.properties(location);
+CREATE INDEX IF NOT EXISTS idx_Vehicles_status ON public.Vehicles(status);
+CREATE INDEX IF NOT EXISTS idx_Vehicles_owner_email ON public.Vehicles(owner_email);
+CREATE INDEX IF NOT EXISTS idx_Vehicles_created_at ON public.Vehicles(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_Vehicles_location ON public.Vehicles(location);
 
 -- Add RLS (Row Level Security) policies
-ALTER TABLE public.properties ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.Vehicles ENABLE ROW LEVEL SECURITY;
 
--- Policy: Everyone can read available properties
-CREATE POLICY "Properties are viewable by everyone" ON public.properties
+-- Policy: Everyone can read available Vehicles
+CREATE POLICY "Vehicles are viewable by everyone" ON public.Vehicles
   FOR SELECT USING (status = 'available');
 
--- Policy: Owners can manage their own properties
-CREATE POLICY "Owners can manage their own properties" ON public.properties
+-- Policy: Owners can manage their own Vehicles
+CREATE POLICY "Owners can manage their own Vehicles" ON public.Vehicles
   FOR ALL USING (owner_email = current_setting('app.current_user_email', true));
 
--- Policy: Admins can manage all properties
-CREATE POLICY "Admins can manage all properties" ON public.properties
+-- Policy: Admins can manage all Vehicles
+CREATE POLICY "Admins can manage all Vehicles" ON public.Vehicles
   FOR ALL USING (
     EXISTS (
       SELECT 1 FROM public.app_users 
@@ -53,7 +53,7 @@ CREATE POLICY "Admins can manage all properties" ON public.properties
   );
 
 -- Insert some sample data for testing
-INSERT INTO public.properties (
+INSERT INTO public.Vehicles (
   title, 
   description, 
   price, 
@@ -103,6 +103,7 @@ INSERT INTO public.properties (
 );
 
 -- Grant necessary permissions
-GRANT SELECT, INSERT, UPDATE, DELETE ON public.properties TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.Vehicles TO authenticated;
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO authenticated;
+
 

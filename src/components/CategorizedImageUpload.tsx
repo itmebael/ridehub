@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+﻿import React, { useState, useRef } from 'react';
 
 interface CategorizedImage {
   file: File;
@@ -53,7 +53,7 @@ export default function CategorizedImageUpload({ images, onChange, maxImages = 2
   return (
     <div className="space-y-4">
       <div className="flex justify-between items-center">
-        <h4 className="text-lg font-semibold text-gray-900">Property Images</h4>
+        <h4 className="text-lg font-semibold text-gray-900">vehicle Images</h4>
         <button
           onClick={() => fileInputRef.current?.click()}
           className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
@@ -133,6 +133,7 @@ export default function CategorizedImageUpload({ images, onChange, maxImages = 2
     </div>
   );
 }
+
 
 
 

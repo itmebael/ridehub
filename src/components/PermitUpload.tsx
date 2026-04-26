@@ -1,9 +1,10 @@
-import React, { useState, useRef, useEffect } from 'react';
+﻿import React, { useState, useRef, useEffect } from 'react';
 import supabase from '../lib/supabase';
+import { VEHICLE_ASSET_BUCKETS, uploadFileWithBucketFallback } from '../lib/storageBuckets';
 
 interface PermitFile {
   file: File;
-  type: 'business_permit' | 'boarding_house_permit';
+  type: 'business_permit' | 'owner_car_permit';
   preview?: string;
   uploaded?: boolean;
   url?: string;
@@ -11,7 +12,7 @@ interface PermitFile {
 
 interface SubmittedPermit {
   id: string;
-  permit_type: 'business_permit' | 'boarding_house_permit';
+  permit_type: 'business_permit' | 'owner_car_permit';
   permit_file_url: string;
   permit_number?: string;
   verification_status: 'pending' | 'approved' | 'rejected' | 'expired';
@@ -21,12 +22,12 @@ interface SubmittedPermit {
 }
 
 interface PermitUploadProps {
-  landlordId?: string;
-  boardingHouseId?: string;
+  ownerId?: string;
+  vehicleId?: string;
   onUploadComplete?: () => void;
 }
 
-export default function PermitUpload({ landlordId, boardingHouseId, onUploadComplete }: PermitUploadProps) {
+export default function PermitUpload({ ownerId, vehicleId, onUploadComplete }: PermitUploadProps) {
   const [permits, setPermits] = useState<PermitFile[]>([]);
   const [submittedPermits, setSubmittedPermits] = useState<SubmittedPermit[]>([]);
   const [loadingPermits, setLoadingPermits] = useState(true);
@@ -56,13 +57,13 @@ export default function PermitUpload({ landlordId, boardingHouseId, onUploadComp
   };
 
   // Fetch submitted permits
-  const loadSubmittedPermits = async (resolvedLandlordId: string) => {
+  const loadSubmittedPermits = async (resolvedOwnerId: string) => {
     try {
       setLoadingPermits(true);
       const { data, error } = await supabase
-        .from('landlord_permits')
+        .from('owner_permits')
         .select('*')
-        .eq('landlord_id', resolvedLandlordId)
+        .eq('owner_id', resolvedOwnerId)
         .order('created_at', { ascending: false });
 
       if (error) {
@@ -77,40 +78,40 @@ export default function PermitUpload({ landlordId, boardingHouseId, onUploadComp
     }
   };
 
-  // Load permits when component mounts or landlordId changes
+  // Load permits when component mounts or ownerId changes
   useEffect(() => {
     const fetchPermits = async () => {
-      let resolvedLandlordId = landlordId;
+      let resolvedOwnerId = ownerId;
       
-      if (!resolvedLandlordId) {
+      if (!resolvedOwnerId) {
         try {
           const { data: { user } } = await supabase.auth.getUser();
           if (!user?.email) return;
 
           const userEmail = user.email.trim().toLowerCase();
           
-          // Try to find landlord profile
+          // Try to find owner profile
           const { data: profile } = await supabase
-            .from('landlord_profiles')
+            .from('vehicle_owner_profiles')
             .select('id')
             .or(`email.eq.${userEmail},user_id.eq.${user.id}`)
             .maybeSingle();
 
           if (profile?.id) {
-            resolvedLandlordId = profile.id;
+            resolvedOwnerId = profile.id;
           }
         } catch (err) {
-          console.error('Error fetching landlord ID:', err);
+          console.error('Error fetching owner ID:', err);
         }
       }
 
-      if (resolvedLandlordId) {
-        await loadSubmittedPermits(resolvedLandlordId);
+      if (resolvedOwnerId) {
+        await loadSubmittedPermits(resolvedOwnerId);
       }
     };
 
     fetchPermits();
-  }, [landlordId]);
+  }, [ownerId]);
 
   const handleUpload = async () => {
     if (permits.length === 0) {
@@ -118,10 +119,10 @@ export default function PermitUpload({ landlordId, boardingHouseId, onUploadComp
       return;
     }
 
-    // Fetch landlord ID if not provided
-    let resolvedLandlordId = landlordId;
+    // Fetch owner ID if not provided
+    let resolvedOwnerId = ownerId;
     
-    if (!resolvedLandlordId) {
+    if (!resolvedOwnerId) {
       try {
         // Get current user
         const { data: { user } } = await supabase.auth.getUser();
@@ -130,11 +131,11 @@ export default function PermitUpload({ landlordId, boardingHouseId, onUploadComp
           return;
         }
 
-        // Try to find landlord profile - match OwnerDashboard logic
-        let landlordProfile = null;
+        // Try to find owner profile - match OwnerDashboard logic
+        let ownerProfile = null;
         const userEmail = user.email?.trim().toLowerCase();
 
-        console.log('Looking for landlord profile for user:', {
+        console.log('Looking for owner profile for user:', {
           user_id: user.id,
           email: userEmail
         });
@@ -142,35 +143,35 @@ export default function PermitUpload({ landlordId, boardingHouseId, onUploadComp
         // First try by email (trimmed and lowercased) - matches OwnerDashboard
         if (userEmail) {
           const { data: emailProfile, error: emailError } = await supabase
-            .from('landlord_profiles')
+            .from('vehicle_owner_profiles')
             .select('id, email, user_id')
             .eq('email', userEmail)
             .maybeSingle();
           
-          console.log('Landlord profile by email:', { data: emailProfile, error: emailError });
+          console.log('Owner profile by email:', { data: emailProfile, error: emailError });
           
           if (!emailError && emailProfile && emailProfile.id) {
-            landlordProfile = emailProfile;
+            ownerProfile = emailProfile;
           }
         }
 
         // If not found by email, try by user_id
-        if (!landlordProfile && user.id) {
+        if (!ownerProfile && user.id) {
           const { data: userIdProfile, error: userIdError } = await supabase
-            .from('landlord_profiles')
+            .from('vehicle_owner_profiles')
             .select('id, email, user_id')
             .eq('user_id', user.id)
             .maybeSingle();
           
-          console.log('Landlord profile by user_id:', { data: userIdProfile, error: userIdError });
+          console.log('Owner profile by user_id:', { data: userIdProfile, error: userIdError });
           
           if (!userIdError && userIdProfile && userIdProfile.id) {
-            landlordProfile = userIdProfile;
+            ownerProfile = userIdProfile;
           }
         }
 
         // If still not found, check user_profiles and auto-create if needed (like OwnerDashboard)
-        if (!landlordProfile && userEmail && user.id) {
+        if (!ownerProfile && userEmail && user.id) {
           const { data: userProfile, error: userProfileError } = await supabase
             .from('user_profiles')
             .select('id, user_email, full_name, phone, address, bio')
@@ -180,10 +181,10 @@ export default function PermitUpload({ landlordId, boardingHouseId, onUploadComp
           console.log('User profile check:', { data: userProfile, error: userProfileError });
           
           if (!userProfileError && userProfile && userProfile.id) {
-            // Auto-create landlord profile from user_profiles
+            // Auto-create owner profile from user_profiles
             try {
               const { data: createdProfile, error: createError } = await supabase
-                .from('landlord_profiles')
+                .from('vehicle_owner_profiles')
                 .upsert({
                   user_id: user.id,
                   email: userEmail,
@@ -201,45 +202,45 @@ export default function PermitUpload({ landlordId, boardingHouseId, onUploadComp
               console.log('Auto-create landlord profile result:', { data: createdProfile, error: createError });
               
               if (!createError && createdProfile && createdProfile.id) {
-                landlordProfile = { id: createdProfile.id };
-                console.log('✅ Auto-created landlord profile from user_profiles');
+                ownerProfile = { id: createdProfile.id };
+                console.log('✅ Auto-created owner profile from user_profiles');
               } else if (createError && createError.code === '23505') {
                 // Duplicate key - profile already exists, try to fetch it
                 const { data: existingProfile } = await supabase
-                  .from('landlord_profiles')
+                  .from('vehicle_owner_profiles')
                   .select('id')
                   .eq('email', userEmail)
                   .maybeSingle();
                 
                 if (existingProfile && existingProfile.id) {
-                  landlordProfile = existingProfile;
-                  console.log('✅ Found existing landlord profile after duplicate key error');
+                  ownerProfile = existingProfile;
+                  console.log('✅ Found existing owner profile after duplicate key error');
                 }
               }
             } catch (err) {
-              console.warn('Error auto-creating landlord profile:', err);
+              console.warn('Error auto-creating owner profile:', err);
             }
           }
         }
 
-        // If still not found, create a basic landlord profile automatically
-        if (!landlordProfile || !landlordProfile.id) {
-          console.log('No landlord profile found, creating one automatically...');
+        // If still not found, create a basic owner profile automatically
+        if (!ownerProfile || !ownerProfile.id) {
+          console.log('No owner profile found, creating one automatically...');
           
           if (!user.id || !userEmail) {
-            console.error('Cannot create landlord profile: missing user ID or email');
-            setError('Unable to create landlord profile. Please ensure you are logged in with a valid email address.');
+            console.error('Cannot create owner profile: missing user ID or email');
+            setError('Unable to create owner profile. Please ensure you are logged in with a valid email address.');
             return;
           }
 
           try {
-            // Create a basic landlord profile
+            // Create a basic owner profile
             const { data: newProfile, error: createError } = await supabase
-              .from('landlord_profiles')
+              .from('vehicle_owner_profiles')
               .insert({
                 user_id: user.id,
                 email: userEmail,
-                full_name: user.user_metadata?.full_name || user.user_metadata?.name || userEmail.split('@')[0] || 'Landlord',
+                full_name: user.user_metadata?.full_name || user.user_metadata?.name || userEmail.split('@')[0] || 'Owner',
                 phone: null,
                 address: null,
                 bio: null,
@@ -248,65 +249,65 @@ export default function PermitUpload({ landlordId, boardingHouseId, onUploadComp
               .select('id')
               .single();
             
-            if (createError) {
-              // If it's a duplicate key error, try to fetch the existing profile
-              if (createError.code === '23505') {
+              if (createError) {
+                // If it's a duplicate key error, try to fetch the existing profile
+                if (createError.code === '23505') {
                 console.log('Profile already exists (duplicate key), fetching it...');
                 const { data: existingProfile } = await supabase
-                  .from('landlord_profiles')
+                  .from('vehicle_owner_profiles')
                   .select('id')
                   .eq('email', userEmail)
                   .maybeSingle();
                 
                 if (existingProfile && existingProfile.id) {
-                  landlordProfile = existingProfile;
-                  console.log('✅ Found existing landlord profile after duplicate key error');
+                  ownerProfile = existingProfile;
+                  console.log('✅ Found existing owner profile after duplicate key error');
                 } else {
                   console.error('Duplicate key error but could not fetch existing profile:', createError);
-                  setError('Landlord profile exists but could not be retrieved. Please try again or contact support.');
+                  setError('Owner profile exists but could not be retrieved. Please try again or contact support.');
                   return;
                 }
               } else {
-                console.error('Error creating landlord profile:', createError);
-                setError(`Failed to create landlord profile: ${createError.message}. Please try creating your profile in the Owner Dashboard first.`);
+                console.error('Error creating owner profile:', createError);
+                setError(`Failed to create owner profile: ${createError.message}. Please try creating your profile in the Owner Dashboard first.`);
                 return;
               }
             } else if (newProfile && newProfile.id) {
-              landlordProfile = newProfile;
-              console.log('✅ Auto-created landlord profile:', newProfile.id);
+              ownerProfile = newProfile;
+              console.log('✅ Auto-created owner profile:', newProfile.id);
             } else {
               console.error('Created profile but no ID returned:', newProfile);
-              setError('Failed to create landlord profile. Please try creating your profile in the Owner Dashboard first.');
+              setError('Failed to create owner profile. Please try creating your profile in the Owner Dashboard first.');
               return;
             }
           } catch (err: any) {
-            console.error('Exception creating landlord profile:', err);
-            setError(`Error creating landlord profile: ${err?.message || err}. Please try creating your profile in the Owner Dashboard first.`);
+            console.error('Exception creating owner profile:', err);
+            setError(`Error creating owner profile: ${err?.message || err}. Please try creating your profile in the Owner Dashboard first.`);
             return;
           }
         }
 
-        if (!landlordProfile || !landlordProfile.id) {
-          console.error('Landlord profile still not found after all attempts:', {
+        if (!ownerProfile || !ownerProfile.id) {
+          console.error('Owner profile still not found after all attempts:', {
             user_id: user.id,
             email: userEmail,
-            searched_profiles: landlordProfile
+            searched_profiles: ownerProfile
           });
-          setError('Landlord profile not found. Please create your landlord profile first. Go to the Owner Dashboard and complete your profile.');
+          setError('Owner profile not found. Please create your owner profile first. Go to the Owner Dashboard and complete your profile.');
           return;
         }
 
-        resolvedLandlordId = landlordProfile.id;
-        console.log('✅ Using landlord profile ID:', resolvedLandlordId);
+        resolvedOwnerId = ownerProfile.id;
+        console.log('✅ Using owner profile ID:', resolvedOwnerId);
       } catch (err: any) {
-        console.error('Error fetching landlord ID:', err);
-        setError('Failed to fetch landlord profile. Please try again.');
+        console.error('Error fetching owner ID:', err);
+        setError('Failed to fetch owner profile. Please try again.');
         return;
       }
     }
 
-    if (!resolvedLandlordId) {
-      setError('Landlord ID is required');
+    if (!resolvedOwnerId) {
+      setError('Owner ID is required');
       return;
     }
 
@@ -319,32 +320,28 @@ export default function PermitUpload({ landlordId, boardingHouseId, onUploadComp
       for (const permit of permits) {
         // Upload file to storage
         const fileExt = permit.file.name.split('.').pop();
-        const fileName = `permits/${resolvedLandlordId}/${Date.now()}-${Math.random().toString(36).substring(7)}.${fileExt}`;
-        
-        const { error: uploadError, data: uploadData } = await supabase.storage
-          .from('property-images') // Using existing bucket, or create 'permits' bucket
-          .upload(fileName, permit.file);
-
-        if (uploadError) throw uploadError;
-
-        const { data: urlData } = supabase.storage
-          .from('property-images')
-          .getPublicUrl(fileName);
+        const filePath = `permits/${resolvedOwnerId}/${Date.now()}-${Math.random().toString(36).substring(7)}.${fileExt}`;
+        const uploadResult = await uploadFileWithBucketFallback({
+          buckets: VEHICLE_ASSET_BUCKETS,
+          path: filePath,
+          file: permit.file,
+          upsert: true,
+        });
 
         // Save permit record to database
         const permitData: any = {
-          landlord_id: resolvedLandlordId,
+          owner_id: resolvedOwnerId,
           permit_type: permit.type,
-          permit_file_url: urlData?.publicUrl || fileName,
+          permit_file_url: uploadResult.publicUrl,
           verification_status: 'pending'
         };
 
-        if (boardingHouseId) {
-          permitData.boarding_house_id = boardingHouseId;
+        if (vehicleId) {
+          permitData.vehicle_id = vehicleId;
         }
 
         const { error: insertError } = await supabase
-          .from('landlord_permits')
+          .from('owner_permits')
           .insert([permitData]);
 
         if (insertError) {
@@ -354,15 +351,15 @@ export default function PermitUpload({ landlordId, boardingHouseId, onUploadComp
         uploadedPermits.push({
           ...permit,
           uploaded: true,
-          url: urlData?.publicUrl || fileName
+          url: uploadResult.publicUrl
         });
       }
 
       setPermits(uploadedPermits);
       
       // Reload submitted permits
-      if (resolvedLandlordId) {
-        await loadSubmittedPermits(resolvedLandlordId);
+      if (resolvedOwnerId) {
+        await loadSubmittedPermits(resolvedOwnerId);
       }
       
       alert('Permits uploaded successfully! They will be reviewed by administrators.');
@@ -379,7 +376,7 @@ export default function PermitUpload({ landlordId, boardingHouseId, onUploadComp
     <div className="space-y-4">
       <div className="flex justify-between items-center">
         <div>
-          <h4 className="text-lg font-semibold text-gray-900">Business & Boarding House Permits</h4>
+          <h4 className="text-lg font-semibold text-gray-900">Business & Owner Car Permits</h4>
           <p className="text-sm text-gray-600">Upload valid permits for verification</p>
         </div>
         <button
@@ -430,7 +427,7 @@ export default function PermitUpload({ landlordId, boardingHouseId, onUploadComp
                 className="px-3 py-2 border border-gray-300 rounded-lg text-sm"
               >
                 <option value="business_permit">Business Permit</option>
-                <option value="boarding_house_permit">Boarding House Permit</option>
+                <option value="owner_car_permit">Owner Car Permit</option>
               </select>
               {permit.uploaded ? (
                 <span className="px-3 py-1 bg-green-100 text-green-800 rounded-lg text-sm font-medium">
@@ -467,7 +464,7 @@ export default function PermitUpload({ landlordId, boardingHouseId, onUploadComp
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
           </svg>
           <p className="text-gray-600">No permits uploaded yet</p>
-          <p className="text-sm text-gray-500 mt-1">Click "Add Permit" to upload business or boarding house permits</p>
+          <p className="text-sm text-gray-500 mt-1">Click "Add Permit" to upload business or owner car permits</p>
         </div>
       )}
 
@@ -484,7 +481,7 @@ export default function PermitUpload({ landlordId, boardingHouseId, onUploadComp
                 <div className="flex-1">
                   <div className="flex items-center gap-3 mb-2">
                     <span className="px-3 py-1 rounded-full text-xs font-semibold bg-blue-100 text-blue-800">
-                      {permit.permit_type === 'business_permit' ? 'Business Permit' : 'Boarding House Permit'}
+                      {permit.permit_type === 'business_permit' ? 'Business Permit' : 'Owner Car Permit'}
                     </span>
                     <span className={`px-3 py-1 rounded-full text-xs font-semibold ${
                       permit.verification_status === 'approved' 
@@ -535,4 +532,5 @@ export default function PermitUpload({ landlordId, boardingHouseId, onUploadComp
     </div>
   );
 }
+
 

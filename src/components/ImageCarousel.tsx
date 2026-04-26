@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+﻿import React, { useState } from 'react';
 import { ImageWithFallback } from './ImageWithFallback';
 
 interface ImageCarouselProps {
@@ -8,9 +8,19 @@ interface ImageCarouselProps {
   bucket?: string;
   compact?: boolean; // For constrained spaces like map overlays
   showThumbnails?: boolean; // Control thumbnail visibility
+  /** CSS perspective + tilt so photos read as a 3D showcase (not a 3D model file). */
+  showcase3d?: boolean;
 }
 
-export default function ImageCarousel({ images, alt = 'Property image', className = '', bucket = 'property-images', compact = false, showThumbnails = false }: ImageCarouselProps) {
+export default function ImageCarousel({
+  images,
+  alt = 'vehicle image',
+  className = '',
+  bucket = 'vehicle-images',
+  compact = false,
+  showThumbnails = false,
+  showcase3d = false,
+}: ImageCarouselProps) {
   const [currentIndex, setCurrentIndex] = useState(0);
   const [touchStart, setTouchStart] = useState(0);
   const [touchEnd, setTouchEnd] = useState(0);
@@ -62,65 +72,77 @@ export default function ImageCarousel({ images, alt = 'Property image', classNam
   };
 
   const isAbsolute = className.includes('absolute');
-  
+  const radiusClass = showcase3d ? 'rounded-xl' : 'rounded-lg';
+
+  const mainImageEl = (
+    <div
+      className={`${isAbsolute ? 'absolute inset-0' : 'relative'} w-full ${
+        isAbsolute ? '' : compact ? 'h-48 sm:h-56' : 'h-64 sm:h-80 md:h-96'
+      } overflow-hidden ${radiusClass} bg-gray-100`}
+      onTouchStart={handleTouchStart}
+      onTouchMove={handleTouchMove}
+      onTouchEnd={handleTouchEnd}
+    >
+      <div
+        className="flex transition-transform duration-300 ease-in-out h-full"
+        style={{ transform: `translateX(-${currentIndex * 100}%)` }}
+      >
+        {validImages.map((image, index) => (
+          <div key={index} className="min-w-full h-full relative">
+            <ImageWithFallback
+              src={image}
+              alt={`${alt} ${index + 1}`}
+              className="w-full h-full object-cover"
+              data-sb-bucket={bucket}
+              data-sb-path={image}
+            />
+          </div>
+        ))}
+      </div>
+
+      {validImages.length > 1 && (
+        <>
+          <button
+            type="button"
+            onClick={goToPrevious}
+            className="absolute left-2 top-1/2 transform -translate-y-1/2 bg-black/50 hover:bg-black/70 text-white rounded-full p-2 transition-all z-10"
+            aria-label="Previous image"
+          >
+            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+            </svg>
+          </button>
+          <button
+            type="button"
+            onClick={goToNext}
+            className="absolute right-2 top-1/2 transform -translate-y-1/2 bg-black/50 hover:bg-black/70 text-white rounded-full p-2 transition-all z-10"
+            aria-label="Next image"
+          >
+            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+            </svg>
+          </button>
+        </>
+      )}
+
+      {validImages.length > 1 && (
+        <div className="absolute bottom-2 right-2 bg-black/50 text-white px-3 py-1 rounded-full text-sm z-10">
+          {currentIndex + 1} / {validImages.length}
+        </div>
+      )}
+    </div>
+  );
+
   return (
     <div className={`${isAbsolute ? 'absolute inset-0' : 'relative'} w-full ${className.replace('absolute inset-0', '')}`}>
-      {/* Main Image Container */}
-      <div 
-        className={`${isAbsolute ? 'absolute inset-0' : 'relative'} w-full ${isAbsolute ? '' : compact ? 'h-48 sm:h-56' : 'h-64 sm:h-80 md:h-96'} overflow-hidden rounded-lg bg-gray-100`}
-        onTouchStart={handleTouchStart}
-        onTouchMove={handleTouchMove}
-        onTouchEnd={handleTouchEnd}
-      >
-        {/* Images */}
-        <div 
-          className="flex transition-transform duration-300 ease-in-out h-full"
-          style={{ transform: `translateX(-${currentIndex * 100}%)` }}
-        >
-          {validImages.map((image, index) => (
-            <div key={index} className="min-w-full h-full relative">
-              <ImageWithFallback 
-                src={image} 
-                alt={`${alt} ${index + 1}`} 
-                className="w-full h-full object-cover"
-                data-sb-bucket={bucket}
-                data-sb-path={image}
-              />
-            </div>
-          ))}
+      {showcase3d && !isAbsolute ? (
+        <div className="vehicle-showcase-3d py-1">
+          <div className="vehicle-showcase-3d__inner overflow-hidden">{mainImageEl}</div>
+          <div className="vehicle-showcase-3d__floor" aria-hidden />
         </div>
-
-        {/* Navigation Arrows */}
-        {validImages.length > 1 && (
-          <>
-            <button
-              onClick={goToPrevious}
-              className="absolute left-2 top-1/2 transform -translate-y-1/2 bg-black/50 hover:bg-black/70 text-white rounded-full p-2 transition-all z-10"
-              aria-label="Previous image"
-            >
-              <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-              </svg>
-            </button>
-            <button
-              onClick={goToNext}
-              className="absolute right-2 top-1/2 transform -translate-y-1/2 bg-black/50 hover:bg-black/70 text-white rounded-full p-2 transition-all z-10"
-              aria-label="Next image"
-            >
-              <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-              </svg>
-            </button>
-          </>
-        )}
-
-        {/* Image Counter */}
-        {validImages.length > 1 && (
-          <div className="absolute bottom-2 right-2 bg-black/50 text-white px-3 py-1 rounded-full text-sm z-10">
-            {currentIndex + 1} / {validImages.length}
-          </div>
-        )}
-      </div>
+      ) : (
+        mainImageEl
+      )}
 
       {/* Thumbnail Navigation */}
       {validImages.length > 1 && showThumbnails && !compact && (
@@ -149,4 +171,5 @@ export default function ImageCarousel({ images, alt = 'Property image', classNam
     </div>
   );
 }
+
 

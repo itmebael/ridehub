@@ -1,9 +1,8 @@
-import React, { useEffect, useState } from 'react';
-import { supabase } from '../lib/supabase';
+﻿import React, { useEffect, useState, useCallback } from 'react';
+import supabase from '../lib/supabase';
 
 interface Notification {
   id: string;
-  user_email: string;
   title: string;
   message: string;
   notification_type: string;
@@ -19,85 +18,175 @@ interface NotificationSystemProps {
   userRole: 'admin' | 'owner' | 'client';
 }
 
+const recipientEmailVariants = (email: string) => {
+  const t = email.trim();
+  if (!t) return [];
+  return Array.from(new Set([t, t.toLowerCase(), t.toUpperCase()]));
+};
+
+const mapRowToNotification = (row: Record<string, unknown>): Notification => {
+  const hasReadAt = row.read_at != null && String(row.read_at).length > 0;
+  const read = hasReadAt || row.is_read === true;
+  const priorityRaw = String(row.priority || 'normal').toLowerCase();
+  const priority: Notification['priority'] =
+    priorityRaw === 'high' || priorityRaw === 'medium' || priorityRaw === 'low'
+      ? priorityRaw
+      : 'low';
+
+  return {
+    id: String(row.id),
+    title: String(row.title || ''),
+    message: String(row.body || row.message || ''),
+    notification_type: String(row.notification_type || row.type || 'general'),
+    priority,
+    is_read: read,
+    action_url: row.action_url ? String(row.action_url) : undefined,
+    created_at: String(row.created_at || ''),
+    expires_at: row.expires_at ? String(row.expires_at) : undefined,
+  };
+};
+
 export default function NotificationSystem({ userEmail, userRole }: NotificationSystemProps) {
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
   const [showNotifications, setShowNotifications] = useState(false);
   const [loading, setLoading] = useState(false);
 
-  useEffect(() => {
-    if (userEmail) {
-      loadNotifications();
-      subscribeToNotifications();
-    }
-  }, [userEmail]);
+  const applyRows = useCallback((rows: Record<string, unknown>[]) => {
+    const mapped = (rows || []).map(mapRowToNotification);
+    setNotifications(mapped);
+    setUnreadCount(mapped.filter((n) => !n.is_read).length);
+  }, []);
 
-  const loadNotifications = async () => {
+  const loadNotifications = useCallback(async () => {
     try {
       setLoading(true);
+
+      if (userRole === 'admin') {
+        const { data, error } = await supabase
+          .from('notifications')
+          .select('*')
+          .order('created_at', { ascending: false })
+          .limit(50);
+        if (error) throw error;
+        applyRows((data || []) as Record<string, unknown>[]);
+        return;
+      }
+
+      const variants = recipientEmailVariants(userEmail);
+      if (variants.length === 0) {
+        applyRows([]);
+        return;
+      }
+
       const { data, error } = await supabase
         .from('notifications')
         .select('*')
-        .eq('user_email', userEmail)
+        .in('recipient_email', variants)
         .order('created_at', { ascending: false })
         .limit(50);
 
       if (error) throw error;
-
-      setNotifications(data || []);
-      setUnreadCount(data?.filter(n => !n.is_read).length || 0);
+      applyRows((data || []) as Record<string, unknown>[]);
     } catch (error) {
       console.error('Error loading notifications:', error);
     } finally {
       setLoading(false);
     }
-  };
+  }, [userEmail, userRole, applyRows]);
 
-  const subscribeToNotifications = () => {
-    const channel = supabase
-      .channel('notifications')
-      .on(
-        'postgres_changes',
-        {
-          event: 'INSERT',
-          schema: 'public',
-          table: 'notifications',
-          filter: `user_email=eq.${userEmail}`
-        },
-        (payload) => {
-          const newNotification = payload.new as Notification;
-          setNotifications(prev => [newNotification, ...prev]);
-          setUnreadCount(prev => prev + 1);
-          
-          // Show browser notification if permission granted
-          if (Notification.permission === 'granted') {
-            new Notification(newNotification.title, {
-              body: newNotification.message,
-              icon: '/favicon.ico'
-            });
+  useEffect(() => {
+    if (userRole !== 'admin' && !userEmail.trim()) {
+      setNotifications([]);
+      setUnreadCount(0);
+      return;
+    }
+
+    void loadNotifications();
+
+    const channels: ReturnType<typeof supabase.channel>[] = [];
+
+    if (userRole === 'admin') {
+      const ch = supabase
+        .channel('notifications-admin-all')
+        .on(
+          'postgres_changes',
+          { event: 'INSERT', schema: 'public', table: 'notifications' },
+          (payload) => {
+            const n = mapRowToNotification(payload.new as Record<string, unknown>);
+            setNotifications((prev) => (prev.some((p) => p.id === n.id) ? prev : [n, ...prev]));
+            if (!n.is_read) setUnreadCount((c) => c + 1);
+            if (
+              typeof window !== 'undefined' &&
+              'Notification' in window &&
+              Notification.permission === 'granted'
+            ) {
+              try {
+                new Notification(n.title, { body: n.message, icon: '/favicon.ico' });
+              } catch {
+                /* ignore */
+              }
+            }
           }
-        }
-      )
-      .subscribe();
+        )
+        .subscribe();
+      channels.push(ch);
+    } else {
+      const variants = recipientEmailVariants(userEmail);
+      variants.forEach((em, idx) => {
+        const ch = supabase
+          .channel(`notifications-recipient-${idx}-${encodeURIComponent(em).slice(0, 40)}`)
+          .on(
+            'postgres_changes',
+            {
+              event: 'INSERT',
+              schema: 'public',
+              table: 'notifications',
+              filter: `recipient_email=eq.${em}`,
+            },
+            (payload) => {
+              const n = mapRowToNotification(payload.new as Record<string, unknown>);
+              setNotifications((prev) => (prev.some((p) => p.id === n.id) ? prev : [n, ...prev]));
+              if (!n.is_read) setUnreadCount((c) => c + 1);
+              if (
+                typeof window !== 'undefined' &&
+                'Notification' in window &&
+                Notification.permission === 'granted'
+              ) {
+                try {
+                  new Notification(n.title, { body: n.message, icon: '/favicon.ico' });
+                } catch {
+                  /* ignore */
+                }
+              }
+            }
+          )
+          .subscribe();
+        channels.push(ch);
+      });
+    }
 
     return () => {
-      supabase.removeChannel(channel);
+      channels.forEach((c) => {
+        void supabase.removeChannel(c);
+      });
     };
-  };
+  }, [userEmail, userRole, loadNotifications]);
 
   const markAsRead = async (notificationId: string) => {
     try {
+      const now = new Date().toISOString();
       const { error } = await supabase
         .from('notifications')
-        .update({ is_read: true })
+        .update({ is_read: true, read_at: now })
         .eq('id', notificationId);
 
       if (error) throw error;
 
-      setNotifications(prev => 
-        prev.map(n => n.id === notificationId ? { ...n, is_read: true } : n)
+      setNotifications((prev) =>
+        prev.map((n) => (n.id === notificationId ? { ...n, is_read: true } : n))
       );
-      setUnreadCount(prev => Math.max(0, prev - 1));
+      setUnreadCount((prev) => Math.max(0, prev - 1));
     } catch (error) {
       console.error('Error marking notification as read:', error);
     }
@@ -105,19 +194,18 @@ export default function NotificationSystem({ userEmail, userRole }: Notification
 
   const markAllAsRead = async () => {
     try {
-      const unreadIds = notifications.filter(n => !n.is_read).map(n => n.id);
+      const unreadIds = notifications.filter((n) => !n.is_read).map((n) => n.id);
       if (unreadIds.length === 0) return;
 
+      const now = new Date().toISOString();
       const { error } = await supabase
         .from('notifications')
-        .update({ is_read: true })
+        .update({ is_read: true, read_at: now })
         .in('id', unreadIds);
 
       if (error) throw error;
 
-      setNotifications(prev => 
-        prev.map(n => ({ ...n, is_read: true }))
-      );
+      setNotifications((prev) => prev.map((n) => ({ ...n, is_read: true })));
       setUnreadCount(0);
     } catch (error) {
       console.error('Error marking all notifications as read:', error);
@@ -126,16 +214,13 @@ export default function NotificationSystem({ userEmail, userRole }: Notification
 
   const deleteNotification = async (notificationId: string) => {
     try {
-      const { error } = await supabase
-        .from('notifications')
-        .delete()
-        .eq('id', notificationId);
+      const { error } = await supabase.from('notifications').delete().eq('id', notificationId);
 
       if (error) throw error;
 
-      setNotifications(prev => prev.filter(n => n.id !== notificationId));
-      setUnreadCount(prev => {
-        const deletedNotification = notifications.find(n => n.id === notificationId);
+      setNotifications((prev) => prev.filter((n) => n.id !== notificationId));
+      setUnreadCount((prev) => {
+        const deletedNotification = notifications.find((n) => n.id === notificationId);
         return deletedNotification && !deletedNotification.is_read ? Math.max(0, prev - 1) : prev;
       });
     } catch (error) {
@@ -151,68 +236,90 @@ export default function NotificationSystem({ userEmail, userRole }: Notification
 
   const getPriorityColor = (priority: string) => {
     switch (priority) {
-      case 'high': return 'text-red-600 bg-red-50 border-red-200';
-      case 'medium': return 'text-yellow-600 bg-yellow-50 border-yellow-200';
-      case 'low': return 'text-blue-600 bg-blue-50 border-blue-200';
-      default: return 'text-gray-600 bg-gray-50 border-gray-200';
+      case 'high':
+        return 'text-red-600 bg-red-50 border-red-200';
+      case 'medium':
+        return 'text-yellow-600 bg-yellow-50 border-yellow-200';
+      case 'low':
+        return 'text-blue-600 bg-blue-50 border-blue-200';
+      default:
+        return 'text-gray-600 bg-gray-50 border-gray-200';
     }
   };
 
   const getTypeIcon = (type: string) => {
     switch (type) {
-      case 'property_deactivated':
+      case 'vehicle_deactivated':
         return (
           <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L3.732 16.5c-.77.833.192 2.5 1.732 2.5z" />
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={2}
+              d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L3.732 16.5c-.77.833.192 2.5 1.732 2.5z"
+            />
           </svg>
         );
-      case 'booking_request':
+      case 'rental_request':
         return (
           <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={2}
+              d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"
+            />
           </svg>
         );
       case 'review_received':
         return (
           <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.915c.969 0 1.371 1.24.588 1.81l-3.976 2.888a1 1 0 00-.363 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.976-2.888a1 1 0 00-1.176 0l-3.976 2.888c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.363-1.118l-3.976-2.888c-.784-.57-.38-1.81.588-1.81h4.914a1 1 0 00.951-.69l1.519-4.674z" />
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={2}
+              d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.915c.969 0 1.371 1.24.588 1.81l-3.976 2.888a1 1 0 00-.363 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.976-2.888a1 1 0 00-1.176 0l-3.976 2.888c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.363-1.118l-3.976-2.888c-.784-.57-.38-1.81.588-1.81h4.914a1 1 0 00.951-.69l1.519-4.674z"
+            />
           </svg>
         );
       default:
-        return (
-          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          </svg>
-        );
+        return <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" />;
     }
   };
 
   return (
     <div className="relative">
-      {/* Notification Bell */}
       <button
+        type="button"
         onClick={() => setShowNotifications(!showNotifications)}
-        className="relative p-2 text-gray-600 hover:text-gray-800 hover:bg-gray-100 rounded-full transition-colors duration-200"
+        className="relative rounded-full p-2 text-gray-600 transition-colors duration-200 hover:bg-gray-100 hover:text-gray-800"
         onMouseEnter={requestNotificationPermission}
       >
-        <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <svg className="h-6 w-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            strokeWidth={2}
+            d="M15 17h5l-1.405-1.405A2 2 0 0118 14.158V11a6 6 0 10-12 0v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"
+          />
         </svg>
         {unreadCount > 0 && (
-          <span className="absolute -top-1 -right-1 bg-red-500 text-white text-xs rounded-full h-5 w-5 flex items-center justify-center">
+          <span className="absolute -right-1 -top-1 flex h-5 w-5 items-center justify-center rounded-full bg-red-500 text-xs text-white">
             {unreadCount > 9 ? '9+' : unreadCount}
           </span>
         )}
       </button>
 
-      {/* Notifications Dropdown */}
       {showNotifications && (
-        <div className="absolute right-0 top-full mt-2 w-80 bg-white rounded-2xl shadow-xl border border-gray-200 z-50 max-h-96 overflow-hidden">
-          <div className="p-4 border-b border-gray-100">
+        <div className="absolute right-0 top-full z-50 mt-2 max-h-96 w-80 overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-xl">
+          <div className="border-b border-gray-100 p-4">
             <div className="flex items-center justify-between">
               <h3 className="font-semibold text-gray-900">Notifications</h3>
               {unreadCount > 0 && (
                 <button
+                  type="button"
                   onClick={markAllAsRead}
-                  className="text-sm text-blue-600 hover:text-blue-800 font-medium"
+                  className="text-sm font-medium text-blue-600 hover:text-blue-800"
                 >
                   Mark all as read
                 </button>
@@ -229,35 +336,44 @@ export default function NotificationSystem({ userEmail, userRole }: Notification
               notifications.map((notification) => (
                 <div
                   key={notification.id}
-                  className={`p-4 border-b border-gray-100 hover:bg-gray-50 transition-colors duration-200 ${
+                  className={`border-b border-gray-100 p-4 transition-colors duration-200 hover:bg-gray-50 ${
                     !notification.is_read ? 'bg-blue-50' : ''
                   }`}
                 >
                   <div className="flex items-start space-x-3">
-                    <div className={`p-2 rounded-lg ${getPriorityColor(notification.priority)}`}>
+                    <div className={`rounded-lg p-2 ${getPriorityColor(notification.priority)}`}>
                       {getTypeIcon(notification.notification_type)}
                     </div>
-                    <div className="flex-1 min-w-0">
+                    <div className="min-w-0 flex-1">
                       <div className="flex items-start justify-between">
-                        <h4 className="font-medium text-gray-900 text-sm">{notification.title}</h4>
+                        <h4 className="text-sm font-medium text-gray-900">{notification.title}</h4>
                         <button
+                          type="button"
                           onClick={() => deleteNotification(notification.id)}
-                          className="text-gray-400 hover:text-gray-600 ml-2"
+                          className="ml-2 text-gray-400 hover:text-gray-600"
                         >
-                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                          <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              strokeWidth={2}
+                              d="M6 18L18 6M6 6l12 12"
+                            />
                           </svg>
                         </button>
                       </div>
-                      <p className="text-sm text-gray-600 mt-1">{notification.message}</p>
-                      <div className="flex items-center justify-between mt-2">
+                      <p className="mt-1 text-sm text-gray-600">{notification.message}</p>
+                      <div className="mt-2 flex items-center justify-between">
                         <span className="text-xs text-gray-500">
-                          {new Date(notification.created_at).toLocaleString()}
+                          {notification.created_at
+                            ? new Date(notification.created_at).toLocaleString()
+                            : ''}
                         </span>
                         {!notification.is_read && (
                           <button
+                            type="button"
                             onClick={() => markAsRead(notification.id)}
-                            className="text-xs text-blue-600 hover:text-blue-800 font-medium"
+                            className="text-xs font-medium text-blue-600 hover:text-blue-800"
                           >
                             Mark as read
                           </button>
@@ -274,4 +390,3 @@ export default function NotificationSystem({ userEmail, userRole }: Notification
     </div>
   );
 }
-

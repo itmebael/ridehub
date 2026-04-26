@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+﻿import React, { useState, useEffect } from 'react';
 import * as XLSX from 'xlsx';
 import jsPDF from 'jspdf';
 // @ts-ignore
@@ -53,22 +53,22 @@ const formatValue = (value: any): string => {
 
 const getColumnPriority = (key: string): number => {
   const priorities: { [key: string]: number } = {
-    // Bookings
+    // Rentals
     'id': 100, // Hide ID or put last
     'full_name': 1,
     'tenant_email': 2,
-    'properties_title': 3,
-    'properties_location': 4,
+    'vehicles_title': 3,
+    'vehicles_location': 4,
     'check_in_date': 5,
     'check_out_date': 6,
     'total_amount': 7,
     'status': 8,
     'created_at': 9,
-    // Landlords
-    'landlord_email': 2,
-    'landlord_full_name': 3,
-    'landlord_phone': 4,
-    // Tenants
+    // Owners
+    'owner_email': 2,
+    'owner_full_name': 3,
+    'owner_phone': 4,
+    // Clients
     'address': 5,
     'barangay': 6,
     'municipality_city': 7,
@@ -77,7 +77,7 @@ const getColumnPriority = (key: string): number => {
     'age': 10,
     'occupation_status': 11,
     // Revenue
-    'owner_email': 4,
+    'vehicles_owner_email': 4,
   };
   return priorities[key.toLowerCase()] || 100;
 };
@@ -101,28 +101,28 @@ const flattenData = (data: any[]) => {
 };
 
 export default function ReportGeneration({ onClose }: ReportGenerationProps) {
-  const [reportType, setReportType] = useState<'bookings' | 'landlords' | 'tenants' | 'revenue'>('bookings');
-  const [selectedBoardingHouse, setSelectedBoardingHouse] = useState<string>('');
+  const [reportType, setReportType] = useState<'Rentals' | 'owners' | 'clients' | 'revenue'>('Rentals');
+  const [selectedVehicle, setSelectedVehicle] = useState<string>('');
   const [dateRange, setDateRange] = useState({ start: '', end: '' });
   const [previewData, setPreviewData] = useState<any[]>([]);
   const [filteredPreviewData, setFilteredPreviewData] = useState<any[]>([]);
   const [generating, setGenerating] = useState(false);
-  const [boardingHouses, setBoardingHouses] = useState<any[]>([]);
+  const [Vehicles, setVehicles] = useState<any[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [filterType, setFilterType] = useState<'date' | 'month' | 'year'>('date');
   const [selectedMonth, setSelectedMonth] = useState('');
   const [selectedYear, setSelectedYear] = useState('');
 
   useEffect(() => {
-    // Load boarding houses for filter
-    const loadBoardingHouses = async () => {
+    // Load Vehicles for filter
+    const loadVehicles = async () => {
       const { data } = await supabase
-        .from('boarding_houses')
-        .select('id, name')
-        .order('name');
-      if (data) setBoardingHouses(data);
+        .from('vehicles')
+        .select('id, title')
+        .order('title');
+      if (data) setVehicles(data);
     };
-    loadBoardingHouses();
+    loadVehicles();
   }, []);
 
   const loadPreview = async () => {
@@ -131,25 +131,23 @@ export default function ReportGeneration({ onClose }: ReportGenerationProps) {
       let query: any;
       
       switch (reportType) {
-        case 'bookings':
+        case 'Rentals':
           query = supabase
-            .from('bookings')
+            .from('rentals')
             .select(`
               *,
-              properties(title, location),
-              rooms(room_number, room_name),
-              beds(bed_number, bed_type)
+              vehicles(title, location),
+              rooms(room_number, room_name)
             `);
           break;
-        case 'landlords':
+        case 'owners':
           query = supabase
-            .from('landlord_profiles')
+            .from('vehicle_owner_profiles')
             .select('*');
           break;
-        case 'tenants':
-          // Try multiple tenant table names
+        case 'clients':
           query = supabase
-            .from('bookings')
+            .from('rentals')
             .select(`
               full_name,
               tenant_email,
@@ -168,20 +166,19 @@ export default function ReportGeneration({ onClose }: ReportGenerationProps) {
           break;
         case 'revenue':
           query = supabase
-            .from('bookings')
+            .from('rentals')
             .select(`
               *,
-              properties(title, location, owner_email),
-              landlord_profiles(full_name, email)
+              vehicles(title, location, owner_email)
             `)
             .eq('status', 'approved');
           break;
         default:
-          query = supabase.from('bookings').select('*');
+          query = supabase.from('rentals').select('*');
       }
       
-      if (selectedBoardingHouse && (reportType === 'bookings' || reportType === 'revenue')) {
-        query = query.or(`property_id.eq.${selectedBoardingHouse},boarding_house_id.eq.${selectedBoardingHouse}`);
+      if (selectedVehicle && (reportType === 'Rentals' || reportType === 'revenue')) {
+        query = query.eq('vehicle_id', selectedVehicle);
       }
       
       // Apply date filtering based on filter type
@@ -259,7 +256,7 @@ export default function ReportGeneration({ onClose }: ReportGenerationProps) {
     const ws = XLSX.utils.json_to_sheet(dataToExport);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Report');
-    const filterInfo = selectedBoardingHouse || dateRange.start || dateRange.end ? '-filtered' : '';
+    const filterInfo = selectedVehicle || dateRange.start || dateRange.end ? '-filtered' : '';
     const fileName = `${reportType}-report${filterInfo}-${new Date().toISOString().split('T')[0]}.xlsx`;
     XLSX.writeFile(wb, fileName);
     alert(`Report exported successfully as ${fileName} (${dataToExport.length} records)`);
@@ -280,23 +277,23 @@ export default function ReportGeneration({ onClose }: ReportGenerationProps) {
       // Add title
       doc.setFontSize(18);
       doc.setFont('helvetica', 'bold');
-      doc.text('BoardingHub Report', 14, 15);
+      doc.text('RideHub Report', 14, 15);
       
       // Add report type
       doc.setFontSize(12);
       doc.setFont('helvetica', 'normal');
-      const reportTypeLabel = reportType === 'bookings' ? 'Bookings Report' :
-                             reportType === 'landlords' ? 'Landlords Report' :
-                             reportType === 'tenants' ? 'Tenants Report' :
+      const reportTypeLabel = reportType === 'Rentals' ? 'Rentals Report' :
+                             reportType === 'owners' ? 'Owners Report' :
+                             reportType === 'clients' ? 'Clients Report' :
                              reportType === 'revenue' ? 'Revenue Report' : 'Report';
       doc.text(reportTypeLabel, 14, 22);
       
       // Add filter information
       doc.setFontSize(9);
       let filterInfo = [];
-      if (selectedBoardingHouse) {
-        const boardingHouse = boardingHouses.find(bh => bh.id === selectedBoardingHouse);
-        filterInfo.push(`Boarding House: ${boardingHouse?.name || selectedBoardingHouse}`);
+      if (selectedVehicle) {
+        const vehicle = Vehicles.find((item) => item.id === selectedVehicle);
+        filterInfo.push(`Vehicle: ${vehicle?.title || selectedVehicle}`);
       }
       if (filterType === 'date' && dateRange.start) {
         filterInfo.push(`Start Date: ${new Date(dateRange.start).toLocaleDateString()}`);
@@ -346,9 +343,9 @@ export default function ReportGeneration({ onClose }: ReportGenerationProps) {
         return header
           .replace(/_/g, ' ')
           .replace(/\b\w/g, l => l.toUpperCase())
-          .replace('Properties ', '')
-          .replace('Rooms ', '')
-          .replace('Beds ', '');
+          .replace(/vehicles /i, '')
+          .replace(/rooms /i, '')
+          .replace(/beds /i, '');
       };
 
       const tableData = dataToExport.map(item => {
@@ -416,7 +413,7 @@ export default function ReportGeneration({ onClose }: ReportGenerationProps) {
       doc.text(`Total Records: ${dataToExport.length}`, margin, finalY);
 
       // Save the PDF
-      const filterInfoStr = selectedBoardingHouse || dateRange.start || dateRange.end || selectedMonth || selectedYear ? '-filtered' : '';
+      const filterInfoStr = selectedVehicle || dateRange.start || dateRange.end || selectedMonth || selectedYear ? '-filtered' : '';
       const fileName = `${reportType}-report${filterInfoStr}-${new Date().toISOString().split('T')[0]}.pdf`;
       doc.save(fileName);
       
@@ -446,58 +443,125 @@ export default function ReportGeneration({ onClose }: ReportGenerationProps) {
   };
 
   const previewHeaders = getPreviewHeaders();
+  const activePreviewCount = filteredPreviewData.length > 0 ? filteredPreviewData.length : previewData.length;
+  const reportOptions: Array<{
+    value: typeof reportType;
+    label: string;
+    description: string;
+    accent: string;
+  }> = [
+    {
+      value: 'Rentals',
+      label: 'Rentals',
+      description: 'Bookings, renters, dates, payments, and status.',
+      accent: 'from-orange-500 to-amber-500',
+    },
+    {
+      value: 'owners',
+      label: 'Owners',
+      description: 'Owner profiles, verification state, and contact details.',
+      accent: 'from-emerald-500 to-teal-500',
+    },
+    {
+      value: 'clients',
+      label: 'Clients',
+      description: 'Renter profile fields collected from rental records.',
+      accent: 'from-sky-500 to-blue-500',
+    },
+    {
+      value: 'revenue',
+      label: 'Revenue',
+      description: 'Approved rentals and revenue by vehicle.',
+      accent: 'from-violet-500 to-fuchsia-500',
+    },
+  ];
 
   return (
-    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-      <div className="bg-white rounded-2xl max-w-5xl w-full p-6 shadow-2xl max-h-[90vh] overflow-y-auto">
-        <div className="flex justify-between items-center mb-6">
-          <h3 className="text-2xl font-bold text-gray-900">Generate Report</h3>
+    <div className="fixed inset-0 bg-slate-950/70 backdrop-blur-md flex items-center justify-center p-3 sm:p-4 z-50">
+      <div className="bg-[#f8fafc] rounded-[28px] max-w-6xl w-full shadow-[0_30px_90px_rgba(15,23,42,0.35)] max-h-[92vh] overflow-hidden border border-white/70">
+        <div className="sticky top-0 z-20 border-b border-slate-200 bg-white/90 px-5 py-4 backdrop-blur-xl sm:px-6">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <p className="text-xs font-bold uppercase tracking-[0.2em] text-orange-600">Admin Export Center</p>
+              <h3 className="mt-1 text-2xl font-black text-slate-950">Generate Report</h3>
+              <p className="mt-1 text-sm text-slate-500">Preview filtered records before exporting to Excel or PDF.</p>
+            </div>
           <button
             onClick={onClose}
-            className="text-gray-500 hover:text-gray-700 text-2xl"
+              className="flex h-10 w-10 items-center justify-center rounded-2xl border border-slate-200 bg-white text-slate-500 shadow-sm transition-colors hover:bg-slate-100 hover:text-slate-900"
+              aria-label="Close report generator"
           >
             ×
           </button>
+          </div>
         </div>
+
+        <div className="max-h-[calc(92vh-82px)] overflow-y-auto p-4 sm:p-6">
+          <div className="mb-5 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            {reportOptions.map((option) => {
+              const isActive = reportType === option.value;
+              return (
+                <button
+                  key={option.value}
+                  onClick={() => {
+                    setReportType(option.value);
+                    setPreviewData([]);
+                    setFilteredPreviewData([]);
+                    setSearchQuery('');
+                  }}
+                  className={`group relative overflow-hidden rounded-2xl border p-4 text-left transition-all duration-200 ${
+                    isActive
+                      ? 'border-orange-200 bg-white shadow-lg shadow-orange-100'
+                      : 'border-slate-200 bg-white/70 hover:border-orange-200 hover:bg-white hover:shadow-md'
+                  }`}
+                >
+                  <div className={`absolute inset-x-0 top-0 h-1 bg-gradient-to-r ${option.accent}`} />
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-sm font-black text-slate-950">{option.label}</span>
+                    <span className={`h-3 w-3 rounded-full ${isActive ? 'bg-orange-500' : 'bg-slate-200 group-hover:bg-orange-300'}`} />
+                  </div>
+                  <p className="mt-2 text-xs leading-5 text-slate-500">{option.description}</p>
+                </button>
+              );
+            })}
+          </div>
         
         {/* Filters */}
-        <div className="space-y-4 mb-6 p-4 bg-gray-50 rounded-xl">
-          <div>
-            <label className="block text-sm font-semibold text-gray-700 mb-2">Report Type</label>
-            <select
-              value={reportType}
-              onChange={(e) => {
-                setReportType(e.target.value as any);
-                setPreviewData([]); // Clear preview when type changes
-                setFilteredPreviewData([]);
-              }}
-              className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-            >
-              <option value="bookings">Bookings Report</option>
-              <option value="landlords">Landlords Report</option>
-              <option value="tenants">Tenants Report</option>
-              <option value="revenue">Revenue Report</option>
-            </select>
-          </div>
-
-          {reportType === 'bookings' || reportType === 'revenue' ? (
-            <div>
-              <label className="block text-sm font-semibold text-gray-700 mb-2">Filter by Boarding House</label>
-              <select
-                value={selectedBoardingHouse}
-                onChange={(e) => setSelectedBoardingHouse(e.target.value)}
-                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+          <div className="mb-5 rounded-[24px] border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
+            <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <h4 className="text-base font-black text-slate-950">Filters</h4>
+                <p className="text-sm text-slate-500">Choose the scope and time window for this export.</p>
+              </div>
+              <button
+                onClick={loadPreview}
+                disabled={generating}
+                className="inline-flex items-center justify-center rounded-2xl bg-slate-950 px-5 py-3 text-sm font-bold text-white shadow-lg shadow-slate-900/20 transition-all hover:-translate-y-0.5 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                <option value="">All Boarding Houses</option>
-                {boardingHouses.map(bh => (
-                  <option key={bh.id} value={bh.id}>{bh.name}</option>
+                {generating ? 'Loading Preview...' : 'Preview Data'}
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+
+          {reportType === 'Rentals' || reportType === 'revenue' ? (
+            <div>
+                <label className="block text-xs font-bold uppercase tracking-[0.14em] text-slate-500 mb-2">Vehicle</label>
+              <select
+                value={selectedVehicle}
+                onChange={(e) => setSelectedVehicle(e.target.value)}
+                  className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-semibold text-slate-800 outline-none transition focus:border-orange-300 focus:bg-white focus:ring-4 focus:ring-orange-100"
+              >
+                <option value="">All Vehicles</option>
+                {Vehicles.map((vehicle) => (
+                  <option key={vehicle.id} value={vehicle.id}>{vehicle.title}</option>
                 ))}
               </select>
             </div>
           ) : null}
 
           <div>
-            <label className="block text-sm font-semibold text-gray-700 mb-2">Filter By</label>
+              <label className="block text-xs font-bold uppercase tracking-[0.14em] text-slate-500 mb-2">Time Filter</label>
             <select
               value={filterType}
               onChange={(e) => {
@@ -506,7 +570,7 @@ export default function ReportGeneration({ onClose }: ReportGenerationProps) {
                 setSelectedMonth('');
                 setSelectedYear('');
               }}
-              className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 mb-4"
+                className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-semibold text-slate-800 outline-none transition focus:border-orange-300 focus:bg-white focus:ring-4 focus:ring-orange-100"
             >
               <option value="date">Date Range</option>
               <option value="month">Month</option>
@@ -516,21 +580,21 @@ export default function ReportGeneration({ onClose }: ReportGenerationProps) {
             {filterType === 'date' && (
               <div className="grid grid-cols-2 gap-4">
                 <div>
-                  <label className="block text-sm font-semibold text-gray-700 mb-2">Start Date</label>
+                    <label className="block text-xs font-bold uppercase tracking-[0.14em] text-slate-500 mb-2">Start</label>
                   <input
                     type="date"
                     value={dateRange.start}
                     onChange={(e) => setDateRange({ ...dateRange, start: e.target.value })}
-                    className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-semibold text-slate-800 outline-none transition focus:border-orange-300 focus:bg-white focus:ring-4 focus:ring-orange-100"
                   />
                 </div>
                 <div>
-                  <label className="block text-sm font-semibold text-gray-700 mb-2">End Date</label>
+                    <label className="block text-xs font-bold uppercase tracking-[0.14em] text-slate-500 mb-2">End</label>
                   <input
                     type="date"
                     value={dateRange.end}
                     onChange={(e) => setDateRange({ ...dateRange, end: e.target.value })}
-                    className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-semibold text-slate-800 outline-none transition focus:border-orange-300 focus:bg-white focus:ring-4 focus:ring-orange-100"
                   />
                 </div>
               </div>
@@ -538,23 +602,23 @@ export default function ReportGeneration({ onClose }: ReportGenerationProps) {
 
             {filterType === 'month' && (
               <div>
-                <label className="block text-sm font-semibold text-gray-700 mb-2">Select Month</label>
+                  <label className="block text-xs font-bold uppercase tracking-[0.14em] text-slate-500 mb-2">Month</label>
                 <input
                   type="month"
                   value={selectedMonth}
                   onChange={(e) => setSelectedMonth(e.target.value)}
-                  className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-semibold text-slate-800 outline-none transition focus:border-orange-300 focus:bg-white focus:ring-4 focus:ring-orange-100"
                 />
               </div>
             )}
 
             {filterType === 'year' && (
               <div>
-                <label className="block text-sm font-semibold text-gray-700 mb-2">Select Year</label>
+                  <label className="block text-xs font-bold uppercase tracking-[0.14em] text-slate-500 mb-2">Year</label>
                 <select
                   value={selectedYear}
                   onChange={(e) => setSelectedYear(e.target.value)}
-                  className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-semibold text-slate-800 outline-none transition focus:border-orange-300 focus:bg-white focus:ring-4 focus:ring-orange-100"
                 >
                   <option value="">Select Year</option>
                   {Array.from({ length: 10 }, (_, i) => {
@@ -565,29 +629,22 @@ export default function ReportGeneration({ onClose }: ReportGenerationProps) {
               </div>
             )}
           </div>
-
-          <button
-            onClick={loadPreview}
-            disabled={generating}
-            className="w-full bg-blue-600 text-white py-3 rounded-lg hover:bg-blue-700 transition-colors font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            {generating ? 'Loading Preview...' : 'Preview Data'}
-          </button>
+            </div>
         </div>
 
         {/* Search Bar - Only show when data is loaded */}
         {previewData.length > 0 && (
-          <div className="mb-6 p-4 bg-gray-50 rounded-xl">
-            <label className="block text-sm font-semibold text-gray-700 mb-2">Search Data</label>
+            <div className="mb-5 rounded-[24px] border border-slate-200 bg-white p-4 shadow-sm">
+              <label className="block text-xs font-bold uppercase tracking-[0.14em] text-slate-500 mb-2">Search Data</label>
             <input
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search by any field (name, email, property, etc.)..."
-              className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+              placeholder="Search by any field (name, email, vehicle, etc.)..."
+                className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-semibold text-slate-800 outline-none transition focus:border-orange-300 focus:bg-white focus:ring-4 focus:ring-orange-100"
             />
             {searchQuery && (
-              <div className="mt-2 text-sm text-gray-600">
+                <div className="mt-2 text-sm font-medium text-slate-500">
                 Showing {filteredPreviewData.length} of {previewData.length} records
               </div>
             )}
@@ -596,31 +653,31 @@ export default function ReportGeneration({ onClose }: ReportGenerationProps) {
 
         {/* Preview */}
         {(filteredPreviewData.length > 0 || previewData.length > 0) && (
-          <div className="mb-6">
-            <div className="flex justify-between items-center mb-3">
-              <h4 className="font-semibold text-gray-900">
-                Preview ({filteredPreviewData.length > 0 ? filteredPreviewData.length : previewData.length} record{(filteredPreviewData.length > 0 ? filteredPreviewData.length : previewData.length) !== 1 ? 's' : ''})
+            <div className="mb-5 rounded-[24px] border border-slate-200 bg-white shadow-sm overflow-hidden">
+              <div className="flex flex-col gap-1 border-b border-slate-100 px-4 py-4 sm:flex-row sm:items-center sm:justify-between">
+                <h4 className="font-black text-slate-950">
+                  Preview ({activePreviewCount} record{activePreviewCount !== 1 ? 's' : ''})
               </h4>
-              <span className="text-sm text-gray-600">
-                Showing first {Math.min(20, filteredPreviewData.length > 0 ? filteredPreviewData.length : previewData.length)} of {filteredPreviewData.length > 0 ? filteredPreviewData.length : previewData.length}
+                <span className="text-sm font-medium text-slate-500">
+                  Showing first {Math.min(20, activePreviewCount)} of {activePreviewCount}
               </span>
             </div>
-            <div className="max-h-96 overflow-y-auto border border-gray-200 rounded-lg">
+              <div className="max-h-96 overflow-auto">
               <table className="w-full text-sm">
-                <thead className="bg-gray-50 sticky top-0">
+                  <thead className="sticky top-0 bg-slate-50">
                   <tr>
                     {previewHeaders.map(key => (
-                      <th key={key} className="px-4 py-3 text-left text-xs font-semibold text-gray-700 uppercase border-b">
-                        {key.replace(/_/g, ' ').replace('properties', '').replace('landlord', '').trim()}
+                        <th key={key} className="whitespace-nowrap border-b border-slate-200 px-4 py-3 text-left text-xs font-black uppercase tracking-[0.08em] text-slate-500">
+                        {key.replace(/_/g, ' ').replace('Vehicles', '').replace('vehicle owner', 'owner').replace('landlord', 'owner').trim()}
                       </th>
                     ))}
                   </tr>
                 </thead>
                 <tbody>
                   {(filteredPreviewData.length > 0 ? filteredPreviewData : previewData).slice(0, 20).map((row, idx) => (
-                    <tr key={idx} className="border-b hover:bg-gray-50">
+                      <tr key={idx} className="border-b border-slate-100 hover:bg-orange-50/40">
                       {previewHeaders.map((key, i) => (
-                        <td key={i} className="px-4 py-2 text-gray-700">
+                          <td key={i} className="max-w-[220px] truncate px-4 py-3 text-slate-700">
                           {formatValue(row[key])}
                         </td>
                       ))}
@@ -633,17 +690,17 @@ export default function ReportGeneration({ onClose }: ReportGenerationProps) {
         )}
 
         {/* Actions */}
-        <div className="flex gap-4 pt-4 border-t">
+          <div className="sticky bottom-0 -mx-4 -mb-4 flex flex-col gap-3 border-t border-slate-200 bg-white/90 p-4 backdrop-blur-xl sm:-mx-6 sm:-mb-6 sm:flex-row sm:px-6">
           <button
             onClick={onClose}
-            className="flex-1 bg-gray-100 text-gray-700 py-3 rounded-lg hover:bg-gray-200 transition-colors font-semibold"
+              className="flex-1 rounded-2xl bg-slate-100 py-3 font-bold text-slate-700 transition-colors hover:bg-slate-200"
           >
             Close
           </button>
           <button
             onClick={exportToExcel}
             disabled={previewData.length === 0}
-            className="flex-1 bg-gradient-to-r from-green-600 to-green-700 text-white py-3 rounded-lg hover:from-green-700 hover:to-green-800 transition-all font-semibold shadow-lg hover:shadow-xl transform hover:-translate-y-0.5 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+              className="flex-1 rounded-2xl bg-gradient-to-r from-emerald-600 to-green-700 py-3 font-bold text-white shadow-lg shadow-emerald-600/20 transition-all hover:-translate-y-0.5 hover:from-emerald-700 hover:to-green-800 disabled:cursor-not-allowed disabled:opacity-50 flex items-center justify-center gap-2"
           >
             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
@@ -653,13 +710,14 @@ export default function ReportGeneration({ onClose }: ReportGenerationProps) {
           <button
             onClick={exportToPDF}
             disabled={previewData.length === 0}
-            className="flex-1 bg-gradient-to-r from-red-600 to-red-700 text-white py-3 rounded-lg hover:from-red-700 hover:to-red-800 transition-all font-semibold shadow-lg hover:shadow-xl transform hover:-translate-y-0.5 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+              className="flex-1 rounded-2xl bg-gradient-to-r from-red-600 to-rose-700 py-3 font-bold text-white shadow-lg shadow-red-600/20 transition-all hover:-translate-y-0.5 hover:from-red-700 hover:to-rose-800 disabled:cursor-not-allowed disabled:opacity-50 flex items-center justify-center gap-2"
           >
             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
             </svg>
             Export to PDF
           </button>
+        </div>
         </div>
       </div>
     </div>

@@ -1,10 +1,10 @@
--- Simple RLS Policies for Reviews Table (Quick Setup)
+﻿-- Simple RLS Policies for Reviews Table (Quick Setup)
 -- Run this in your Supabase SQL Editor for immediate testing
 
 -- Create reviews table if it doesn't exist
 CREATE TABLE IF NOT EXISTS public.reviews (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    property_id UUID REFERENCES properties(id) ON DELETE CASCADE,
+    vehicle_id UUID REFERENCES Vehicles(id) ON DELETE CASCADE,
     client_email VARCHAR(255) NOT NULL,
     client_name VARCHAR(255) NOT NULL,
     rating INTEGER CHECK (rating >= 1 AND rating <= 5) NOT NULL,
@@ -16,13 +16,13 @@ CREATE TABLE IF NOT EXISTS public.reviews (
 
 -- Drop all existing policies
 DROP POLICY IF EXISTS "Anyone can read verified reviews" ON reviews;
-DROP POLICY IF EXISTS "Property owners can see all their reviews" ON reviews;
+DROP POLICY IF EXISTS "vehicle owners can see all their reviews" ON reviews;
 DROP POLICY IF EXISTS "Users can see their own reviews" ON reviews;
 DROP POLICY IF EXISTS "Anyone can insert reviews" ON reviews;
 DROP POLICY IF EXISTS "Users can update their own reviews" ON reviews;
-DROP POLICY IF EXISTS "Property owners can update their reviews" ON reviews;
+DROP POLICY IF EXISTS "vehicle owners can update their reviews" ON reviews;
 DROP POLICY IF EXISTS "Users can delete their own reviews" ON reviews;
-DROP POLICY IF EXISTS "Property owners can delete their reviews" ON reviews;
+DROP POLICY IF EXISTS "vehicle owners can delete their reviews" ON reviews;
 
 -- OPTION 1: Disable RLS completely (Easiest for testing)
 ALTER TABLE reviews DISABLE ROW LEVEL SECURITY;
@@ -57,4 +57,5 @@ FROM information_schema.columns
 WHERE table_name = 'reviews' 
 AND table_schema = 'public'
 ORDER BY ordinal_position;
+
 

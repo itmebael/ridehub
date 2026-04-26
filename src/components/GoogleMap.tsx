@@ -10,6 +10,14 @@ interface GoogleMapProps {
     info?: string;
     iconUrl?: string;
   }>;
+  polygons?: Array<{
+    path: Array<{ lat: number; lng: number }>;
+    strokeColor?: string;
+    strokeOpacity?: number;
+    strokeWeight?: number;
+    fillColor?: string;
+    fillOpacity?: number;
+  }>;
   onMapClick?: (lat: number, lng: number) => void;
   onMarkerClick?: (index: number) => void;
   satellite?: boolean;
@@ -18,6 +26,26 @@ interface GoogleMapProps {
   fallbackOnTimeoutMs?: number;
   preferLeaflet?: boolean;
 }
+
+type MapPoint = { lat: number; lng: number };
+
+const getPolygonCornerPoints = (path: MapPoint[] = []): MapPoint[] => {
+  const points = path.filter(
+    (point): point is MapPoint =>
+      Number.isFinite(point?.lat) && Number.isFinite(point?.lng)
+  );
+
+  if (points.length > 1) {
+    const firstPoint = points[0];
+    const lastPoint = points[points.length - 1];
+
+    if (firstPoint.lat === lastPoint.lat && firstPoint.lng === lastPoint.lng) {
+      return points.slice(0, -1);
+    }
+  }
+
+  return points;
+};
 
 declare global {
   interface Window {
@@ -28,7 +56,8 @@ declare global {
 export default function GoogleMap({ 
   center, 
   zoom = 15, 
-  markers = [], 
+  markers = [],
+  polygons = [],
   onMapClick,
   onMarkerClick,
   satellite = true,
@@ -183,6 +212,47 @@ export default function GoogleMap({
           }
         });
 
+        if ((mapInstanceRef.current as any)?.__bh_polygons) {
+          (mapInstanceRef.current as any).__bh_polygons.forEach((shape: any) => {
+            try {
+              shape.remove();
+            } catch {}
+          });
+        }
+        const polygonLayers = polygons.flatMap((polygon) => {
+          const cornerPoints = getPolygonCornerPoints(polygon.path);
+
+          if (cornerPoints.length < 3) {
+            return [];
+          }
+
+          const boundaryLine = L.polygon(
+            cornerPoints.map((point) => [point.lat, point.lng]),
+            {
+              color: polygon.strokeColor || '#2563eb',
+              weight: polygon.strokeWeight || 2,
+              opacity: polygon.strokeOpacity ?? 1,
+              fillColor: polygon.fillColor || '#3b82f6',
+              fillOpacity: polygon.fillOpacity ?? 0.08,
+            }
+          ).addTo(mapInstance);
+
+          const cornerMarkers = cornerPoints.map((point) =>
+            L.circleMarker([point.lat, point.lng], {
+              radius: 6,
+              color: '#ffffff',
+              weight: 2,
+              fillColor: polygon.strokeColor || '#2563eb',
+              fillOpacity: 1,
+              opacity: 1,
+              interactive: false,
+            }).addTo(mapInstance)
+          );
+
+          return [boundaryLine, ...cornerMarkers];
+        });
+        (mapInstanceRef.current as any).__bh_polygons = polygonLayers;
+
         // Map click to set coordinates - remove old listener first, then add new one
         if (mapInstanceRef.current) {
           mapInstanceRef.current.off('click'); // Remove any existing click handlers
@@ -210,7 +280,7 @@ export default function GoogleMap({
           if (containerRef.current) containerRef.current.innerHTML = '';
         }
       };
-    }, [center, zoom, JSON.stringify(markers), onMapClick]);
+    }, [center, zoom, JSON.stringify(markers), JSON.stringify(polygons), onMapClick]);
 
     if (loadFailed) {
       return renderGoogleEmbedSatellite() || renderGoogleStaticSatellite() || renderOSM();
@@ -398,6 +468,15 @@ export default function GoogleMap({
       if ((localMap as any).__bh_markers) {
         (localMap as any).__bh_markers.forEach((mk: any) => mk.setMap(null));
       }
+      if ((localMap as any).__bh_overlays) {
+        (localMap as any).__bh_overlays.forEach((overlay: any) => overlay.setMap(null));
+      }
+      if ((localMap as any).__bh_polygons) {
+        (localMap as any).__bh_polygons.forEach((shape: any) => shape.setMap(null));
+      }
+      if ((localMap as any).__bh_polygonPoints) {
+        (localMap as any).__bh_polygonPoints.forEach((marker: any) => marker.setMap(null));
+      }
       const markersArr: any[] = [];
       const desiredSize = 56;
       const overlaysArr: any[] = [];
@@ -468,6 +547,50 @@ export default function GoogleMap({
       (localMap as any).__bh_overlays = overlaysArr;
       (localMap as any).__bh_markers = markersArr;
 
+      const polygonsArr = polygons
+        .map((polygon) => {
+          const cornerPoints = getPolygonCornerPoints(polygon.path);
+
+          if (cornerPoints.length < 3) {
+            return null;
+          }
+
+          return new window.google.maps.Polygon({
+            paths: cornerPoints,
+            strokeColor: polygon.strokeColor || '#2563eb',
+            strokeOpacity: polygon.strokeOpacity ?? 1,
+            strokeWeight: polygon.strokeWeight || 2,
+            fillColor: polygon.fillColor || '#3b82f6',
+            fillOpacity: polygon.fillOpacity ?? 0.08,
+            map: localMap,
+          });
+        })
+        .filter(Boolean);
+
+      const polygonPointsArr = polygons.flatMap((polygon) => {
+        const cornerPoints = getPolygonCornerPoints(polygon.path);
+
+        return cornerPoints.map(
+          (point) =>
+            new window.google.maps.Marker({
+              position: point,
+              map: localMap,
+              clickable: false,
+              zIndex: 1000,
+              icon: {
+                path: window.google.maps.SymbolPath.CIRCLE,
+                scale: 6,
+                fillColor: polygon.strokeColor || '#2563eb',
+                fillOpacity: 1,
+                strokeColor: '#ffffff',
+                strokeWeight: 2,
+              },
+            })
+        );
+      });
+      (localMap as any).__bh_polygons = polygonsArr;
+      (localMap as any).__bh_polygonPoints = polygonPointsArr;
+
       requestAnimationFrame(() => {
         try {
           if (window.google && window.google.maps.event && localMap) {
@@ -495,7 +618,7 @@ export default function GoogleMap({
       io.disconnect();
       if (ro) ro.disconnect();
     };
-  }, [isLoaded, center, zoom, markers, onMapClick, satellite]);
+  }, [isLoaded, center, zoom, markers, polygons, onMapClick, satellite]);
 
   if (preferLeaflet) {
     return <LeafletSatellite />;

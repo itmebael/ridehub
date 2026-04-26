@@ -1,11 +1,46 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import GoogleMap from './GoogleMap';
 import ImageUpload from './ImageUpload';
+import PermitUpload from './PermitUpload';
 import supabase from '../lib/supabase';
+import { mergeMessageById } from '../lib/mergeChatMessage';
+import { notifyChatRecipientNonBlocking } from '../lib/chatNotify';
+import { updateVehicleWithColumnFallback } from '../lib/vehicleUpdateFallback';
+import { emailsMatchCaseInsensitive, recipientEmailVariants } from '../lib/recipientEmailVariants';
 import { sendTenantDecisionEmail } from '../lib/email';
+import {
+  REGISTER_ID_DOCUMENT_BUCKETS,
+  VEHICLE_ASSET_BUCKETS,
+  resolveStoredPublicUrl,
+  uploadFileWithBucketFallback,
+} from '../lib/storageBuckets';
 import { ImageWithFallback } from './ImageWithFallback';
 import ImageCarousel from './ImageCarousel';
 import ReportProblem from './ReportProblem';
+import {
+  RENTAL_UNITS,
+  RENTAL_UNIT_LABELS,
+  RENTAL_UNIT_SUFFIXES,
+  extractRentalUnitFromText,
+  getRentalRates,
+  type RentalRates,
+  type RentalUnit
+} from '../lib/rentalPricing';
+import {
+  DEFAULT_MAP_CENTER,
+  buildAxisAlignedBoundaryFromPoints,
+  buildRectangleBoundaryFromTwoCorners,
+  buildSquareBoundary,
+  getBoundaryCenter,
+  getSquareArea,
+  getSquareBoundaryPath,
+  isPointWithinBoundary,
+  isValidLatLng,
+  normalizeBoundarySize,
+  type LatLng,
+  type SquareBoundary
+} from '../lib/vehicleBoundary';
+import { formatYmdMedium, getLocalDateYmd, reservationRangesOverlap } from '../lib/rentalReservation';
 import { Line, Bar } from 'react-chartjs-2';
 import * as XLSX from 'xlsx';
 import jsPDF from 'jspdf';
@@ -19,7 +54,7 @@ declare module 'jspdf' {
   }
 }
 
-interface Property {
+interface vehicle {
   id: string;
   title: string;
   description: string;
@@ -27,21 +62,72 @@ interface Property {
   location: string;
   images: string[];
   amenities: string[];
-  coordinates: { lat: number; lng: number };
-  status: 'active' | 'inactive' | 'pending';
+  coordinates: LatLng;
+  currentCoordinates: LatLng;
+  rentalRates: RentalRates;
+  boundary: SquareBoundary;
+  boundarySizeMeters: number;
+  status: 'available' | 'active' | 'inactive' | 'pending' | 'rented';
   isVerified: boolean;
   ownerEmail?: string;
   rating?: number;
   business_permit_url?: string;
+  geofenceAlertSentAt?: string | null;
+  trackingDeviceId?: string;
+  trackingEnabled?: boolean;
+  trackingProvider?: string;
+  trackingLastPing?: string | null;
+  /** PHP amount owner charges if vehicle leaves allowed GPS zone during rental (0 = none). */
+  outOfBoundaryPenaltyPhp: number;
 }
 
-interface BookingRequest {
+type BoundaryPlacementMode = 'center_square' | 'draw_two_corners' | 'draw_four_corners';
+
+const BOUNDARY_FOUR_CORNER_SHORT = ['TR', 'TL', 'BR', 'BL'] as const;
+const BOUNDARY_FOUR_CORNER_HINT = [
+  'Top-right',
+  'Top-left',
+  'Bottom-right',
+  'Bottom-left',
+] as const;
+
+const EMPTY_FOUR_CORNERS: [LatLng | null, LatLng | null, LatLng | null, LatLng | null] = [
+  null,
+  null,
+  null,
+  null,
+];
+
+interface VehicleFormState {
+  title: string;
+  description: string;
+  location: string;
+  amenities: string[];
+  rates: Record<RentalUnit, string>;
+  boundarySizeMeters: string;
+  boundaryPlacementMode: BoundaryPlacementMode;
+  /** First tap when drawing a box (e.g. left/bottom area); second tap completes opposite corner. */
+  boundaryCornerFirst: LatLng | null;
+  boundaryCornerSecond: LatLng | null;
+  /** Tap order: TR, TL, BR, BL (top-right → top-left → bottom-right → bottom-left). */
+  boundaryFourCorners: [LatLng | null, LatLng | null, LatLng | null, LatLng | null];
+  coordinates: LatLng;
+  currentCoordinates: LatLng;
+  trackingDeviceId: string;
+  trackingEnabled: boolean;
+  trackingProvider: string;
+  images: File[];
+  /** Whole pesos; stored as out_of_boundary_penalty_php on vehicles. */
+  outOfBoundaryPenaltyPhp: string;
+}
+
+interface rentalRequest {
   id: string;
-  propertyId: string;
+  vehicleId: string;
   clientName: string;
   clientEmail: string;
   message: string;
-  status: 'pending' | 'approved' | 'rejected';
+  status: 'pending' | 'approved' | 'rejected' | 'cancelled' | 'completed';
   createdAt: string;
   totalAmount?: number;
   checkInDate?: string;
@@ -57,44 +143,253 @@ interface BookingRequest {
   citizenship?: string;
   full_name?: string;
   tenant_email?: string;
+  driver_license?: string | null;
+  specialRequests?: string;
+  rentalUnit?: RentalUnit | null;
+  paymentStatus?: 'pending' | 'paid' | 'partial' | 'refunded';
+  paymentMethod?: string | null;
 }
 
 interface OwnerAnalytics {
-  totalProperties: number;
-  totalBookings: number;
+  totalVehicles: number;
+  totalRentals: number;
   averageRating: number;
   occupancyRate: number;
   totalRevenue: number;
-  averageRevenuePerBooking: number;
+  averageRevenuePerrental: number;
   revenueTrends: { date: string; revenue: number }[];
-  bookingTrends: { date: string; bookings: number; revenue: number }[];
-  propertyPerformance: { propertyId: string; propertyTitle: string; bookings: number; rating: number; revenue: number; averageRevenue: number }[];
-  monthlyRevenue: { month: string; revenue: number; bookings: number }[];
-  topPerformingProperties: { propertyId: string; propertyTitle: string; revenue: number }[];
+  rentalTrends: { date: string; Rentals: number; revenue: number }[];
+  vehiclePerformance: { vehicleId: string; vehicleTitle: string; Rentals: number; rating: number; revenue: number; averageRevenue: number }[];
+  monthlyRevenue: { month: string; revenue: number; Rentals: number }[];
+  topPerformingVehicles: { vehicleId: string; vehicleTitle: string; revenue: number }[];
   revenueByStatus: { status: string; count: number; revenue: number }[];
 }
 
 interface Review {
   id: string;
-  propertyId: string;
+  vehicleId: string;
   clientName: string;
   rating: number;
   reviewText: string;
   createdAt: string;
 }
 
+interface OwnerRequirementStatus {
+  ownerProfileId: string | null;
+  isComplete: boolean;
+  missingItems: string[];
+  hasPermit: boolean;
+  hasIdDocument: boolean;
+}
+
 interface OwnerDashboardProps {
   onBack: () => void;
 }
 
+const DEFAULT_BOUNDARY_SIZE_METERS = 200;
+const VEHICLE_FEATURE_OPTIONS = [
+  'Air Conditioning',
+  'Automatic',
+  'Manual',
+  'Fuel Efficient',
+  'GPS Ready',
+  'Bluetooth',
+  'USB Charger',
+  'Large Trunk',
+] as const;
+const PAYMENT_STATUS_OPTIONS: Array<NonNullable<rentalRequest['paymentStatus']>> = ['pending', 'partial', 'paid', 'refunded'];
+
+const PAYMENT_STATUS_LABELS: Record<NonNullable<rentalRequest['paymentStatus']>, string> = {
+  pending: 'Pending',
+  partial: 'Partial',
+  paid: 'Paid',
+  refunded: 'Refunded',
+};
+
+const PAYMENT_STATUS_CLASSES: Record<NonNullable<rentalRequest['paymentStatus']>, string> = {
+  pending: 'bg-yellow-100 text-yellow-800 border-yellow-200',
+  partial: 'bg-blue-100 text-blue-800 border-blue-200',
+  paid: 'bg-green-100 text-green-800 border-green-200',
+  refunded: 'bg-gray-100 text-gray-700 border-gray-200',
+};
+
+const extractPaymentMethodFromText = (...sources: Array<string | null | undefined>): string | null => {
+  const combinedText = sources.filter(Boolean).join('\n');
+  const match = combinedText.match(/Payment Method:\s*([^\n]+)/i);
+  return match?.[1]?.trim() || null;
+};
+
+const createEmptyVehicleRateForm = (): Record<RentalUnit, string> => ({
+  hour: '',
+  day: '',
+  week: '',
+  month: '',
+});
+
+const createEmptyVehicleForm = (): VehicleFormState => ({
+  title: '',
+  description: '',
+  location: 'Catbalogan City, Samar',
+  amenities: [],
+  rates: createEmptyVehicleRateForm(),
+  boundarySizeMeters: String(DEFAULT_BOUNDARY_SIZE_METERS),
+  boundaryPlacementMode: 'center_square',
+  boundaryCornerFirst: null,
+  boundaryCornerSecond: null,
+  boundaryFourCorners: [...EMPTY_FOUR_CORNERS],
+  coordinates: { ...DEFAULT_MAP_CENTER },
+  currentCoordinates: { ...DEFAULT_MAP_CENTER },
+  trackingDeviceId: '',
+  trackingEnabled: false,
+  trackingProvider: 'Manual GPS',
+  images: [],
+  outOfBoundaryPenaltyPhp: '0',
+});
+
+const parseRequiredRate = (value: string | number): number | null => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return Math.round(parsed);
+};
+
+/** Non-negative PHP amount for boundary violation penalty (whole pesos, capped). */
+const parseOutOfBoundaryPenaltyPeso = (raw: string | number | null | undefined): number => {
+  const n = Number(String(raw ?? '').replace(/,/g, ''));
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return Math.min(Math.round(n), 999999999);
+};
+
+const parseVehicleRates = (rates: Record<RentalUnit, string>): RentalRates | null => {
+  const resolved = {} as RentalRates;
+
+  for (const unit of RENTAL_UNITS) {
+    const parsed = parseRequiredRate(rates[unit]);
+    if (parsed === null) return null;
+    resolved[unit] = parsed;
+  }
+
+  return resolved;
+};
+
+const parseFiniteCoordinate = (value: unknown): number | null => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const getBrowserPosition = (): Promise<LatLng> =>
+  new Promise((resolve, reject) => {
+    if (!navigator.geolocation) {
+      reject(new Error('Geolocation is not supported by this browser.'));
+      return;
+    }
+
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        resolve({
+          lat: position.coords.latitude,
+          lng: position.coords.longitude,
+        });
+      },
+      (error) => reject(error),
+      {
+        enableHighAccuracy: true,
+        timeout: 15000,
+        maximumAge: 0,
+      }
+    );
+  });
+
+const mapVehicleRecord = (record: any): vehicle => {
+  const baseLat = parseFiniteCoordinate(record?.lat);
+  const baseLng = parseFiniteCoordinate(record?.lng);
+  const coordinates =
+    baseLat !== null && baseLng !== null ? { lat: baseLat, lng: baseLng } : { ...DEFAULT_MAP_CENTER };
+
+  const currentLat = parseFiniteCoordinate(record?.current_lat);
+  const currentLng = parseFiniteCoordinate(record?.current_lng);
+  const currentCoordinates =
+    currentLat !== null && currentLng !== null ? { lat: currentLat, lng: currentLng } : coordinates;
+
+  const boundarySizeMeters = normalizeBoundarySize(record?.boundary_size_meters);
+  const northLat = parseFiniteCoordinate(record?.boundary_north_lat);
+  const southLat = parseFiniteCoordinate(record?.boundary_south_lat);
+  const eastLng = parseFiniteCoordinate(record?.boundary_east_lng);
+  const westLng = parseFiniteCoordinate(record?.boundary_west_lng);
+
+  const boundary =
+    northLat !== null && southLat !== null && eastLng !== null && westLng !== null
+      ? {
+          northLat,
+          southLat,
+          eastLng,
+          westLng,
+          sizeMeters: boundarySizeMeters,
+        }
+      : buildSquareBoundary(coordinates, boundarySizeMeters);
+
+  const rentalRates = getRentalRates({
+    hour: record?.hourly_rate,
+    day: record?.daily_rate ?? record?.price,
+    week: record?.weekly_rate,
+    month: record?.monthly_rate,
+  });
+
+  return {
+    id: String(record?.id || ''),
+    title: String(record?.title || ''),
+    description: String(record?.description || ''),
+    price: rentalRates.day,
+    location: String(record?.location || ''),
+    images: (Array.isArray(record?.images) ? record.images : record?.images ? [record.images] : [])
+      .filter((path: any) => path && String(path).trim() !== '')
+      .map((path: any) => resolveStoredPublicUrl(String(path || ''), 'vehicle-images')),
+    amenities: Array.isArray(record?.amenities) ? record.amenities : [],
+    coordinates,
+    currentCoordinates,
+    rentalRates,
+    boundary,
+    boundarySizeMeters,
+    status:
+      record?.status === 'available'
+        ? 'available'
+        : record?.status === 'active'
+          ? 'active'
+          : record?.status === 'pending'
+            ? 'pending'
+            : record?.status === 'rented'
+              ? 'rented'
+              : 'inactive',
+    isVerified: Boolean(record?.is_verified),
+    ownerEmail: record?.owner_email || '',
+    rating: Number(record?.rating) || 0,
+    business_permit_url: record?.business_permit_url || undefined,
+    geofenceAlertSentAt: record?.geofence_alert_sent_at || null,
+    trackingDeviceId: record?.tracking_device_id || '',
+    trackingEnabled: Boolean(record?.tracking_enabled),
+    trackingProvider: record?.tracking_provider || 'Manual GPS',
+    trackingLastPing: record?.tracking_last_ping || null,
+    outOfBoundaryPenaltyPhp: parseOutOfBoundaryPenaltyPeso(record?.out_of_boundary_penalty_php),
+  };
+};
+
+const dedupeVehiclesById = (items: vehicle[]): vehicle[] => {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    if (!item.id || seen.has(item.id)) return false;
+    seen.add(item.id);
+    return true;
+  });
+};
+
 export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
-  const [activeTab, setActiveTab] = useState<'properties' | 'bookings' | 'analytics'>('properties');
-  const [showAddProperty, setShowAddProperty] = useState(false);
-  const [showPropertyDetails, setShowPropertyDetails] = useState<Property | null>(null);
+  const [activeTab, setActiveTab] = useState<'Vehicles' | 'Rentals' | 'analytics'>('Vehicles');
+  const [showAddvehicle, setShowAddvehicle] = useState(false);
+  const [showvehicleDetails, setShowvehicleDetails] = useState<vehicle | null>(null);
   const [profileOpen, setProfileOpen] = useState(false);
   const [showNotif, setShowNotif] = useState(false);
   const [showViewProfile, setShowViewProfile] = useState(false);
   const [showEditProfile, setShowEditProfile] = useState(false);
+  const [showOwnerRequirementsModal, setShowOwnerRequirementsModal] = useState(false);
   const [user, setUser] = useState<any>(null);
   
   // Profile states
@@ -105,7 +400,8 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
     address: '',
     barangay: '',
     city: '',
-    profile_image_url: ''
+    profile_image_url: '',
+    id_document_url: ''
   });
   const [viewProfileData, setViewProfileData] = useState<{
     full_name: string;
@@ -115,6 +411,7 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
     barangay: string;
     city: string;
     profile_image_url: string | null;
+    id_document_url: string | null;
   }>({
     full_name: '',
     email: '',
@@ -122,19 +419,33 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
     address: '',
     barangay: '',
     city: '',
-    profile_image_url: null
+    profile_image_url: null,
+    id_document_url: null
   });
   const [profileImageFile, setProfileImageFile] = useState<File | null>(null);
   const [profileImagePreview, setProfileImagePreview] = useState<string | null>(null);
+  const [idDocumentFile, setIdDocumentFile] = useState<File | null>(null);
+  const [idDocumentPreview, setIdDocumentPreview] = useState<string | null>(null);
   const [savingProfile, setSavingProfile] = useState(false);
-  const [editingProperty, setEditingProperty] = useState<Property | null>(null);
+  const [editingvehicle, setEditingvehicle] = useState<vehicle | null>(null);
+  const [editingBoundaryMapMode, setEditingBoundaryMapMode] = useState<
+    'tracker' | 'center_pin' | 'draw_box'
+  >('tracker');
+  const [editingBoxFirstCorner, setEditingBoxFirstCorner] = useState<LatLng | null>(null);
+  const [ownerRequirements, setOwnerRequirements] = useState<OwnerRequirementStatus>({
+    ownerProfileId: null,
+    isComplete: false,
+    missingItems: [],
+    hasPermit: false,
+    hasIdDocument: false,
+  });
 
   // Chat state
   const [chatOpen, setChatOpen] = useState(false);
   const [chatLoading, setChatLoading] = useState(false);
   const [chatMessages, setChatMessages] = useState<{ id: string; sender_email: string; content: string; created_at: string; }[]>([]);
   const [chatInput, setChatInput] = useState('');
-  const [activeConversation, setActiveConversation] = useState<{ id: string; property_id: string; owner_email: string; client_email: string } | null>(null);
+  const [activeConversation, setActiveConversation] = useState<{ id: string; vehicle_id: string; owner_email: string; client_email: string } | null>(null);
   const [chatChannel, setChatChannel] = useState<any>(null);
   const messagesEndRef = React.useRef<HTMLDivElement | null>(null);
 
@@ -143,109 +454,290 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
       messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     } catch {}
   };
-  
-  // Form states for adding property
-  const [newProperty, setNewProperty] = useState({
-    title: '',
-    description: '',
-    price: '',
-    location: 'Catbalogan City, Samar',
-    amenities: [] as string[],
-    coordinates: { lat: 11.7778, lng: 124.8847 },
-    images: [] as File[]
-  });
+
+  const refreshOwnerRequirements = async (authUserParam?: any, emailParam?: string, openModal = false) => {
+    const authUser = authUserParam || (await supabase.auth.getUser()).data.user;
+    const resolvedEmail = (emailParam || authUser?.email || '').trim().toLowerCase();
+
+    if (!resolvedEmail) {
+      const emptyStatus: OwnerRequirementStatus = {
+        ownerProfileId: null,
+        isComplete: false,
+        missingItems: ['owner email'],
+        hasPermit: false,
+        hasIdDocument: false,
+      };
+      setOwnerRequirements(emptyStatus);
+      if (openModal) {
+        setShowOwnerRequirementsModal(true);
+      }
+      return emptyStatus;
+    }
+
+    const ownerSelectors = authUser?.id
+      ? `email.eq.${resolvedEmail},user_id.eq.${authUser.id}`
+      : `email.eq.${resolvedEmail}`;
+
+    const [{ data: ownerProfile }, { data: appUser }] = await Promise.all([
+      supabase
+        .from('vehicle_owner_profiles')
+        .select('id, full_name, phone, address')
+        .or(ownerSelectors)
+        .maybeSingle(),
+      supabase
+        .from('app_users')
+        .select('full_name, phone, address, barangay, city, id_document_url')
+        .or(ownerSelectors)
+        .maybeSingle(),
+    ]);
+
+    let hasPermit = false;
+    if (ownerProfile?.id) {
+      const { count } = await supabase
+        .from('owner_permits')
+        .select('id', { count: 'exact', head: true })
+        .eq('owner_id', ownerProfile.id)
+        .in('verification_status', ['pending', 'approved']);
+
+      hasPermit = (count || 0) > 0;
+    }
+
+    const fullName = ownerProfile?.full_name || appUser?.full_name || '';
+    const phone = ownerProfile?.phone || appUser?.phone || '';
+    const address = ownerProfile?.address || appUser?.address || '';
+    const barangay = appUser?.barangay || '';
+    const city = appUser?.city || '';
+    const idDocumentUrl = appUser?.id_document_url || '';
+
+    const missingItems: string[] = [];
+    if (!fullName.trim()) missingItems.push('full name');
+    if (!phone.trim()) missingItems.push('phone number');
+    if (!address.trim()) missingItems.push('street address');
+    if (!barangay.trim()) missingItems.push('barangay');
+    if (!city.trim()) missingItems.push('city');
+    if (!idDocumentUrl.trim()) missingItems.push('government ID document');
+    if (!hasPermit) missingItems.push('at least one business or owner car permit');
+
+    const nextStatus: OwnerRequirementStatus = {
+      ownerProfileId: ownerProfile?.id || null,
+      isComplete: missingItems.length === 0,
+      missingItems,
+      hasPermit,
+      hasIdDocument: Boolean(idDocumentUrl),
+    };
+
+    setOwnerRequirements(nextStatus);
+    if (openModal && !nextStatus.isComplete) {
+      setShowOwnerRequirementsModal(true);
+    }
+
+    return nextStatus;
+  };
+
+  const openOwnerProfileEditor = async () => {
+    const email = ownerEmail || user?.email;
+    if (!email) {
+      alert('Email not found');
+      return;
+    }
+
+    try {
+      const { data: vehicleOwnerProfile } = await supabase
+        .from('vehicle_owner_profiles')
+        .select('*')
+        .eq('email', email)
+        .single();
+
+      const { data: appUser } = await supabase
+        .from('app_users')
+        .select('*')
+        .eq('email', email)
+        .single();
+
+      const profile = { ...(appUser || {}), ...(vehicleOwnerProfile || {}) };
+      setProfileData({
+        full_name: profile?.full_name || user?.user_metadata?.full_name || '',
+        email: email,
+        phone: profile?.phone || '',
+        address: profile?.address || '',
+        barangay: profile?.barangay || '',
+        city: profile?.city || '',
+        profile_image_url: profile?.profile_image_url || '',
+        id_document_url: profile?.id_document_url || '',
+      });
+      setProfileImagePreview(profile?.profile_image_url || null);
+      setIdDocumentPreview(profile?.id_document_url || null);
+      setShowEditProfile(true);
+    } catch (error) {
+      console.error('Failed to load profile:', error);
+      setProfileData({
+        full_name: user?.user_metadata?.full_name || '',
+        email: ownerEmail || user?.email || '',
+        phone: '',
+        address: '',
+        barangay: '',
+        city: '',
+        profile_image_url: '',
+        id_document_url: '',
+      });
+      setProfileImagePreview(null);
+      setIdDocumentPreview(null);
+      setShowEditProfile(true);
+    }
+  };
+
+  // Form states for adding vehicle
+  const [newvehicle, setNewvehicle] = useState<VehicleFormState>(createEmptyVehicleForm());
+  /** Device GPS shown on owner maps after the owner taps the map (browser geolocation). */
+  const [ownerMapUserGpsAdd, setOwnerMapUserGpsAdd] = useState<LatLng | null>(null);
+  const [ownerMapUserGpsEdit, setOwnerMapUserGpsEdit] = useState<LatLng | null>(null);
+  const [ownerMapUserGpsDetails, setOwnerMapUserGpsDetails] = useState<LatLng | null>(null);
+
+  const resetNewvehicleForm = () => {
+    setNewvehicle(createEmptyVehicleForm());
+    setOwnerMapUserGpsAdd(null);
+  };
+
+  const refreshOwnerDeviceGpsMarker = (setter: (pos: LatLng) => void) => {
+    void getBrowserPosition()
+      .then((pos) => setter(pos))
+      .catch((err) => console.warn('[OwnerDashboard] Geolocation:', err));
+  };
+
+  const handleRequestAddvehicle = async () => {
+    const requirementStatus = await refreshOwnerRequirements(user, ownerEmail || user?.email, true);
+
+    if (!requirementStatus.isComplete) {
+      return;
+    }
+
+    setOwnerMapUserGpsAdd(null);
+    setShowAddvehicle(true);
+  };
 
   // Replace mock data with live state
-  const [properties, setProperties] = useState<Property[]>([]);
+  const [Vehicles, setVehicles] = useState<vehicle[]>([]);
 
-  const [bookings, setBookings] = useState<BookingRequest[]>([]);
+  const [Rentals, setRentals] = useState<rentalRequest[]>([]);
   const [ownerEmail, setOwnerEmail] = useState<string>('');
   const [notifications, setNotifications] = useState<any[]>([]);
-  const [isAddingProperty, setIsAddingProperty] = useState(false);
+  const [isAddingvehicle, setIsAddingvehicle] = useState(false);
   const [showScrollTop, setShowScrollTop] = useState(false);
+  const [reservationCalendarMonth, setReservationCalendarMonth] = useState(() => {
+    const d = new Date();
+    return new Date(d.getFullYear(), d.getMonth(), 1);
+  });
+  const [reservationCalendarVehicleId, setReservationCalendarVehicleId] = useState<string>('all');
+
+  const reservationCalendarModel = useMemo(() => {
+    const year = reservationCalendarMonth.getFullYear();
+    const month = reservationCalendarMonth.getMonth();
+    const first = new Date(year, month, 1);
+    const last = new Date(year, month + 1, 0);
+    const daysInMonth = last.getDate();
+    const startWeekday = first.getDay();
+    const monthPrefix = `${year}-${String(month + 1).padStart(2, '0')}`;
+    const monthStartYmd = `${monthPrefix}-01`;
+    const monthEndYmd = `${monthPrefix}-${String(daysInMonth).padStart(2, '0')}`;
+    const todayYmd = getLocalDateYmd();
+
+    const filtered = Rentals.filter((r) => {
+      if (reservationCalendarVehicleId !== 'all' && r.vehicleId !== reservationCalendarVehicleId) {
+        return false;
+      }
+      if (!r.checkInDate || !r.checkOutDate) return false;
+      return reservationRangesOverlap(r.checkInDate, r.checkOutDate, monthStartYmd, monthEndYmd);
+    });
+
+    return {
+      year,
+      month,
+      daysInMonth,
+      startWeekday,
+      todayYmd,
+      monthStartYmd,
+      monthEndYmd,
+      monthListLabel: reservationCalendarMonth.toLocaleDateString(undefined, {
+        month: 'long',
+        year: 'numeric'
+      }),
+      rentalsInMonth: filtered
+    };
+  }, [Rentals, reservationCalendarMonth, reservationCalendarVehicleId]);
+
+  const newVehicleMapBoundary = useMemo((): SquareBoundary => {
+    if (newvehicle.boundaryPlacementMode === 'draw_four_corners') {
+      const filled = newvehicle.boundaryFourCorners.filter((c): c is LatLng => c != null);
+      const fromPts = filled.length >= 2 ? buildAxisAlignedBoundaryFromPoints(filled) : null;
+      if (fromPts) return fromPts;
+    }
+    if (
+      newvehicle.boundaryPlacementMode === 'draw_two_corners' &&
+      newvehicle.boundaryCornerFirst &&
+      newvehicle.boundaryCornerSecond
+    ) {
+      return buildRectangleBoundaryFromTwoCorners(
+        newvehicle.boundaryCornerFirst,
+        newvehicle.boundaryCornerSecond
+      );
+    }
+    return buildSquareBoundary(newvehicle.coordinates, Number(newvehicle.boundarySizeMeters));
+  }, [
+    newvehicle.boundaryPlacementMode,
+    newvehicle.boundaryCornerFirst,
+    newvehicle.boundaryCornerSecond,
+    newvehicle.boundaryFourCorners,
+    newvehicle.coordinates,
+    newvehicle.boundarySizeMeters,
+  ]);
+
   const [analytics, setAnalytics] = useState<OwnerAnalytics>({
-    totalProperties: 0,
-    totalBookings: 0,
+    totalVehicles: 0,
+    totalRentals: 0,
     averageRating: 0,
     occupancyRate: 0,
     totalRevenue: 0,
-    averageRevenuePerBooking: 0,
+    averageRevenuePerrental: 0,
     revenueTrends: [],
-    bookingTrends: [],
-    propertyPerformance: [],
+    rentalTrends: [],
+    vehiclePerformance: [],
     monthlyRevenue: [],
-    topPerformingProperties: [],
+    topPerformingVehicles: [],
     revenueByStatus: []
   });
   const [reviews, setReviews] = useState<Review[]>([]);
-  const [customAmenity, setCustomAmenity] = useState('');
-  const [editCustomAmenity, setEditCustomAmenity] = useState('');
   const [selectedMonth, setSelectedMonth] = useState<string>('all');
   const [showAllTenantsModal, setShowAllTenantsModal] = useState(false);
   const [selectedTenant, setSelectedTenant] = useState<any>(null);
   const [showTenantModal, setShowTenantModal] = useState(false);
   
-  // Rooms and Beds management
-  const [rooms, setRooms] = useState<any[]>([]);
-  const [beds, setBeds] = useState<any[]>([]);
-  const [showAddRoom, setShowAddRoom] = useState(false);
-  const [showAddBed, setShowAddBed] = useState(false);
-  const [selectedRoomForBed, setSelectedRoomForBed] = useState<string>('');
-  const [newRoom, setNewRoom] = useState({
-    room_number: '',
-    room_name: '',
-    max_beds: '',
-    price_per_bed: '',
-    status: 'available'
-  });
-  const [newBed, setNewBed] = useState({
-    bed_number: '',
-    bed_type: 'single',
-    deck_position: 'lower',
-    status: 'available',
-    price: ''
-  });
-  
   // Permits
   const [showPermits, setShowPermits] = useState(false);
-  const [permitFile, setPermitFile] = useState<File | null>(null);
-  const [permitPreview, setPermitPreview] = useState<string | null>(null);
-  const [propertyPermit, setPropertyPermit] = useState<string | null>(null);
+  const [vehiclePermit, setvehiclePermit] = useState<string | null>(null);
   
   // Report
   const [showReportProblem, setShowReportProblem] = useState(false);
 
-  // Load rooms and permit when property details modal opens
+  // Load permit when vehicle details modal opens
   React.useEffect(() => {
-    if (showPropertyDetails) {
-      const loadPropertyData = async () => {
+    if (showvehicleDetails) {
+      const loadvehicleData = async () => {
         try {
-          // Load rooms
-          const { data: roomsData } = await supabase
-            .from('rooms')
-            .select('*')
-            .eq('boarding_house_id', showPropertyDetails.id)
-            .order('room_number', { ascending: true });
-          setRooms(roomsData || []);
-          
-          // Load permit
           const { data: permitData } = await supabase
-            .from('properties')
+            .from('vehicles')
             .select('business_permit_url')
-            .eq('id', showPropertyDetails.id)
+            .eq('id', showvehicleDetails.id)
             .single();
-          setPropertyPermit(permitData?.business_permit_url || null);
+          setvehiclePermit(permitData?.business_permit_url || null);
         } catch (error) {
-          console.error('Failed to load property data:', error);
+          console.error('Failed to load vehicle data:', error);
         }
       };
-      loadPropertyData();
+      loadvehicleData();
     } else {
-      setRooms([]);
-      setBeds([]);
-      setPropertyPermit(null);
+      setvehiclePermit(null);
     }
-  }, [showPropertyDetails?.id]);
+  }, [showvehicleDetails?.id]);
 
   React.useEffect(() => {
     const loadData = async () => {
@@ -255,7 +747,7 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
         const currentUserEmail = userData?.user?.email || '';
         setUser(userData?.user);
         
-        // Resolve owner email: current user first, then localStorage, then from properties
+        // Resolve owner email: current user first, then localStorage, then from Vehicles
         let email = currentUserEmail;
         if (!email) {
           try { email = window.localStorage.getItem('ownerEmail') || ''; } catch {}
@@ -265,100 +757,114 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
 
         if (!email) {
           console.warn('No owner email found - cannot load owner-specific data');
-          setProperties([]);
-          setBookings([]);
+          setVehicles([]);
+          setRentals([]);
           setNotifications([]);
           return;
         }
 
-        // Load only properties owned by this user
-        const { data: props, error: propsErr } = await supabase
-          .from('properties')
-          .select('id, title, description, price, location, images, amenities, lat, lng, status, created_at, owner_email, rating, total_reviews, business_permit_url')
-          .eq('owner_email', email)
-          .order('created_at', { ascending: false });
+        // Load only Vehicles owned by this user (case-insensitive owner_email — DB may differ from auth email casing)
+        const ownerLookupEmails = recipientEmailVariants(email);
+        const { data: props, error: propsErr } =
+          ownerLookupEmails.length > 0
+            ? await supabase
+                .from('vehicles')
+                .select('*')
+                .in('owner_email', ownerLookupEmails)
+                .order('created_at', { ascending: false })
+            : { data: [], error: null as null };
         if (propsErr) throw propsErr;
-        const mappedProps: Property[] = (props || []).map((p: any) => ({
-          id: p.id,
-          title: p.title || '',
-          description: p.description || '',
-          price: Number(p.price) || 0,
-          location: p.location || '',
-          images: (Array.isArray(p.images) ? p.images : (p.images ? [p.images] : []))
-            .filter((path: any) => path && String(path).trim() !== '')
-            .map((path: any) => {
-              const str = String(path || '');
-              if (!str) return str;
-              if (/^https?:\/\//i.test(str)) return str;
-              const res = supabase.storage.from('property-images').getPublicUrl(str);
-              return res.data?.publicUrl || str;
-            }),
-          amenities: Array.isArray(p.amenities) ? p.amenities : [],
-          coordinates: { lat: p.lat, lng: p.lng },
-          status: (p.status === 'available' ? 'active' : p.status === 'pending' ? 'pending' : 'inactive'),
-          ownerEmail: p.owner_email || '',
-          rating: Number(p.rating) || 0,
-          isVerified: Boolean(p.is_verified),
-          business_permit_url: p.business_permit_url || null
-        }));
-        setProperties(mappedProps);
+        const mappedProps: vehicle[] = dedupeVehiclesById((props || []).map(mapVehicleRecord));
+        setVehicles(mappedProps);
+        const canonicalOwnerEmail =
+          mappedProps.length > 0 && mappedProps[0].ownerEmail?.trim()
+            ? mappedProps[0].ownerEmail.trim()
+            : email;
+        setOwnerEmail(canonicalOwnerEmail);
 
-        // Load only bookings for properties owned by this user
-        const propertyIds = mappedProps.map(p => p.id);
-        let mappedBookings: BookingRequest[] = [];
-        if (propertyIds.length > 0) {
+        // Load only Rentals for Vehicles owned by this user
+        const vehicleIds = mappedProps.map(p => p.id);
+        let mappedRentals: rentalRequest[] = [];
+        if (vehicleIds.length > 0) {
           const { data: books, error: booksErr } = await supabase
-            .from('bookings')
-            .select('id, property_id, client_name, client_email, message, status, created_at, total_amount')
-            .in('property_id', propertyIds)
+            .from('rentals')
+            .select('*')
+            .in('vehicle_id', vehicleIds)
             .order('created_at', { ascending: false });
           if (booksErr) throw booksErr;
-          mappedBookings = (books || []).map((b: any) => ({
+          mappedRentals = (books || []).map((b: any) => ({
             id: b.id,
-            propertyId: b.property_id,
-            clientName: b.client_name,
-            clientEmail: b.client_email,
-            message: b.message,
-            status: b.status as 'pending' | 'approved' | 'rejected',
+            vehicleId: b.vehicle_id,
+            clientName: b.full_name || b.tenant_email || 'Unknown renter',
+            clientEmail: b.tenant_email || '',
+            message: b.special_requests || '',
+            status: (b.status || 'pending') as 'pending' | 'approved' | 'rejected' | 'cancelled' | 'completed',
             createdAt: b.created_at,
-            totalAmount: b.total_amount || 0
+            totalAmount: b.total_amount || 0,
+            checkInDate: b.check_in_date,
+            checkOutDate: b.check_out_date,
+            phone: b.phone,
+            address: b.address,
+            barangay: b.barangay,
+            municipality_city: b.municipality_city,
+            id_document_url: b.id_document_url,
+            gender: b.gender,
+            age: b.age,
+            occupation_status: b.occupation_status,
+            citizenship: b.citizenship,
+            full_name: b.full_name,
+            tenant_email: b.tenant_email,
+            driver_license: b.driver_license ?? null,
+            specialRequests: b.special_requests || '',
+            rentalUnit: extractRentalUnitFromText(b.special_requests, b.message),
+            paymentStatus: (b.payment_status || 'pending') as rentalRequest['paymentStatus'],
+            paymentMethod: b.payment_method || extractPaymentMethodFromText(b.special_requests, b.message)
           }));
         }
-        setBookings(mappedBookings);
+        setRentals(mappedRentals);
 
-        // Load only notifications for this owner
-        const { data: notifs, error: notifErr } = await supabase
-          .from('notifications')
-          .select('id, recipient_email, booking_id, property_id, type, title, body, read_at, created_at')
-          .eq('recipient_email', email)
-          .order('created_at', { ascending: false });
+        // Load notifications (case variants so chat rows match vehicles.owner_email / conversation owner_email)
+        const notifRecipients = recipientEmailVariants(canonicalOwnerEmail);
+        const { data: notifs, error: notifErr } =
+          notifRecipients.length > 0
+            ? await supabase
+                .from('notifications')
+                .select('id, recipient_email, rental_id, vehicle_id, type, title, body, read_at, created_at')
+                .in('recipient_email', notifRecipients)
+                .order('created_at', { ascending: false })
+            : { data: [], error: null as null };
         if (notifErr) throw notifErr;
         setNotifications(notifs || []);
 
-        // Load reviews for owner's properties
-        const { data: reviewsData, error: reviewsErr } = await supabase
-          .from('reviews')
-          .select(`
-            id,
-            property_id,
-            client_name,
-            rating,
-            review_text,
-            created_at,
-            properties!inner(title, owner_email)
-          `)
-          .eq('properties.owner_email', email)
-          .eq('is_verified', true)
-          .order('created_at', { ascending: false });
-        if (reviewsErr) throw reviewsErr;
-        const mappedReviews: Review[] = (reviewsData || []).map((r: any) => ({
-          id: r.id,
-          propertyId: r.property_id,
-          clientName: r.client_name,
-          rating: r.rating,
-          reviewText: r.review_text,
-          createdAt: r.created_at
-        }));
+        await refreshOwnerRequirements(userData?.user, canonicalOwnerEmail, true);
+
+        // Reviews scoped by vehicle ids (avoids case-sensitive join on vehicles.owner_email)
+        let mappedReviews: Review[] = [];
+        if (vehicleIds.length > 0) {
+          const { data: reviewsData, error: reviewsErr } = await supabase
+            .from('reviews')
+            .select(`
+              id,
+              vehicle_id,
+              tenant_email,
+              rating,
+              review_text,
+              created_at,
+              vehicles(title)
+            `)
+            .in('vehicle_id', vehicleIds)
+            .eq('is_verified', true)
+            .order('created_at', { ascending: false });
+          if (reviewsErr) throw reviewsErr;
+          mappedReviews = (reviewsData || []).map((r: any) => ({
+            id: r.id,
+            vehicleId: r.vehicle_id,
+            clientName: r.tenant_email || 'Client',
+            rating: r.rating,
+            reviewText: r.review_text,
+            createdAt: r.created_at
+          }));
+        }
         setReviews(mappedReviews);
       } catch (e) {
         console.error('Failed to load owner data', e);
@@ -367,74 +873,150 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
     loadData();
   }, []);
 
+  useEffect(() => {
+    if (editingvehicle) {
+      setEditingBoundaryMapMode('tracker');
+      setEditingBoxFirstCorner(null);
+    }
+  }, [editingvehicle?.id]);
+
+  useEffect(() => {
+    if (!ownerEmail) return;
+    const variants = recipientEmailVariants(ownerEmail);
+    if (variants.length === 0) return;
+
+    const handleInsert = (payload: { new: Record<string, unknown> }) => {
+      const row = payload.new as {
+        id?: string;
+        title?: string;
+        body?: string;
+        type?: string;
+        recipient_email?: string;
+      };
+      if (!row?.id) return;
+      const allowed = new Set(variants.map((v) => v.toLowerCase()));
+      const rec = String(row.recipient_email || '').trim().toLowerCase();
+      if (rec && !allowed.has(rec)) return;
+
+      setNotifications((prev) => {
+        if (prev.some((n: { id: string }) => n.id === row.id)) return prev;
+        return [row, ...prev] as typeof prev;
+      });
+      const toastType = row.type === 'vehicle_boundary_alert' || row.type === 'chat_message';
+      if (
+        toastType &&
+        typeof window !== 'undefined' &&
+        'Notification' in window &&
+        Notification.permission === 'granted'
+      ) {
+        try {
+          const defaultTitle =
+            row.type === 'chat_message' ? 'New renter message' : 'Vehicle boundary alert';
+          new Notification(row.title || defaultTitle, {
+            body: row.body || '',
+            icon: '/logo.png',
+          });
+        } catch {
+          /* ignore */
+        }
+      }
+    };
+
+    const channels = variants.map((em, idx) =>
+      supabase
+        .channel(`owner-notifications-${idx}-${encodeURIComponent(em).slice(0, 48)}`)
+        .on(
+          'postgres_changes',
+          {
+            event: 'INSERT',
+            schema: 'public',
+            table: 'notifications',
+            filter: `recipient_email=eq.${em}`,
+          },
+          handleInsert
+        )
+        .subscribe()
+    );
+
+    return () => {
+      channels.forEach((c) => {
+        try {
+          void supabase.removeChannel(c);
+        } catch {
+          /* ignore */
+        }
+      });
+    };
+  }, [ownerEmail]);
+
   // Load analytics data
   React.useEffect(() => {
     const loadAnalytics = async () => {
       if (!ownerEmail) return;
       
       try {
-        // Get property IDs for this owner
-        const propertyIds = properties.map(p => p.id);
-        if (propertyIds.length === 0) return;
+        // Get vehicle IDs for this owner
+        const vehicleIds = Vehicles.map(p => p.id);
+        if (vehicleIds.length === 0) return;
 
-        // Filter bookings by month if selected
-        let filteredBookingsForStats = bookings;
+        // Filter Rentals by month if selected
+        let filteredRentalsForStats = Rentals;
         if (selectedMonth !== 'all') {
           const [year, month] = selectedMonth.split('-');
           const startDate = `${year}-${month}-01`;
           const endDate = `${year}-${month}-${new Date(parseInt(year), parseInt(month), 0).getDate()}`;
-          filteredBookingsForStats = bookings.filter(b => {
-            const bookingDate = b.createdAt.split('T')[0];
-            return bookingDate >= startDate && bookingDate <= endDate;
+          filteredRentalsForStats = Rentals.filter(b => {
+            const rentalDate = b.createdAt.split('T')[0];
+            return rentalDate >= startDate && rentalDate <= endDate;
           });
         }
 
         // Calculate basic stats
-        const totalProperties = properties.length;
-        const totalBookings = filteredBookingsForStats.length;
+        const totalVehicles = Vehicles.length;
+        const totalRentals = filteredRentalsForStats.length;
         
-        // Calculate average rating - use reviews if property rating is missing
+        // Calculate average rating - use reviews if vehicle rating is missing
         let totalRatingSum = 0;
-        let propertiesWithRatings = 0;
-        properties.forEach(property => {
-          const propertyReviews = reviews.filter(r => r.propertyId === property.id);
-          let propertyRating = property.rating || 0;
+        let VehiclesWithRatings = 0;
+        Vehicles.forEach(vehicle => {
+          const vehicleReviews = reviews.filter(r => r.vehicleId === vehicle.id);
+          let vehicleRating = vehicle.rating || 0;
           
-          // If property rating is 0 or missing, calculate from reviews
-          if ((!propertyRating || propertyRating === 0) && propertyReviews.length > 0) {
-            const totalRating = propertyReviews.reduce((sum, r) => sum + (r.rating || 0), 0);
-            propertyRating = totalRating / propertyReviews.length;
+          // If vehicle rating is 0 or missing, calculate from reviews
+          if ((!vehicleRating || vehicleRating === 0) && vehicleReviews.length > 0) {
+            const totalRating = vehicleReviews.reduce((sum, r) => sum + (r.rating || 0), 0);
+            vehicleRating = totalRating / vehicleReviews.length;
           }
           
-          if (propertyRating > 0) {
-            totalRatingSum += propertyRating;
-            propertiesWithRatings++;
+          if (vehicleRating > 0) {
+            totalRatingSum += vehicleRating;
+            VehiclesWithRatings++;
           }
         });
         
-        const averageRating = propertiesWithRatings > 0 
-          ? totalRatingSum / propertiesWithRatings 
+        const averageRating = VehiclesWithRatings > 0 
+          ? totalRatingSum / VehiclesWithRatings 
           : 0;
 
         // Calculate occupancy rate (simplified)
-        const approvedBookings = filteredBookingsForStats.filter(b => b.status === 'approved').length;
-        const occupancyRate = totalProperties > 0 ? (approvedBookings / totalProperties) * 100 : 0;
+        const approvedRentals = filteredRentalsForStats.filter(b => b.status === 'approved').length;
+        const occupancyRate = totalVehicles > 0 ? (approvedRentals / totalVehicles) * 100 : 0;
 
-        // Calculate total revenue from approved bookings
-        const totalRevenue = filteredBookingsForStats
+        // Calculate total revenue from approved Rentals
+        const totalRevenue = filteredRentalsForStats
           .filter(b => b.status === 'approved')
-          .reduce((sum, booking) => sum + (booking.totalAmount || 0), 0);
+          .reduce((sum, rental) => sum + (rental.totalAmount || 0), 0);
 
-        // Booking trends (filtered by month if selected)
-        const bookingTrends = [];
-        let filteredBookings = bookings;
+        // rental trends (filtered by month if selected)
+        const rentalTrends = [];
+        let filteredRentals = Rentals;
         if (selectedMonth !== 'all') {
           const [year, month] = selectedMonth.split('-');
           const startDate = `${year}-${month}-01`;
           const endDate = `${year}-${month}-${new Date(parseInt(year), parseInt(month), 0).getDate()}`;
-          filteredBookings = bookings.filter(b => {
-            const bookingDate = b.createdAt.split('T')[0];
-            return bookingDate >= startDate && bookingDate <= endDate;
+          filteredRentals = Rentals.filter(b => {
+            const rentalDate = b.createdAt.split('T')[0];
+            return rentalDate >= startDate && rentalDate <= endDate;
           });
         }
         
@@ -449,52 +1031,52 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
           date.setDate(date.getDate() - i);
           }
           const dateKey = date.toISOString().slice(0, 10);
-          const dayBookings = filteredBookings.filter(b => b.createdAt.startsWith(dateKey));
-          const dayRevenue = dayBookings
+          const dayRentals = filteredRentals.filter(b => b.createdAt.startsWith(dateKey));
+          const dayRevenue = dayRentals
             .filter(b => b.status === 'approved')
-            .reduce((sum, booking) => sum + (booking.totalAmount || 0), 0);
-          bookingTrends.push({ 
+            .reduce((sum, rental) => sum + (rental.totalAmount || 0), 0);
+          rentalTrends.push({ 
             date: dateKey, 
-            bookings: dayBookings.length,
+            Rentals: dayRentals.length,
             revenue: dayRevenue 
           });
         }
 
-        // Property performance
-        const propertyPerformance = properties.map(property => {
-          const propertyBookings = filteredBookingsForStats.filter(b => b.propertyId === property.id);
-          const propertyReviews = reviews.filter(r => r.propertyId === property.id);
+        // vehicle performance
+        const vehiclePerformance = Vehicles.map(vehicle => {
+          const vehicleRentals = filteredRentalsForStats.filter(b => b.vehicleId === vehicle.id);
+          const vehicleReviews = reviews.filter(r => r.vehicleId === vehicle.id);
           
-          // Calculate rating from reviews if property rating is missing or 0
-          let calculatedRating = property.rating || 0;
-          if ((!calculatedRating || calculatedRating === 0) && propertyReviews.length > 0) {
-            const totalRating = propertyReviews.reduce((sum, r) => sum + (r.rating || 0), 0);
-            calculatedRating = totalRating / propertyReviews.length;
+          // Calculate rating from reviews if vehicle rating is missing or 0
+          let calculatedRating = vehicle.rating || 0;
+          if ((!calculatedRating || calculatedRating === 0) && vehicleReviews.length > 0) {
+            const totalRating = vehicleReviews.reduce((sum, r) => sum + (r.rating || 0), 0);
+            calculatedRating = totalRating / vehicleReviews.length;
           }
           
-          // Calculate revenue from approved bookings for this property
-          const propertyRevenue = propertyBookings
+          // Calculate revenue from approved Rentals for this vehicle
+          const vehicleRevenue = vehicleRentals
             .filter(b => b.status === 'approved')
-            .reduce((sum, booking) => sum + (booking.totalAmount || 0), 0);
+            .reduce((sum, rental) => sum + (rental.totalAmount || 0), 0);
           
           return {
-            propertyId: property.id,
-            propertyTitle: property.title,
-            bookings: propertyBookings.length,
+            vehicleId: vehicle.id,
+            vehicleTitle: vehicle.title,
+            Rentals: vehicleRentals.length,
             rating: calculatedRating,
-            revenue: propertyRevenue,
-            averageRevenue: propertyBookings.length > 0 ? propertyRevenue / propertyBookings.length : 0
+            revenue: vehicleRevenue,
+            averageRevenue: vehicleRentals.length > 0 ? vehicleRevenue / vehicleRentals.length : 0
           };
         });
 
         // Calculate sales metrics
-        const approvedBookingsArray = filteredBookingsForStats.filter(b => b.status === 'approved');
-        const averageRevenuePerBooking = approvedBookingsArray.length > 0 
-          ? totalRevenue / approvedBookingsArray.length 
+        const approvedRentalsArray = filteredRentalsForStats.filter(b => b.status === 'approved');
+        const averageRevenuePerrental = approvedRentalsArray.length > 0 
+          ? totalRevenue / approvedRentalsArray.length 
           : 0;
 
         // Calculate revenue trends
-        const revenueTrends = bookingTrends.map(trend => ({
+        const revenueTrends = rentalTrends.map(trend => ({
           date: trend.date,
           revenue: trend.revenue
         }));
@@ -506,51 +1088,51 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
           date.setMonth(date.getMonth() - i);
           const monthKey = date.toISOString().slice(0, 7);
           
-          const monthBookings = bookings.filter(b => {
-            const bookingDate = b.createdAt.slice(0, 7);
-            return bookingDate === monthKey;
+          const monthRentals = Rentals.filter(b => {
+            const rentalDate = b.createdAt.slice(0, 7);
+            return rentalDate === monthKey;
           });
           
-          const monthRevenue = monthBookings
+          const monthRevenue = monthRentals
             .filter(b => b.status === 'approved')
-            .reduce((sum, booking) => sum + (booking.totalAmount || 0), 0);
+            .reduce((sum, rental) => sum + (rental.totalAmount || 0), 0);
           
           monthlyRevenue.push({
             month: monthKey,
             revenue: monthRevenue,
-            bookings: monthBookings.length
+            Rentals: monthRentals.length
           });
         }
 
-        // Top performing properties by revenue
-        const topPerformingProperties = [...propertyPerformance]
+        // Top performing Vehicles by revenue
+        const topPerformingVehicles = [...vehiclePerformance]
           .sort((a, b) => b.revenue - a.revenue)
           .slice(0, 5)
           .map(p => ({
-            propertyId: p.propertyId,
-            propertyTitle: p.propertyTitle,
+            vehicleId: p.vehicleId,
+            vehicleTitle: p.vehicleTitle,
             revenue: p.revenue
           }));
 
-        // Revenue by booking status
+        // Revenue by rental status
         const revenueByStatus = [
-          { status: 'approved', count: filteredBookingsForStats.filter(b => b.status === 'approved').length, revenue: totalRevenue },
-          { status: 'pending', count: filteredBookingsForStats.filter(b => b.status === 'pending').length, revenue: 0 },
-          { status: 'rejected', count: filteredBookingsForStats.filter(b => b.status === 'rejected').length, revenue: 0 }
+          { status: 'approved', count: filteredRentalsForStats.filter(b => b.status === 'approved').length, revenue: totalRevenue },
+          { status: 'pending', count: filteredRentalsForStats.filter(b => b.status === 'pending').length, revenue: 0 },
+          { status: 'rejected', count: filteredRentalsForStats.filter(b => b.status === 'rejected').length, revenue: 0 }
         ];
 
         setAnalytics({
-          totalProperties,
-          totalBookings,
+          totalVehicles,
+          totalRentals,
           averageRating,
           occupancyRate,
           totalRevenue,
-          averageRevenuePerBooking,
+          averageRevenuePerrental,
           revenueTrends,
-          bookingTrends,
-          propertyPerformance,
+          rentalTrends,
+          vehiclePerformance,
           monthlyRevenue,
-          topPerformingProperties,
+          topPerformingVehicles,
           revenueByStatus
         });
       } catch (e) {
@@ -558,11 +1140,11 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
       }
     };
     loadAnalytics();
-  }, [ownerEmail, properties, bookings, selectedMonth]);
+  }, [ownerEmail, Vehicles, Rentals, selectedMonth]);
 
   React.useEffect(() => {
-    // Guard: only allow landlord role
-    const enforceLandlordRole = async () => {
+    // Guard: only allow vehicle owner role
+    const enforceVehicleOwnerRole = async () => {
       try {
         const { data: { user } } = await supabase.auth.getUser();
         if (!user) {
@@ -581,7 +1163,7 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
 
         if (!appUser && (status === 406 || appUserError?.code === 'PGRST116' || !appUserError)) {
           if (metaRole !== 'owner') {
-            alert('Access denied: landlord role required.');
+            alert('Access denied: vehicle owner role required.');
             onBack();
             return;
           }
@@ -602,18 +1184,18 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
 
         const effectiveRole = appUser?.role || metaRole;
         if (effectiveRole !== 'owner') {
-          alert('Access denied: landlord role required.');
+          alert('Access denied: vehicle owner role required.');
           onBack();
           return;
         }
       } catch (e: any) {
         console.error('Role validation failed', e);
-        alert('Access denied: landlord role required.');
+        alert('Access denied: vehicle owner role required.');
         onBack();
         return;
       }
     };
-    enforceLandlordRole();
+    enforceVehicleOwnerRole();
   }, [onBack]);
 
   // Handle scroll to show/hide scroll-to-top button
@@ -634,73 +1216,224 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
     });
   };
 
-  const handleDeleteProperty = async (propertyId: string) => {
-    if (window.confirm('Are you sure you want to delete this property?')) {
+  const handleDeletevehicle = async (vehicleId: string) => {
+    if (window.confirm('Are you sure you want to delete this vehicle?')) {
         try {
             const { error } = await supabase
-                .from('properties')
+                .from('vehicles')
                 .delete()
-                .eq('id', propertyId);
+                .eq('id', vehicleId);
 
             if (error) {
                 throw error;
             }
 
-            setProperties(properties.filter(p => p.id !== propertyId));
-            setShowPropertyDetails(null);
-            alert('Property deleted successfully!');
+            setVehicles(Vehicles.filter(p => p.id !== vehicleId));
+            setOwnerMapUserGpsDetails(null);
+            setShowvehicleDetails(null);
+            alert('vehicle deleted successfully!');
         } catch (error) {
-            console.error('Error deleting property:', error);
-            alert('Failed to delete property');
+            console.error('Error deleting vehicle:', error);
+            alert('Failed to delete vehicle');
         }
     }
   };
 
-  const handleUpdateProperty = async () => {
-    if (editingProperty) {
-        try {
-            const { error } = await supabase
-                .from('properties')
-                .update({
-                    title: editingProperty.title,
-                    description: editingProperty.description,
-                    price: editingProperty.price,
-                    location: editingProperty.location,
-                    amenities: editingProperty.amenities,
-                })
-                .eq('id', editingProperty.id);
+  const trackVehicleFromUserDevice = async (vehicle: vehicle) => {
+    try {
+      const position = await getBrowserPosition();
+      const { data, error } = await updateVehicleWithColumnFallback(supabase, vehicle.id, {
+        current_lat: position.lat,
+        current_lng: position.lng,
+        tracking_enabled: true,
+        tracking_provider: vehicle.trackingProvider || 'User device GPS',
+        tracking_last_ping: new Date().toISOString(),
+      });
 
-            if (error) {
-                throw error;
-            }
+      if (error) throw error;
 
-            setProperties(properties.map(p => p.id === editingProperty.id ? editingProperty : p));
-            setEditingProperty(null);
-            setShowPropertyDetails(editingProperty);
-            alert('Property updated successfully!');
-        } catch (error) {
-            console.error('Error updating property:', error);
-            alert('Failed to update property');
-        }
+      const updatedVehicle = mapVehicleRecord(data as any);
+      setVehicles((prev) => prev.map((item) => (item.id === updatedVehicle.id ? updatedVehicle : item)));
+      setOwnerMapUserGpsDetails(null);
+      setShowvehicleDetails(updatedVehicle);
+
+      if (!isPointWithinBoundary(updatedVehicle.currentCoordinates, updatedVehicle.boundary)) {
+        alert(
+          'Position saved. This location is outside the vehicle\'s allowed boundary. Active renters and your account are notified when the database geofence trigger is enabled.'
+        );
+      }
+    } catch (error: any) {
+      alert(error?.message || 'Unable to track this user device. Please allow location access and try again.');
     }
   };
 
-  const handleAddProperty = async () => {
-    // Validate required fields
-    if (!newProperty.title || !newProperty.description || !newProperty.price || !newProperty.location) {
-      alert('Please fill in all required fields: Title, Description, Price, and Location');
+  const openRentalTrackerOnMap = async (rental: rentalRequest) => {
+    const bookedVehicle = Vehicles.find((vehicle) => vehicle.id === rental.vehicleId);
+
+    if (!bookedVehicle) {
+      alert('Unable to find the vehicle for this booking.');
       return;
     }
 
-    // Validate coordinates
-    if (!newProperty.coordinates || 
-        !newProperty.coordinates.lat || 
-        !newProperty.coordinates.lng || 
-        newProperty.coordinates.lat === 0 || 
-        newProperty.coordinates.lng === 0 ||
-        isNaN(newProperty.coordinates.lat) ||
-        isNaN(newProperty.coordinates.lng)) {
-      alert('Please click on the map to set the property location. Coordinates are required.');
+    try {
+      const { data, error } = await updateVehicleWithColumnFallback(supabase, bookedVehicle.id, {
+        renter_tracking_requested_at: new Date().toISOString(),
+        tracking_enabled: true,
+        tracking_provider: 'Renter device GPS',
+      });
+      if (error) {
+        console.warn('Could not request renter GPS:', error);
+      } else if (data) {
+        const updated = mapVehicleRecord(data as any);
+        setVehicles((prev) => prev.map((item) => (item.id === updated.id ? updated : item)));
+        setOwnerMapUserGpsDetails(null);
+        setShowvehicleDetails(updated);
+        return;
+      }
+    } catch (e) {
+      console.warn('renter_tracking_requested_at update failed', e);
+    }
+
+    setOwnerMapUserGpsDetails(null);
+    setShowvehicleDetails(bookedVehicle);
+  };
+
+  const handleUpdatevehicle = async () => {
+    if (editingvehicle) {
+      const nextRates = getRentalRates(editingvehicle.rentalRates);
+      const boundary = editingvehicle.boundary;
+      const boundarySizeMeters = normalizeBoundarySize(boundary?.sizeMeters ?? editingvehicle.boundarySizeMeters);
+
+      if (!editingvehicle.title.trim() || !editingvehicle.description.trim() || !editingvehicle.location.trim()) {
+        alert('Please complete the title, description, and location fields.');
+        return;
+      }
+
+      if (!RENTAL_UNITS.every((unit) => nextRates[unit] > 0)) {
+        alert('Please enter valid rates for hour, day, week, and month.');
+        return;
+      }
+
+      if (!isValidLatLng(editingvehicle.coordinates)) {
+        alert('Please provide a valid vehicle location.');
+        return;
+      }
+
+      if (!isValidLatLng(editingvehicle.currentCoordinates)) {
+        alert('Please provide a valid current vehicle position.');
+        return;
+      }
+
+      try {
+        const { data: updatedVehicleData, error } = await updateVehicleWithColumnFallback(
+          supabase,
+          editingvehicle.id,
+          {
+            title: editingvehicle.title.trim(),
+            description: editingvehicle.description.trim(),
+            price: nextRates.day,
+            hourly_rate: nextRates.hour,
+            daily_rate: nextRates.day,
+            weekly_rate: nextRates.week,
+            monthly_rate: nextRates.month,
+            location: editingvehicle.location.trim(),
+            amenities: editingvehicle.amenities || [],
+            lat: editingvehicle.coordinates.lat,
+            lng: editingvehicle.coordinates.lng,
+            current_lat: editingvehicle.currentCoordinates.lat,
+            current_lng: editingvehicle.currentCoordinates.lng,
+            tracking_device_id: editingvehicle.trackingDeviceId?.trim() || null,
+            tracking_enabled: Boolean(editingvehicle.trackingEnabled),
+            tracking_provider: editingvehicle.trackingProvider?.trim() || 'Manual GPS',
+            tracking_last_ping: Boolean(editingvehicle.trackingEnabled)
+              ? new Date().toISOString()
+              : editingvehicle.trackingLastPing || null,
+            boundary_size_meters: boundarySizeMeters,
+            boundary_north_lat: boundary.northLat,
+            boundary_south_lat: boundary.southLat,
+            boundary_east_lng: boundary.eastLng,
+            boundary_west_lng: boundary.westLng,
+            out_of_boundary_penalty_php: parseOutOfBoundaryPenaltyPeso(
+              editingvehicle.outOfBoundaryPenaltyPhp
+            ),
+          }
+        );
+
+        if (error) {
+          throw error;
+        }
+
+        const updatedVehicle = mapVehicleRecord(updatedVehicleData as any);
+        setVehicles((prev) => prev.map((item) => (item.id === updatedVehicle.id ? updatedVehicle : item)));
+        setOwnerMapUserGpsEdit(null);
+        setEditingvehicle(null);
+        setShowvehicleDetails(updatedVehicle);
+
+        if (ownerEmail) {
+          const nv = recipientEmailVariants(ownerEmail);
+          if (nv.length > 0) {
+            const { data: latestNotifications } = await supabase
+              .from('notifications')
+              .select('id, recipient_email, rental_id, vehicle_id, type, title, body, read_at, created_at')
+              .in('recipient_email', nv)
+              .order('created_at', { ascending: false });
+
+            if (latestNotifications) {
+              setNotifications(latestNotifications);
+            }
+          }
+        }
+
+        alert('vehicle updated successfully!');
+      } catch (error: unknown) {
+        console.error('Error updating vehicle:', error);
+        const msg =
+          error && typeof error === 'object' && 'message' in error
+            ? String((error as { message?: string }).message)
+            : '';
+        alert(msg ? `Failed to update vehicle: ${msg}` : 'Failed to update vehicle');
+      }
+    }
+  };
+
+  const handleAddvehicle = async () => {
+    // Validate required fields
+    if (!newvehicle.title.trim() || !newvehicle.description.trim() || !newvehicle.location.trim()) {
+      alert('Please fill in all required fields: Title, Description, Location, and all rent rates.');
+      return;
+    }
+
+    const rateValues = parseVehicleRates(newvehicle.rates);
+    if (!rateValues) {
+      alert('Please enter valid positive rates for hour, day, week, and month.');
+      return;
+    }
+
+    if (!isValidLatLng(newvehicle.coordinates)) {
+      alert('Please click on the map to set the vehicle location. Coordinates are required.');
+      return;
+    }
+
+    if (newvehicle.boundaryPlacementMode === 'draw_two_corners') {
+      if (!newvehicle.boundaryCornerFirst || !newvehicle.boundaryCornerSecond) {
+        alert(
+          'Finish drawing the allowed area: tap the map twice — first one corner (left/bottom side), then the opposite corner (right/top).'
+        );
+        return;
+      }
+    }
+
+    if (newvehicle.boundaryPlacementMode === 'draw_four_corners') {
+      if (!newvehicle.boundaryFourCorners.every((c) => c != null)) {
+        alert(
+          'Finish drawing the allowed area: tap the map four times in order — top-right (TR), top-left (TL), bottom-right (BR), bottom-left (BL).'
+        );
+        return;
+      }
+    }
+
+    if (!isValidLatLng(newvehicle.currentCoordinates)) {
+      alert('Please provide a valid current vehicle position.');
       return;
     }
 
@@ -710,71 +1443,128 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
       return;
     }
 
-      setIsAddingProperty(true);
-      try {
-        // Upload images to Supabase storage
-        const uploadedImagePaths: string[] = [];
-        
-        for (let i = 0; i < newProperty.images.length; i++) {
-          const file = newProperty.images[i];
-          const fileExt = file.name.split('.').pop();
-          const fileName = `${Date.now()}-${i}.${fileExt}`;
-          const filePath = `properties/${fileName}`;
-          
-          const { error: uploadError } = await supabase.storage
-            .from('property-images')
-            .upload(filePath, file);
-          
-          if (uploadError) {
-            console.error('Error uploading image:', uploadError);
-          alert(`Failed to upload image: ${file.name}\nError: ${uploadError.message}`);
-            setIsAddingProperty(false);
-            return;
-          }
-          
-          uploadedImagePaths.push(filePath);
-        }
+    const requirementStatus = await refreshOwnerRequirements(user, ownerEmail, true);
+    if (!requirementStatus.isComplete) {
+      return;
+    }
 
-      // Validate price is a valid number
-      const priceValue = parseInt(newProperty.price);
-      if (isNaN(priceValue) || priceValue <= 0) {
-        alert('Please enter a valid price (must be a positive number)');
-        setIsAddingProperty(false);
-        return;
+    setIsAddingvehicle(true);
+    try {
+      // Upload images to Supabase storage
+      const uploadedImageUrls: string[] = [];
+      
+      for (let i = 0; i < newvehicle.images.length; i++) {
+        const file = newvehicle.images[i];
+        const fileExt = file.name.split('.').pop();
+        const fileName = `${Date.now()}-${i}.${fileExt}`;
+        const filePath = `Vehicles/${fileName}`;
+
+        try {
+          const uploadResult = await uploadFileWithBucketFallback({
+            buckets: VEHICLE_ASSET_BUCKETS,
+            path: filePath,
+            file,
+            upsert: true,
+          });
+
+          uploadedImageUrls.push(uploadResult.publicUrl);
+        } catch (uploadError: any) {
+          console.error('Error uploading image:', uploadError);
+          alert(`Failed to upload image: ${file.name}\nError: ${uploadError.message}`);
+          setIsAddingvehicle(false);
+          return;
+        }
       }
 
-      console.log('Creating property with data:', {
-        title: newProperty.title,
-        description: newProperty.description,
-        price: priceValue,
-        location: newProperty.location,
-        lat: newProperty.coordinates.lat,
-        lng: newProperty.coordinates.lng,
+      let boundary: SquareBoundary;
+      let listingLat: number;
+      let listingLng: number;
+      if (
+        newvehicle.boundaryPlacementMode === 'draw_four_corners' &&
+        newvehicle.boundaryFourCorners.every((c) => c != null)
+      ) {
+        const pts = newvehicle.boundaryFourCorners.filter((c): c is LatLng => c != null);
+        const rect = buildAxisAlignedBoundaryFromPoints(pts);
+        if (!rect) {
+          alert('Could not build the allowed area from the four corners. Please tap all four corners again.');
+          setIsAddingvehicle(false);
+          return;
+        }
+        boundary = rect;
+        const c = getBoundaryCenter(boundary);
+        listingLat = c.lat;
+        listingLng = c.lng;
+      } else if (
+        newvehicle.boundaryPlacementMode === 'draw_two_corners' &&
+        newvehicle.boundaryCornerFirst &&
+        newvehicle.boundaryCornerSecond
+      ) {
+        boundary = buildRectangleBoundaryFromTwoCorners(
+          newvehicle.boundaryCornerFirst,
+          newvehicle.boundaryCornerSecond
+        );
+        const c = getBoundaryCenter(boundary);
+        listingLat = c.lat;
+        listingLng = c.lng;
+      } else {
+        const boundarySizeMeters = normalizeBoundarySize(Number(newvehicle.boundarySizeMeters));
+        boundary = buildSquareBoundary(newvehicle.coordinates, boundarySizeMeters);
+        listingLat = newvehicle.coordinates.lat;
+        listingLng = newvehicle.coordinates.lng;
+      }
+      const boundarySizeForDb = normalizeBoundarySize(boundary.sizeMeters);
+
+      console.log('Creating vehicle with data:', {
+        title: newvehicle.title,
+        description: newvehicle.description,
+        rates: rateValues,
+        location: newvehicle.location,
+        amenities: newvehicle.amenities,
+        lat: listingLat,
+        lng: listingLng,
+        current_lat: newvehicle.currentCoordinates.lat,
+        current_lng: newvehicle.currentCoordinates.lng,
+        boundary_size_meters: boundarySizeForDb,
         owner_email: ownerEmail,
-        images: uploadedImagePaths,
-        amenities: newProperty.amenities
+        images: uploadedImageUrls,
       });
 
-        // Create property in database according to the exact schema
-        const { data: propertyData, error: insertError } = await supabase
-          .from('properties')
+        // Create vehicle in database according to the exact schema
+        const { data: vehicleData, error: insertError } = await supabase
+          .from('vehicles')
           .insert([{
-          title: newProperty.title.trim(),
-          description: newProperty.description.trim(),
-          price: priceValue,
-          location: newProperty.location.trim(),
-            images: uploadedImagePaths.length > 0 ? uploadedImagePaths : [],
-            amenities: newProperty.amenities.length > 0 ? newProperty.amenities : [],
-            lat: newProperty.coordinates.lat,
-            lng: newProperty.coordinates.lng,
-          status: 'available', // Changed from 'pending' to match database constraint
+            title: newvehicle.title.trim(),
+            description: newvehicle.description.trim(),
+            price: rateValues.day,
+            hourly_rate: rateValues.hour,
+            daily_rate: rateValues.day,
+            weekly_rate: rateValues.week,
+            monthly_rate: rateValues.month,
+            location: newvehicle.location.trim(),
+            images: uploadedImageUrls.length > 0 ? uploadedImageUrls : [],
+            amenities: newvehicle.amenities,
+            lat: listingLat,
+            lng: listingLng,
+            current_lat: newvehicle.currentCoordinates.lat,
+            current_lng: newvehicle.currentCoordinates.lng,
+            tracking_device_id: newvehicle.trackingDeviceId.trim() || null,
+            tracking_enabled: newvehicle.trackingEnabled,
+            tracking_provider: newvehicle.trackingProvider.trim() || 'Manual GPS',
+            tracking_last_ping: newvehicle.trackingEnabled ? new Date().toISOString() : null,
+            boundary_size_meters: boundarySizeForDb,
+            boundary_north_lat: boundary.northLat,
+            boundary_south_lat: boundary.southLat,
+            boundary_east_lng: boundary.eastLng,
+            boundary_west_lng: boundary.westLng,
+            out_of_boundary_penalty_php: parseOutOfBoundaryPenaltyPeso(newvehicle.outOfBoundaryPenaltyPhp),
+            status: 'available',
             owner_email: ownerEmail
           }])
           .select()
           .single();
 
         if (insertError) {
-          console.error('Error creating property:', insertError);
+          console.error('Error creating vehicle:', insertError);
         console.error('Error details:', {
           message: insertError.message,
           details: insertError.details,
@@ -783,7 +1573,7 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
         });
         
         // Show detailed error message
-        let errorMessage = 'Failed to create property';
+        let errorMessage = 'Failed to create vehicle';
         if (insertError.message) {
           errorMessage += `: ${insertError.message}`;
         }
@@ -791,153 +1581,213 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
           errorMessage += `\n\nHint: ${insertError.hint}`;
         }
         if (insertError.code === '42501') {
-          errorMessage += '\n\nThis might be a permissions issue. Please check your database policies.';
+          errorMessage += '\n\nThis might be a permissions issue. Please check your access policies.';
         }
         
         alert(errorMessage);
-        setIsAddingProperty(false);
+        setIsAddingvehicle(false);
           return;
         }
 
-        // Add to local state
-        const property: Property = {
-          id: propertyData.id,
-          title: propertyData.title,
-          description: propertyData.description,
-          price: propertyData.price,
-          location: propertyData.location,
-          images: uploadedImagePaths.map(path => {
-            const res = supabase.storage.from('property-images').getPublicUrl(path);
-            return res.data?.publicUrl || path;
-          }),
-          amenities: propertyData.amenities,
-          coordinates: { lat: propertyData.lat, lng: propertyData.lng },
-          status: propertyData.status === 'available' ? 'active' : propertyData.status === 'full' ? 'inactive' : 'active',
-          isVerified: Boolean(propertyData.is_verified),
-          ownerEmail: propertyData.owner_email
-        };
-        
-        setProperties([property, ...properties]);
-        setNewProperty({
-          title: '',
-          description: '',
-          price: '',
-          location: '',
-          amenities: [],
-          coordinates: { lat: 0, lng: 0 },
-          images: []
+        const vehicle = mapVehicleRecord(vehicleData);
+
+        setVehicles((prev) => {
+          const withoutDuplicate = prev.filter((item) => item.id !== vehicle.id);
+          return [vehicle, ...withoutDuplicate];
         });
-        setShowAddProperty(false);
+        resetNewvehicleForm();
+        setShowAddvehicle(false);
         
-        alert('Property added successfully! It is now visible to tenants.');
+        alert('vehicle added successfully! It is now visible to clients.');
       } catch (error: any) {
-        console.error('Error adding property:', error);
+        console.error('Error adding vehicle:', error);
         const errorMessage = error?.message || error?.toString() || 'Unknown error occurred';
-        alert(`Failed to add property: ${errorMessage}`);
+        alert(`Failed to add vehicle: ${errorMessage}`);
       } finally {
-        setIsAddingProperty(false);
+        setIsAddingvehicle(false);
     }
   };
 
-  const handleBookingAction = async (bookingId: string, action: 'approve' | 'reject') => {
+  const handlerentalAction = async (rentalId: string, action: 'approve' | 'reject') => {
     try {
       const newStatus = action === 'approve' ? 'approved' : 'rejected';
+      const targetRental = Rentals.find((rental) => rental.id === rentalId);
+
+      if (!targetRental) {
+        alert('Rental request not found.');
+        return;
+      }
+
+      if (action === 'approve') {
+        const targetIn = targetRental.checkInDate;
+        const targetOut = targetRental.checkOutDate;
+
+        if (targetIn && targetOut) {
+          const overlappingApproved = Rentals.find((rental) => {
+            if (rental.id === rentalId) return false;
+            if (rental.vehicleId !== targetRental.vehicleId) return false;
+            if (rental.status !== 'approved') return false;
+            if (!rental.checkInDate || !rental.checkOutDate) return true;
+            return reservationRangesOverlap(targetIn, targetOut, rental.checkInDate, rental.checkOutDate);
+          });
+
+          if (overlappingApproved) {
+            alert(
+              'These dates overlap another approved booking. Use the reservation calendar to pick a free window, or complete the other rental first.'
+            );
+            return;
+          }
+        } else {
+          const legacyBlock = Rentals.find(
+            (rental) =>
+              rental.vehicleId === targetRental.vehicleId &&
+              rental.id !== rentalId &&
+              rental.status === 'approved' &&
+              (!rental.checkOutDate || new Date(rental.checkOutDate) >= new Date())
+          );
+          if (legacyBlock) {
+            alert('This vehicle already has an active approved rental. Finish the current rent before approving another request.');
+            return;
+          }
+        }
+      }
       
-      // Update booking status in database
+      // Update rental status in database
       const { error: updateError } = await supabase
-        .from('bookings')
+        .from('rentals')
         .update({ status: newStatus })
-        .eq('id', bookingId);
+        .eq('id', rentalId);
       
       if (updateError) {
-        console.error('Error updating booking status:', updateError);
-        alert('Failed to update booking status');
+        console.error('Error updating rental status:', updateError);
+        const detail = [updateError.message, updateError.code ? `(${updateError.code})` : '']
+          .filter(Boolean)
+          .join(' ');
+        alert(
+          `Failed to update rental status: ${detail}\n\nIf you see permission denied for table users, run fix_rentals_owner_rls.sql in Supabase (rooms RLS must not query auth.users). Otherwise owners need UPDATE on rentals for their vehicles.`
+        );
         return;
+      }
+
+      if (action === 'approve') {
+        const today = getLocalDateYmd();
+        const hasDates = Boolean(targetRental.checkInDate && targetRental.checkOutDate);
+        const shouldMarkRented =
+          !hasDates ||
+          (targetRental.checkInDate! <= today && targetRental.checkOutDate! >= today);
+
+        if (shouldMarkRented) {
+          const { error: vehicleStatusError } = await supabase
+            .from('vehicles')
+            .update({ status: 'rented' })
+            .eq('id', targetRental.vehicleId);
+
+          if (vehicleStatusError) {
+            console.error('Error locking rented vehicle:', vehicleStatusError);
+            alert('Rental approved, but the vehicle could not be locked. Please update the vehicle status manually.');
+          } else {
+            setVehicles((prev) =>
+              prev.map((vehicle) =>
+                vehicle.id === targetRental.vehicleId ? { ...vehicle, status: 'rented' } : vehicle
+              )
+            );
+          }
+        }
       }
       
       // Update local state
-      setBookings(bookings.map((booking) => (
-        booking.id === bookingId 
-          ? { ...booking, status: newStatus as 'approved' | 'rejected' }
-          : booking
+      setRentals(Rentals.map((rental) => (
+        rental.id === rentalId 
+          ? { ...rental, status: newStatus as 'approved' | 'rejected' }
+          : rental
       )));
       
       try {
-        const booking = bookings.find(b => b.id === bookingId);
-        const property = booking ? properties.find(p => p.id === booking.propertyId) : null;
-        const toEmail = (booking?.clientEmail || '').trim();
-        if (booking && toEmail) {
-           console.log(`Sending decision email to ${booking.clientEmail} for booking ${bookingId}`);
+        const rental = Rentals.find(b => b.id === rentalId);
+        const vehicle = rental ? Vehicles.find(p => p.id === rental.vehicleId) : null;
+        const toEmail = (rental?.clientEmail || '').trim();
+        if (rental && toEmail) {
+           console.log(`Sending decision email to ${rental.clientEmail} for rental ${rentalId}`);
            const emailResult = await sendTenantDecisionEmail({
             toEmail,
-            clientName: booking.clientName,
-            propertyTitle: property?.title,
+            clientName: rental.clientName,
+            vehicleTitle: vehicle?.title,
             decision: newStatus === 'approved' ? 'approved' : 'rejected',
-            ownerName: user?.user_metadata?.full_name || 'Landlord',
+            ownerName: user?.user_metadata?.full_name || 'vehicle owner',
            });
 
           if (!emailResult.success) {
             alert(`Status updated, but email failed to send: ${emailResult.error?.text || 'Unknown error'}`);
           }
         } else {
-          console.warn('Cannot send email: Booking or client email missing', { booking });
+          console.warn('Cannot send email: rental or client email missing', { rental });
         }
       } catch (emailErr) {
         console.error('Failed to send tenant decision email:', emailErr);
       }
 
       // Show success message
-      alert(`Booking ${action}d successfully!`);
+      alert(`rental ${action}d successfully!`);
+    } catch (error: any) {
+      console.error('Error handling rental action:', error);
+      alert(`Failed to update rental status: ${error?.message || error || 'Unknown error'}`);
+    }
+  };
+
+  const finishRental = async (rental: rentalRequest) => {
+    try {
+      const { error: rentalError } = await supabase
+        .from('rentals')
+        .update({ status: 'completed' })
+        .eq('id', rental.id);
+
+      if (rentalError) throw rentalError;
+
+      const { error: vehicleError } = await supabase
+        .from('vehicles')
+        .update({ status: 'available' })
+        .eq('id', rental.vehicleId);
+
+      if (vehicleError) throw vehicleError;
+
+      setRentals((prev) =>
+        prev.map((item) => (item.id === rental.id ? { ...item, status: 'completed' } : item))
+      );
+      setVehicles((prev) =>
+        prev.map((vehicle) =>
+          vehicle.id === rental.vehicleId ? { ...vehicle, status: 'available' } : vehicle
+        )
+      );
+
+      alert('Rent finished. The vehicle is now available again.');
+    } catch (error: any) {
+      console.error('Failed to finish rent:', error);
+      alert(error?.message || 'Failed to finish rent.');
+    }
+  };
+
+  const handlePaymentStatusChange = async (
+    rentalId: string,
+    paymentStatus: NonNullable<rentalRequest['paymentStatus']>
+  ) => {
+    try {
+      const { error } = await supabase
+        .from('rentals')
+        .update({ payment_status: paymentStatus })
+        .eq('id', rentalId);
+
+      if (error) {
+        console.error('Error updating payment status:', error);
+        alert('Failed to update payment status. Please make sure the payment_status column exists in your rentals table.');
+        return;
+      }
+
+      setRentals(Rentals.map((rental) => (
+        rental.id === rentalId ? { ...rental, paymentStatus } : rental
+      )));
     } catch (error) {
-      console.error('Error handling booking action:', error);
-      alert('Failed to update booking status');
-    }
-  };
-
-  const toggleAmenity = (amenity: string) => {
-    setNewProperty(prev => ({
-      ...prev,
-      amenities: prev.amenities.includes(amenity)
-        ? prev.amenities.filter(a => a !== amenity)
-        : [...prev.amenities, amenity]
-    }));
-  };
-
-  const addCustomAmenity = () => {
-    const trimmedAmenity = customAmenity.trim();
-    if (trimmedAmenity && !newProperty.amenities.includes(trimmedAmenity)) {
-      setNewProperty(prev => ({
-        ...prev,
-        amenities: [...prev.amenities, trimmedAmenity]
-      }));
-      setCustomAmenity('');
-    }
-  };
-
-  const removeAmenity = (amenity: string) => {
-    setNewProperty(prev => ({
-      ...prev,
-      amenities: prev.amenities.filter(a => a !== amenity)
-    }));
-  };
-
-  const addEditCustomAmenity = () => {
-    const trimmedAmenity = editCustomAmenity.trim();
-    if (trimmedAmenity && editingProperty && !editingProperty.amenities.includes(trimmedAmenity)) {
-      setEditingProperty({
-        ...editingProperty,
-        amenities: [...editingProperty.amenities, trimmedAmenity]
-      });
-      setEditCustomAmenity('');
-    }
-  };
-
-  const removeEditAmenity = (amenity: string) => {
-    if (editingProperty) {
-      setEditingProperty({
-        ...editingProperty,
-        amenities: editingProperty.amenities.filter(a => a !== amenity)
-      });
+      console.error('Failed to update payment status:', error);
+      alert('Failed to update payment status');
     }
   };
 
@@ -951,8 +1801,8 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
       // Analytics Summary Sheet
       const summaryData = [
         ['Metric', 'Value'],
-        ['Total Properties', analytics.totalProperties],
-        ['Total Bookings', analytics.totalBookings],
+        ['Total Vehicles', analytics.totalVehicles],
+        ['Total Rentals', analytics.totalRentals],
         ['Average Rating', analytics.averageRating.toFixed(2)],
         ['Occupancy Rate', `${analytics.occupancyRate.toFixed(2)}%`],
         ['Time Period', selectedMonth !== 'all' ? selectedMonth : 'All Months'],
@@ -961,21 +1811,21 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
       const summarySheet = XLSX.utils.aoa_to_sheet(summaryData);
       XLSX.utils.book_append_sheet(workbook, summarySheet, 'Summary');
 
-      // Booking Trends Sheet
+      // rental Trends Sheet
       const trendsData = [
-        ['Date', 'Bookings'],
-        ...analytics.bookingTrends.map(t => [t.date, t.bookings])
+        ['Date', 'Rentals'],
+        ...analytics.rentalTrends.map(t => [t.date, t.Rentals])
       ];
       const trendsSheet = XLSX.utils.aoa_to_sheet(trendsData);
-      XLSX.utils.book_append_sheet(workbook, trendsSheet, 'Booking Trends');
+      XLSX.utils.book_append_sheet(workbook, trendsSheet, 'rental Trends');
 
-      // Property Performance Sheet
+      // vehicle Performance Sheet
       const performanceData = [
-        ['Property', 'Bookings', 'Rating'],
-        ...analytics.propertyPerformance.map(p => [p.propertyTitle, p.bookings, p.rating.toFixed(2)])
+        ['vehicle', 'Rentals', 'Rating'],
+        ...analytics.vehiclePerformance.map(p => [p.vehicleTitle, p.Rentals, p.rating.toFixed(2)])
       ];
       const performanceSheet = XLSX.utils.aoa_to_sheet(performanceData);
-      XLSX.utils.book_append_sheet(workbook, performanceSheet, 'Property Performance');
+      XLSX.utils.book_append_sheet(workbook, performanceSheet, 'vehicle Performance');
 
       const fileName = `analytics_report_${currentDate}${selectedMonth !== 'all' ? `_${selectedMonth}` : ''}.xlsx`;
       XLSX.writeFile(workbook, fileName);
@@ -991,29 +1841,29 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
       const workbook = XLSX.utils.book_new();
       const currentDate = new Date().toISOString().split('T')[0];
 
-      // Get unique tenants from bookings
+      // Get unique tenants from Rentals
       const tenantMap = new Map();
-      bookings.forEach(booking => {
-        const tenantEmail = booking.clientEmail || booking.tenant_email || '';
+      Rentals.forEach(rental => {
+        const tenantEmail = rental.clientEmail || rental.tenant_email || '';
         if (tenantEmail && !tenantMap.has(tenantEmail)) {
           tenantMap.set(tenantEmail, {
-            name: booking.clientName || booking.full_name || 'N/A',
+            name: rental.clientName || rental.full_name || 'N/A',
             email: tenantEmail,
-            phone: booking.phone || 'N/A',
-            address: booking.address || 'N/A',
-            barangay: booking.barangay || 'N/A',
-            city: booking.municipality_city || 'N/A',
-            gender: booking.gender || 'N/A',
-            age: booking.age || 'N/A',
-            citizenship: booking.citizenship || 'N/A',
-            occupation: booking.occupation_status || 'N/A',
-            totalBookings: 1,
-            totalSpent: booking.totalAmount || 0
+            phone: rental.phone || 'N/A',
+            address: rental.address || 'N/A',
+            barangay: rental.barangay || 'N/A',
+            city: rental.municipality_city || 'N/A',
+            gender: rental.gender || 'N/A',
+            age: rental.age || 'N/A',
+            citizenship: rental.citizenship || 'N/A',
+            occupation: rental.occupation_status || 'N/A',
+            totalRentals: 1,
+            totalSpent: rental.totalAmount || 0
           });
         } else if (tenantMap.has(tenantEmail)) {
           const tenant = tenantMap.get(tenantEmail);
-          tenant.totalBookings += 1;
-          tenant.totalSpent += booking.totalAmount || 0;
+          tenant.totalRentals += 1;
+          tenant.totalSpent += rental.totalAmount || 0;
         }
       });
 
@@ -1021,7 +1871,7 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
 
       // Tenant Details Sheet
       const tenantData = [
-        ['Name', 'Email', 'Phone', 'Address', 'Barangay', 'City', 'Gender', 'Age', 'Citizenship', 'Occupation', 'Total Bookings', 'Total Spent'],
+        ['Name', 'Email', 'Phone', 'Address', 'Barangay', 'City', 'Gender', 'Age', 'Citizenship', 'Occupation', 'Total Rentals', 'Total Spent'],
         ...tenants.map(tenant => [
           tenant.name,
           tenant.email,
@@ -1033,36 +1883,39 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
           tenant.age,
           tenant.citizenship,
           tenant.occupation,
-          tenant.totalBookings,
+          tenant.totalRentals,
           tenant.totalSpent
         ])
       ];
       const tenantSheet = XLSX.utils.aoa_to_sheet(tenantData);
-      XLSX.utils.book_append_sheet(workbook, tenantSheet, 'Tenant Details');
+      XLSX.utils.book_append_sheet(workbook, tenantSheet, 'Client Details');
 
-      // Booking Details Sheet
-      const bookingData = [
-        ['Tenant Name', 'Tenant Email', 'Property', 'Check-in Date', 'Check-out Date', 'Status', 'Total Amount', 'Booking Date'],
-        ...bookings.map(booking => [
-          booking.clientName || booking.full_name || 'N/A',
-          booking.clientEmail || booking.tenant_email || 'N/A',
-          properties.find(p => p.id === booking.propertyId)?.title || 'N/A',
-          booking.checkInDate || 'N/A',
-          booking.checkOutDate || 'N/A',
-          booking.status,
-          booking.totalAmount || 0,
-          booking.createdAt
+      // rental Details Sheet
+      const rentalData = [
+        ['Client Name', 'Client Email', "Driver's license", 'vehicle', 'Check-in Date', 'Check-out Date', 'Status', 'Payment Method', 'Payment Status', 'Total Amount', 'rental Date'],
+        ...Rentals.map(rental => [
+          rental.clientName || rental.full_name || 'N/A',
+          rental.clientEmail || rental.tenant_email || 'N/A',
+          rental.driver_license || 'N/A',
+          Vehicles.find(p => p.id === rental.vehicleId)?.title || 'N/A',
+          rental.checkInDate || 'N/A',
+          rental.checkOutDate || 'N/A',
+          rental.status,
+          rental.paymentMethod || 'N/A',
+          PAYMENT_STATUS_LABELS[rental.paymentStatus || 'pending'],
+          rental.totalAmount || 0,
+          rental.createdAt
         ])
       ];
-      const bookingSheet = XLSX.utils.aoa_to_sheet(bookingData);
-      XLSX.utils.book_append_sheet(workbook, bookingSheet, 'Booking Details');
+      const Rentalsheet = XLSX.utils.aoa_to_sheet(rentalData);
+      XLSX.utils.book_append_sheet(workbook, Rentalsheet, 'rental Details');
 
-      const fileName = `tenant_data_${currentDate}.xlsx`;
+      const fileName = `client_data_${currentDate}.xlsx`;
       XLSX.writeFile(workbook, fileName);
-      alert(`Tenant data exported successfully: ${fileName}`);
+      alert(`Client data exported successfully: ${fileName}`);
     } catch (error) {
-      console.error('Failed to export tenant data:', error);
-      alert('Failed to export tenant data');
+      console.error('Failed to export client data:', error);
+      alert('Failed to export client data');
     }
   };
 
@@ -1084,8 +1937,8 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
       // Summary Table
       const summaryData = [
         ['Metric', 'Value'],
-        ['Total Properties', analytics.totalProperties.toString()],
-        ['Total Bookings', analytics.totalBookings.toString()],
+        ['Total Vehicles', analytics.totalVehicles.toString()],
+        ['Total Rentals', analytics.totalRentals.toString()],
         ['Average Rating', analytics.averageRating.toFixed(2)],
         ['Occupancy Rate', `${analytics.occupancyRate.toFixed(2)}%`]
       ];
@@ -1099,16 +1952,16 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
       });
       startY = (doc as any).lastAutoTable.finalY + 15;
 
-      // Booking Trends Table
+      // rental Trends Table
       if (startY > 150) {
         doc.addPage();
         startY = 20;
       }
 
-      const trendsData = analytics.bookingTrends.map(t => [t.date, t.bookings.toString()]);
+      const trendsData = analytics.rentalTrends.map(t => [t.date, t.Rentals.toString()]);
 
       (doc as any).autoTable({
-        head: [['Date', 'Bookings']],
+        head: [['Date', 'Rentals']],
         body: trendsData,
         startY: startY,
         styles: { fontSize: 9 },
@@ -1116,20 +1969,20 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
       });
       startY = (doc as any).lastAutoTable.finalY + 15;
 
-      // Property Performance Table
+      // vehicle Performance Table
       if (startY > 150) {
         doc.addPage();
         startY = 20;
       }
 
-      const performanceData = analytics.propertyPerformance.map(p => [
-        p.propertyTitle,
-        p.bookings.toString(),
+      const performanceData = analytics.vehiclePerformance.map(p => [
+        p.vehicleTitle,
+        p.Rentals.toString(),
         p.rating.toFixed(2)
       ]);
 
       (doc as any).autoTable({
-        head: [['Property', 'Bookings', 'Rating']],
+        head: [['vehicle', 'Rentals', 'Rating']],
         body: performanceData,
         startY: startY,
         styles: { fontSize: 9 },
@@ -1156,26 +2009,26 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
       // Summary section
       csvContent += 'ANALYTICS SUMMARY\n\n';
       csvContent += 'Metric,Value\n';
-      csvContent += `Total Properties,${analytics.totalProperties}\n`;
-      csvContent += `Total Bookings,${analytics.totalBookings}\n`;
+      csvContent += `Total Vehicles,${analytics.totalVehicles}\n`;
+      csvContent += `Total Rentals,${analytics.totalRentals}\n`;
       csvContent += `Average Rating,${analytics.averageRating.toFixed(2)}\n`;
       csvContent += `Occupancy Rate,${analytics.occupancyRate.toFixed(2)}%\n`;
       csvContent += `Time Period,${selectedMonth !== 'all' ? selectedMonth : 'All Months'}\n`;
       csvContent += `Report Generated,${new Date().toLocaleString()}\n\n`;
       
-      // Booking Trends section
-      csvContent += 'BOOKING TRENDS\n\n';
-      csvContent += 'Date,Bookings\n';
-      analytics.bookingTrends.forEach(trend => {
-        csvContent += `${trend.date},${trend.bookings}\n`;
+      // rental Trends section
+      csvContent += 'rental TRENDS\n\n';
+      csvContent += 'Date,Rentals\n';
+      analytics.rentalTrends.forEach(trend => {
+        csvContent += `${trend.date},${trend.Rentals}\n`;
       });
       csvContent += '\n';
       
-      // Property Performance section
-      csvContent += 'PROPERTY PERFORMANCE\n\n';
-      csvContent += 'Property,Bookings,Rating\n';
-      analytics.propertyPerformance.forEach(property => {
-        csvContent += `"${property.propertyTitle.replace(/"/g, '""')}",${property.bookings},${property.rating.toFixed(2)}\n`;
+      // vehicle Performance section
+      csvContent += 'vehicle PERFORMANCE\n\n';
+      csvContent += 'vehicle,Rentals,Rating\n';
+      analytics.vehiclePerformance.forEach(vehicle => {
+        csvContent += `"${vehicle.vehicleTitle.replace(/"/g, '""')}",${vehicle.Rentals},${vehicle.rating.toFixed(2)}\n`;
       });
       
       // Create download link
@@ -1196,30 +2049,21 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
     }
   };
 
-  const exportBookingsToExcel = async () => {
+  const exportRentalsToExcel = async () => {
     try {
       const workbook = XLSX.utils.book_new();
       const currentDate = new Date().toISOString().split('T')[0];
 
-      // Get bed status for each booking
-      const bookingsWithBedStatus = await Promise.all(bookings.map(async (b) => {
-        const { data: bedData } = await supabase
-          .from('beds')
-          .select('status')
-          .eq('booking_id', b.id)
-          .single();
-        return { ...b, bedStatus: bedData?.status || 'N/A' };
-      }));
-
-      const bookingsData = [
-        ['ID', 'Client Name', 'Client Email', 'Property', 'Status', 'Bed Status', 'Total Amount', 'Check In', 'Check Out', 'Created At'],
-        ...bookingsWithBedStatus.map(b => [
+      const RentalsData = [
+        ['ID', 'Client Name', 'Client Email', 'vehicle', 'Status', 'Payment Method', 'Payment Status', 'Total Amount', 'Check In', 'Check Out', 'Created At'],
+        ...Rentals.map(b => [
           b.id,
           b.clientName,
           b.clientEmail,
-          properties.find(p => p.id === b.propertyId)?.title || 'N/A',
+          Vehicles.find(p => p.id === b.vehicleId)?.title || 'N/A',
           b.status,
-          b.bedStatus,
+          b.paymentMethod || 'N/A',
+          PAYMENT_STATUS_LABELS[b.paymentStatus || 'pending'],
           b.totalAmount ? `₱${b.totalAmount.toLocaleString()}` : 'N/A',
           b.checkInDate || 'N/A',
           b.checkOutDate || 'N/A',
@@ -1227,19 +2071,19 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
         ])
       ];
 
-      const sheet = XLSX.utils.aoa_to_sheet(bookingsData);
-      XLSX.utils.book_append_sheet(workbook, sheet, 'Bookings');
+      const sheet = XLSX.utils.aoa_to_sheet(RentalsData);
+      XLSX.utils.book_append_sheet(workbook, sheet, 'Rentals');
 
-      const fileName = `bookings_report_${currentDate}.xlsx`;
+      const fileName = `Rentals_report_${currentDate}.xlsx`;
       XLSX.writeFile(workbook, fileName);
-      alert(`Bookings report exported successfully: ${fileName}`);
+      alert(`Rentals Report exported successfully: ${fileName}`);
     } catch (error) {
-      console.error('Failed to export bookings:', error);
-      alert('Failed to export bookings report');
+      console.error('Failed to export Rentals:', error);
+      alert('Failed to export Rentals Report');
     }
   };
 
-  const exportBookingsToPDF = async () => {
+  const exportRentalsToPDF = async () => {
     try {
       const doc = new jsPDF('landscape');
       let startY = 20;
@@ -1247,30 +2091,21 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
       // Title
       doc.setFontSize(18);
       doc.setFont('helvetica', 'bold');
-      doc.text('Bookings Report', 14, 15);
+      doc.text('Rentals Report', 14, 15);
       
       doc.setFontSize(10);
       doc.setFont('helvetica', 'normal');
       doc.text(`Generated: ${new Date().toLocaleString()}`, 14, 22);
       startY = 30;
 
-      // Get bed status for each booking
-      const bookingsWithBedStatus = await Promise.all(bookings.map(async (b) => {
-        const { data: bedData } = await supabase
-          .from('beds')
-          .select('status')
-          .eq('booking_id', b.id)
-          .single();
-        return { ...b, bedStatus: bedData?.status || 'N/A' };
-      }));
-
-      const bookingsData = bookingsWithBedStatus.map(b => [
+      const RentalsData = Rentals.map(b => [
         b.id.substring(0, 8) + '...',
         b.clientName,
         b.clientEmail,
-        (properties.find(p => p.id === b.propertyId)?.title || 'N/A').substring(0, 30),
+        (Vehicles.find(p => p.id === b.vehicleId)?.title || 'N/A').substring(0, 30),
         b.status,
-        b.bedStatus,
+        b.paymentMethod || 'N/A',
+        PAYMENT_STATUS_LABELS[b.paymentStatus || 'pending'],
         b.totalAmount ? `₱${b.totalAmount.toLocaleString()}` : 'N/A',
         b.checkInDate || 'N/A',
         b.checkOutDate || 'N/A',
@@ -1278,8 +2113,8 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
       ]);
 
       (doc as any).autoTable({
-        head: [['ID', 'Client Name', 'Email', 'Property', 'Status', 'Bed Status', 'Amount', 'Check In', 'Check Out', 'Created']],
-        body: bookingsData,
+        head: [['ID', 'Client Name', 'Email', 'vehicle', 'Status', 'Payment Method', 'Payment', 'Amount', 'Check In', 'Check Out', 'Created']],
+        body: RentalsData,
         startY: startY,
         styles: { fontSize: 8 },
         headStyles: { fillColor: [66, 139, 202] },
@@ -1289,19 +2124,18 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
           2: { cellWidth: 50 },
           3: { cellWidth: 50 },
           4: { cellWidth: 25 },
-          5: { cellWidth: 35 },
+          5: { cellWidth: 30 },
           6: { cellWidth: 30 },
-          7: { cellWidth: 30 },
-          8: { cellWidth: 30 }
+          7: { cellWidth: 30 }
         }
       });
 
-      const fileName = `bookings_report_${new Date().toISOString().split('T')[0]}.pdf`;
+      const fileName = `Rentals_report_${new Date().toISOString().split('T')[0]}.pdf`;
       doc.save(fileName);
-      alert(`Bookings PDF report exported successfully: ${fileName}`);
+      alert(`Rentals PDF report exported successfully: ${fileName}`);
     } catch (error) {
-      console.error('Failed to export bookings PDF:', error);
-      alert('Failed to export bookings PDF report');
+      console.error('Failed to export Rentals PDF:', error);
+      alert('Failed to export Rentals PDF report');
     }
   };
 
@@ -1311,25 +2145,25 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
     try {
       await supabase.auth.signOut();
     } catch (error) {
-      console.error('Failed to sign out landlord', error);
+      console.error('Failed to sign out vehicle owner', error);
     }
     onBack();
   };
 
-  const openChatForBooking = async (booking: BookingRequest) => {
+  const openChatForrental = async (rental: rentalRequest) => {
     try {
-      let prop = properties.find(p => p.id === booking.propertyId);
+      let prop = Vehicles.find(p => p.id === rental.vehicleId);
       let ownerEmail = prop?.ownerEmail || '';
       if (!ownerEmail) {
         const saved = typeof window !== 'undefined' ? window.localStorage.getItem('ownerEmail') || '' : '';
         if (saved && saved.includes('@')) {
           ownerEmail = saved;
           const { error: updErrSaved } = await supabase
-            .from('properties')
+            .from('vehicles')
             .update({ owner_email: ownerEmail })
-            .eq('id', booking.propertyId);
+            .eq('id', rental.vehicleId);
           if (updErrSaved) throw updErrSaved;
-          setProperties(prev => prev.map(p => p.id === booking.propertyId ? { ...p, ownerEmail } : p));
+          setVehicles(prev => prev.map(p => p.id === rental.vehicleId ? { ...p, ownerEmail } : p));
         } else {
           const entered = window.prompt('Enter your email to enable chat with clients:');
           const trimmed = (entered || '').trim();
@@ -1339,30 +2173,37 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
           }
           try { window.localStorage.setItem('ownerEmail', trimmed); } catch {}
           const { error: updErr } = await supabase
-            .from('properties')
+            .from('vehicles')
             .update({ owner_email: trimmed })
-            .eq('id', booking.propertyId);
+            .eq('id', rental.vehicleId);
           if (updErr) throw updErr;
-          setProperties(prev => prev.map(p => p.id === booking.propertyId ? { ...p, ownerEmail: trimmed } : p));
+          setVehicles(prev => prev.map(p => p.id === rental.vehicleId ? { ...p, ownerEmail: trimmed } : p));
           ownerEmail = trimmed;
         }
         // refresh prop reference
-        prop = properties.find(p => p.id === booking.propertyId);
+        prop = Vehicles.find(p => p.id === rental.vehicleId);
       }
-      // Ensure conversation exists
-      const { data: existing, error: selErr } = await supabase
+      // Ensure conversation exists (match emails case-insensitively — RLS/chat rows may use different casing)
+      const { data: existingRows, error: selErr } = await supabase
         .from('conversations')
         .select('*')
-        .eq('property_id', booking.propertyId)
-        .eq('owner_email', ownerEmail)
-        .eq('client_email', booking.clientEmail)
-        .limit(1);
+        .eq('vehicle_id', rental.vehicleId);
       if (selErr) throw selErr;
-      let conversation = existing && existing[0];
+      let conversation =
+        (existingRows || []).find(
+          (c: { owner_email?: string; client_email?: string }) =>
+            emailsMatchCaseInsensitive(c.owner_email, ownerEmail) &&
+            emailsMatchCaseInsensitive(c.client_email, rental.clientEmail || rental.tenant_email)
+        ) || null;
       if (!conversation) {
+        const clientEm = (rental.clientEmail || rental.tenant_email || '').trim();
+        if (!clientEm) {
+          alert('This rental has no renter email; chat cannot be created.');
+          return;
+        }
         const { data: created, error: insErr } = await supabase
           .from('conversations')
-          .insert([{ property_id: booking.propertyId, owner_email: ownerEmail, client_email: booking.clientEmail }])
+          .insert([{ vehicle_id: rental.vehicleId, owner_email: ownerEmail.trim(), client_email: clientEm }])
           .select('*')
           .single();
         if (insErr) throw insErr;
@@ -1389,17 +2230,20 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
       const channel = supabase
         .channel(`messages-${conversation.id}`)
         .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `conversation_id=eq.${conversation.id}` }, (payload: any) => {
-          setChatMessages(prev => {
-            const next = [...prev, payload.new as any];
-            return next;
-          });
+          setChatMessages((prev) => mergeMessageById(prev, payload.new as any));
           setTimeout(scrollMessagesToBottom, 0);
         })
         .subscribe();
       setChatChannel(channel);
-    } catch (e) {
+    } catch (e: any) {
       console.error('Open chat failed', e);
-      alert('Failed to open chat');
+      const detail =
+        e?.message ||
+        e?.error_description ||
+        (typeof e === 'string' ? e : e ? JSON.stringify(e) : '');
+      alert(
+        `Failed to open chat${detail ? `: ${detail}` : ''}\n\nIf it says relation or 42P01, run chat_conversations_messages.sql in Supabase.`
+      );
     } finally {
       setChatLoading(false);
     }
@@ -1410,32 +2254,54 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
     const content = chatInput.trim();
     if (!content) return;
     try {
-      const { error } = await supabase
-        .from('messages')
-        .insert([{ 
-          conversation_id: activeConversation.id, 
-          sender_email: activeConversation.owner_email, 
-          content 
-        }]);
-      
-      if (error) {
-        console.error('Send message failed', error);
-        alert('Failed to send message');
+      const [{ data: authData }, { data: sessionData }] = await Promise.all([
+        supabase.auth.getUser(),
+        supabase.auth.getSession(),
+      ]);
+      const senderEmail = (
+        sessionData?.session?.user?.email ||
+        authData?.user?.email ||
+        ownerEmail ||
+        ''
+      ).trim();
+      if (!senderEmail) {
+        alert('Could not resolve your account email. Try signing in again.');
         return;
       }
-      
-      setChatInput('');
-      // Rely on realtime to append; optionally refresh as fallback
-      const { data: msgs } = await supabase
+      const { data: inserted, error } = await supabase
         .from('messages')
+        .insert([
+          {
+            conversation_id: activeConversation.id,
+            sender_email: senderEmail,
+            content,
+          },
+        ])
         .select('id, conversation_id, sender_email, content, created_at')
-        .eq('conversation_id', activeConversation.id)
-        .order('created_at', { ascending: true });
-      setChatMessages(msgs || []);
+        .single();
+
+      if (error) {
+        console.error('Send message failed', error);
+        const parts = [
+          error.message || 'Failed to send message',
+          error.code ? `Code: ${error.code}` : '',
+          (error as { details?: string }).details ? `Details: ${(error as { details?: string }).details}` : '',
+          (error as { hint?: string }).hint ? `Hint: ${(error as { hint?: string }).hint}` : '',
+        ].filter(Boolean);
+        alert(
+          `${parts.join('\n')}\n\nRe-run chat_conversations_messages.sql in Supabase. Your login email must match owner_email on this conversation (and usually vehicles.owner_email).`
+        );
+        return;
+      }
+
+      notifyChatRecipientNonBlocking(activeConversation.id, content, senderEmail);
+      setChatInput('');
+      setChatMessages((prev) => mergeMessageById(prev, inserted));
       setTimeout(scrollMessagesToBottom, 0);
-    } catch (e) {
+    } catch (e: unknown) {
       console.error('Send message failed', e);
-      alert('Failed to send message');
+      const err = e as { message?: string; code?: string; details?: string };
+      alert([err.message, err.code, err.details].filter(Boolean).join('\n') || 'Failed to send message');
     }
   };
 
@@ -1447,31 +2313,32 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
     }
   };
 
-  const openChatByPropertyId = async (propertyId: string) => {
+  const openChatByvehicleId = async (vehicleId: string) => {
     try {
       if (!ownerEmail) {
         alert('Owner email not set.');
         return;
       }
       
-      // Verify the property belongs to this owner
-      const property = properties.find(p => p.id === propertyId);
-      if (!property || property.ownerEmail !== ownerEmail) {
-        alert('You can only access chats for your own properties.');
+      // Verify the vehicle belongs to this owner
+      const vehicle = Vehicles.find(p => p.id === vehicleId);
+      if (!vehicle || !emailsMatchCaseInsensitive(vehicle.ownerEmail, ownerEmail)) {
+        alert('You can only access chats for your own Vehicles.');
         return;
       }
-      
+
       const { data: convs, error: convErr } = await supabase
         .from('conversations')
         .select('*')
-        .eq('property_id', propertyId)
-        .eq('owner_email', ownerEmail)
-        .order('created_at', { ascending: false })
-        .limit(1);
+        .eq('vehicle_id', vehicleId)
+        .order('created_at', { ascending: false });
       if (convErr) throw convErr;
-      const conversation = convs && convs[0];
+      const conversation =
+        (convs || []).find((c: { owner_email?: string }) =>
+          emailsMatchCaseInsensitive(c.owner_email, ownerEmail)
+        ) || null;
       if (!conversation) {
-        alert('No chat for this property yet.');
+        alert('No chat for this vehicle yet.');
         return;
       }
       setActiveConversation(conversation);
@@ -1489,51 +2356,74 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
       const channel = supabase
         .channel(`messages-${conversation.id}`)
         .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `conversation_id=eq.${conversation.id}` }, (payload: any) => {
-          setChatMessages(prev => [...prev, payload.new as any]);
+          setChatMessages((prev) => mergeMessageById(prev, payload.new as any));
           setTimeout(scrollMessagesToBottom, 0);
         })
         .subscribe();
       setChatChannel(channel);
-    } catch (e) {
-      console.error('Open chat by property failed', e);
-      alert('Failed to open chat');
+    } catch (e: any) {
+      console.error('Open chat by vehicle failed', e);
+      const detail =
+        e?.message ||
+        e?.error_description ||
+        (typeof e === 'string' ? e : e ? JSON.stringify(e) : '');
+      alert(
+        `Failed to open chat${detail ? `: ${detail}` : ''}\n\nIf it says relation or 42P01, run chat_conversations_messages.sql in Supabase.`
+      );
     } finally {
       setChatLoading(false);
     }
   };
 
+  const unreadNotificationCount = notifications.filter((notification) => !notification.read_at).length;
+  // "Live" = listed units (DB usually uses `available`, not `active`)
+  const activeVehicleCount = Vehicles.filter((vehicle) =>
+    ['active', 'available', 'rented', 'pending'].includes(String(vehicle.status || ''))
+  ).length;
+  const pendingVehicleCount = Vehicles.filter((vehicle) => vehicle.status === 'pending').length;
+  const verifiedVehicleCount = Vehicles.filter((vehicle) => vehicle.isVerified).length;
+  const pendingRentalCount = Rentals.filter((rental) => rental.status === 'pending').length;
+  const approvedRentalCount = Rentals.filter((rental) => rental.status === 'approved').length;
+  const ownerDisplayName =
+    profileData.full_name ||
+    user?.user_metadata?.full_name ||
+    ownerEmail?.split('@')[0] ||
+    'Owner';
+  const strongestMonthRevenue =
+    analytics.monthlyRevenue.length > 0
+      ? Math.max(...analytics.monthlyRevenue.map((entry) => Number(entry.revenue) || 0))
+      : analytics.totalRevenue || 0;
+  const featuredVehicleTitle = analytics.topPerformingVehicles[0]?.vehicleTitle || Vehicles[0]?.title || 'No featured vehicle yet';
+
   return (
-    <div className="min-h-screen w-screen bg-white overflow-y-auto">
+    <div className="dashboard-bento-shell min-h-screen w-screen overflow-y-auto">
       {/* Top Orange Bar */}
       <div className="w-full h-2 bg-gradient-to-r from-orange-500 via-orange-600 to-orange-700"></div>
-      <div className="p-2 sm:p-4">
+      <div className="mx-auto max-w-7xl p-2 sm:p-4">
         {/* Header */}
-        <div className="bg-white rounded-xl sm:rounded-2xl shadow-lg border border-gray-100 p-3 sm:p-4 md:p-6 mb-3 sm:mb-4 md:mb-6">
+        <div className="dashboard-bento-card dashboard-bento-card-open relative z-[90] p-3 sm:p-4 md:p-6 mb-3 sm:mb-4 md:mb-6">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-4">
             <div className="text-left">
               <h1 className="text-xl sm:text-2xl md:text-3xl font-bold text-gray-900 mb-1 sm:mb-2">
-                Landlord Dashboard
+                Vehicle Owner Dashboard
               </h1>
               <p className="text-gray-600 font-medium text-xs sm:text-sm md:text-base">
-                Manage your properties and booking requests
+                Manage your Vehicles and rental requests
               </p>
             </div>
-            <div className="relative flex flex-wrap items-center gap-2 sm:gap-3">
+            <div className="relative z-[100] flex flex-wrap items-center gap-2 sm:gap-3">
               <button onClick={() => setShowNotif(!showNotif)} className="relative bg-orange-100 text-orange-700 px-3 py-2 rounded-lg hover:bg-orange-200 transition-colors duration-200 flex items-center space-x-2">
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 17h5l-1.405-1.405A2 2 0 0118 14.158V11a6 6 0 10-12 0v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
                 </svg>
-                {(() => {
-                  const unreadCount = notifications.filter(n => !n.read_at).length;
-                  return unreadCount > 0 ? (
-                    <span className="absolute -top-2 -right-2 bg-red-600 text-white text-xs font-bold px-2 py-0.5 rounded-full">
-                      {unreadCount}
-                    </span>
-                  ) : null;
-                })()}
+                {unreadNotificationCount > 0 ? (
+                  <span className="absolute -top-2 -right-2 bg-red-600 text-white text-xs font-bold px-2 py-0.5 rounded-full">
+                    {unreadNotificationCount}
+                  </span>
+                ) : null}
               </button>
               {showNotif && (
-                <div className="absolute right-0 top-12 w-[calc(100vw-2rem)] sm:w-96 max-w-sm bg-white rounded-xl shadow-lg border border-gray-100 z-50">
+                <div className="absolute right-0 top-12 w-[calc(100vw-2rem)] sm:w-96 max-w-sm bg-white rounded-xl shadow-2xl border border-gray-100 z-[120] overflow-hidden">
                   <div className="p-2 sm:p-3 border-b font-semibold text-sm sm:text-base flex items-center justify-between">
                     <span>Notifications</span>
                       <button
@@ -1542,11 +2432,13 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                           try {
                             const unreadNotifications = notifications.filter(n => !n.read_at);
                             if (unreadNotifications.length === 0) return;
-                            
+                            const nv = recipientEmailVariants(ownerEmail);
+                            if (nv.length === 0) return;
+
                             const { error } = await supabase
                               .from('notifications')
                               .update({ read_at: new Date().toISOString() })
-                              .eq('recipient_email', ownerEmail)
+                              .in('recipient_email', nv)
                               .is('read_at', null);
                           
                             if (error) {
@@ -1575,10 +2467,10 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                         <div className="text-sm font-semibold text-gray-900">{n.title}</div>
                         <div className="text-xs text-gray-600 mt-0.5">{n.body}</div>
                         <div className="text-[10px] text-gray-500 mt-1">{new Date(n.created_at).toLocaleString()}</div>
-                        {(n.type === 'booking_approved' || n.type === 'chat_message') && (
+                        {(n.type === 'rental_approved' || n.type === 'chat_message') && (
                           <div className="mt-2">
                             <button
-                              onClick={() => openChatByPropertyId(n.property_id)}
+                              onClick={() => openChatByvehicleId(n.vehicle_id)}
                               className="text-xs text-blue-600 hover:text-blue-700 font-semibold"
                             >Open Chat</button>
                           </div>
@@ -1587,155 +2479,277 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                     ))}
                   </div>
                   <div className="p-3 border-t">
-                    <button onClick={() => { setActiveTab('bookings'); setShowNotif(false); }} className="w-full text-center text-orange-600 font-semibold hover:text-orange-700">Manage bookings</button>
+                    <button onClick={() => { setActiveTab('Rentals'); setShowNotif(false); }} className="w-full text-center text-orange-600 font-semibold hover:text-orange-700">Manage Rentals</button>
                   </div>
                 </div>
               )}
-              <button onClick={() => setProfileOpen(!profileOpen)} className="bg-purple-100 text-purple-700 p-2 rounded-lg hover:bg-purple-200 transition-colors duration-200 flex items-center justify-center">
-                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
-                </svg>
-              </button>
-              {profileOpen && (
-                <div className="absolute right-0 mt-2 w-48 bg-white rounded-lg shadow-lg border border-gray-100 py-2 z-50">
-                  <button 
-                    onClick={async () => {
-                      setProfileOpen(false);
-                      // Load profile data for viewing
-                      try {
-                        const email = ownerEmail || user?.email;
-                        if (!email) {
-                          alert('Email not found');
-                          return;
-                        }
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => setProfileOpen(!profileOpen)}
+                  className={`h-10 w-10 rounded-2xl border transition-all duration-200 flex items-center justify-center ${
+                    profileOpen
+                      ? 'bg-primary-600 text-white border-primary-600 shadow-lg shadow-primary-600/20'
+                      : 'bg-white/90 text-gray-700 border-gray-200/80 hover:bg-white hover:text-primary-700 shadow-sm'
+                  }`}
+                  aria-label="Open account menu"
+                  aria-expanded={profileOpen}
+                >
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
+                  </svg>
+                </button>
+                {profileOpen && (
+                  <div className="absolute right-0 top-12 w-64 overflow-hidden rounded-[28px] border border-white/70 bg-white/95 shadow-[0_24px_60px_rgba(20,32,43,0.18)] backdrop-blur-2xl z-[130]">
+                    <div className="border-b border-gray-100/80 bg-gradient-to-r from-primary-50 to-white px-4 py-3">
+                      <p className="text-xs font-bold uppercase tracking-[0.18em] text-primary-700">Account</p>
+                      <p className="mt-1 truncate text-sm font-semibold text-gray-900">
+                        {ownerEmail || user?.email || 'Owner'}
+                      </p>
+                    </div>
+                    <div className="p-2">
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          setProfileOpen(false);
+                          try {
+                            const email = ownerEmail || user?.email;
+                            if (!email) {
+                              alert('Email not found');
+                              return;
+                            }
 
-                        // Try to load from landlord_profiles
-                        const { data: landlordProfile } = await supabase
-                          .from('landlord_profiles')
-                          .select('*')
-                          .eq('email', email)
-                          .single();
+                            const { data: vehicleOwnerProfile } = await supabase
+                              .from('vehicle_owner_profiles')
+                              .select('*')
+                              .eq('email', email)
+                              .single();
 
-                        // Try to load from app_users
-                        const { data: appUser } = await supabase
-                          .from('app_users')
-                          .select('*')
-                          .eq('email', email)
-                          .single();
+                            const { data: appUser } = await supabase
+                              .from('app_users')
+                              .select('*')
+                              .eq('email', email)
+                              .single();
 
-                        const profile = landlordProfile || appUser;
-                        setViewProfileData({
-                          full_name: profile?.full_name || user?.user_metadata?.full_name || 'N/A',
-                          email: email,
-                          phone: profile?.phone || 'N/A',
-                          address: profile?.address || 'N/A',
-                          barangay: profile?.barangay || 'N/A',
-                          city: profile?.city || 'N/A',
-                          profile_image_url: profile?.profile_image_url || null
-                        });
-                        setShowViewProfile(true);
-                      } catch (error) {
-                        console.error('Failed to load profile:', error);
-                        const email = ownerEmail || user?.email || '';
-                        setViewProfileData({
-                          full_name: user?.user_metadata?.full_name || 'N/A',
-                          email: email,
-                          phone: 'N/A',
-                          address: 'N/A',
-                          barangay: 'N/A',
-                          city: 'N/A',
-                          profile_image_url: null
-                        });
-                        setShowViewProfile(true);
-                      }
-                    }}
-                    className="w-full text-left px-4 py-3 hover:bg-gray-50 flex items-center space-x-3"
-                  >
-                    <svg className="w-5 h-5 text-primary-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
-                    </svg>
-                    <span className="text-gray-700 font-medium">View Profile</span>
-                  </button>
+                            const profile = { ...(appUser || {}), ...(vehicleOwnerProfile || {}) };
+                            setViewProfileData({
+                              full_name: profile?.full_name || user?.user_metadata?.full_name || 'N/A',
+                              email: email,
+                              phone: profile?.phone || 'N/A',
+                              address: profile?.address || 'N/A',
+                              barangay: profile?.barangay || 'N/A',
+                              city: profile?.city || 'N/A',
+                              profile_image_url: profile?.profile_image_url || null,
+                              id_document_url: profile?.id_document_url || null,
+                            });
+                            setShowViewProfile(true);
+                          } catch (error) {
+                            console.error('Failed to load profile:', error);
+                            const email = ownerEmail || user?.email || '';
+                            setViewProfileData({
+                              full_name: user?.user_metadata?.full_name || 'N/A',
+                              email: email,
+                              phone: 'N/A',
+                              address: 'N/A',
+                              barangay: 'N/A',
+                              city: 'N/A',
+                              profile_image_url: null,
+                              id_document_url: null,
+                            });
+                            setShowViewProfile(true);
+                          }
+                        }}
+                        className="group w-full rounded-2xl px-3 py-3 text-left transition-all duration-200 hover:bg-primary-50 flex items-center gap-3"
+                      >
+                        <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-primary-100 text-primary-700 transition-all duration-200 group-hover:bg-primary-600 group-hover:text-white">
+                          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                            <path
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              strokeWidth={2}
+                              d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"
+                            />
+                          </svg>
+                        </span>
+                        <span>
+                          <span className="block text-sm font-bold text-gray-900">View Profile</span>
+                          <span className="block text-xs text-gray-500">See your owner details</span>
+                        </span>
+                      </button>
 
-                  <button
-                    onClick={async () => {
-                      setProfileOpen(false);
-                      // Load profile data for editing
-                      try {
-                        const email = ownerEmail || user?.email;
-                        if (!email) {
-                          alert('Email not found');
-                          return;
-                        }
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          setProfileOpen(false);
+                          await openOwnerProfileEditor();
+                        }}
+                        className="group w-full rounded-2xl px-3 py-3 text-left transition-all duration-200 hover:bg-primary-50 flex items-center gap-3"
+                      >
+                        <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-primary-100 text-primary-700 transition-all duration-200 group-hover:bg-primary-600 group-hover:text-white">
+                          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                            <path
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              strokeWidth={2}
+                              d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"
+                            />
+                          </svg>
+                        </span>
+                        <span>
+                          <span className="block text-sm font-bold text-gray-900">Edit Profile</span>
+                          <span className="block text-xs text-gray-500">Update contact and documents</span>
+                        </span>
+                      </button>
 
-                        // Try to load from landlord_profiles
-                        const { data: landlordProfile } = await supabase
-                          .from('landlord_profiles')
-                          .select('*')
-                          .eq('email', email)
-                          .single();
+                      <div className="my-2 h-px bg-gray-100" role="separator" />
 
-                        // Try to load from app_users
-                        const { data: appUser } = await supabase
-                          .from('app_users')
-                          .select('*')
-                          .eq('email', email)
-                          .single();
-
-                        const profile = landlordProfile || appUser;
-                        setProfileData({
-                          full_name: profile?.full_name || user?.user_metadata?.full_name || '',
-                          email: email,
-                          phone: profile?.phone || '',
-                          address: profile?.address || '',
-                          barangay: profile?.barangay || '',
-                          city: profile?.city || '',
-                          profile_image_url: profile?.profile_image_url || ''
-                        });
-                        setProfileImagePreview(profile?.profile_image_url || null);
-                        setShowEditProfile(true);
-                      } catch (error) {
-                        console.error('Failed to load profile:', error);
-                        setProfileData({
-                          full_name: user?.user_metadata?.full_name || '',
-                          email: ownerEmail || user?.email || '',
-                          phone: '',
-                          address: '',
-                          barangay: '',
-                          city: '',
-                          profile_image_url: ''
-                        });
-                        setShowEditProfile(true);
-                      }
-                    }}
-                    className="w-full text-left px-4 py-3 hover:bg-gray-50 flex items-center space-x-3"
-                  >
-                    <svg className="w-5 h-5 text-primary-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-                    </svg>
-                    <span className="text-gray-700 font-medium">Edit Profile</span>
-                  </button>
-
-
-                  <button onClick={handleLogout} className="w-full text-left px-4 py-3 hover:bg-gray-50 flex items-center space-x-3 text-red-600">
-                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
-                    </svg>
-                    <span className="font-medium">Logout</span>
-                  </button>
-                </div>
-              )}
+                      <button
+                        type="button"
+                        onClick={handleLogout}
+                        className="group w-full rounded-2xl px-3 py-3 text-left transition-all duration-200 hover:bg-red-50 flex items-center gap-3 text-red-600"
+                      >
+                        <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-red-100 text-red-600 transition-all duration-200 group-hover:bg-red-600 group-hover:text-white">
+                          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                            <path
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              strokeWidth={2}
+                              d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"
+                            />
+                          </svg>
+                        </span>
+                        <span>
+                          <span className="block text-sm font-bold">Logout</span>
+                          <span className="block text-xs text-red-400">End this session</span>
+                        </span>
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         </div>
 
+        <div className="grid gap-4 lg:grid-cols-12 mb-3 sm:mb-4 md:mb-6">
+          <section className="dashboard-bento-card lg:col-span-7 p-5 sm:p-6">
+            <div className="flex flex-wrap items-center gap-2 mb-4">
+              <span className="dashboard-bento-badge">Owner Studio</span>
+              <span className="dashboard-bento-pill bg-orange-100 text-orange-800">
+                {activeVehicleCount} live vehicle{activeVehicleCount === 1 ? '' : 's'}
+              </span>
+            </div>
+
+            <div className="flex flex-col gap-5">
+              <div className="space-y-3">
+                <h2 className="text-2xl sm:text-3xl font-bold text-[#221711] leading-tight">
+                  {ownerDisplayName}, your fleet now has a cleaner command center.
+                </h2>
+                <p className="max-w-2xl text-sm sm:text-base text-[#6b584b] leading-relaxed">
+                  Keep listings healthy, jump on incoming rentals faster, and move from growth checks to day-to-day operations without digging through separate panels.
+                </p>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <button
+                  onClick={handleRequestAddvehicle}
+                  className="dashboard-bento-action text-left"
+                >
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-[0.18em] text-orange-600">Launch</p>
+                    <p className="mt-1 text-sm font-semibold text-[#221711]">Add a new vehicle</p>
+                  </div>
+                  <svg className="w-5 h-5 text-orange-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v12m6-6H6" />
+                  </svg>
+                </button>
+                <button
+                  onClick={() => setActiveTab('Rentals')}
+                  className="dashboard-bento-action text-left"
+                >
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-[0.18em] text-orange-600">Queue</p>
+                    <p className="mt-1 text-sm font-semibold text-[#221711]">Review rental requests</p>
+                  </div>
+                  <span className="text-sm font-bold text-orange-600">{pendingRentalCount}</span>
+                </button>
+                <button
+                  onClick={() => setActiveTab('analytics')}
+                  className="dashboard-bento-action text-left"
+                >
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-[0.18em] text-orange-600">Signals</p>
+                    <p className="mt-1 text-sm font-semibold text-[#221711]">Open analytics</p>
+                  </div>
+                  <svg className="w-5 h-5 text-orange-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 3v18m-4-4v4m8-12v12m4-8v8" />
+                  </svg>
+                </button>
+                <button
+                  onClick={() => setShowNotif((prev) => !prev)}
+                  className="dashboard-bento-action text-left"
+                >
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-[0.18em] text-orange-600">Inbox</p>
+                    <p className="mt-1 text-sm font-semibold text-[#221711]">Notifications and chat</p>
+                  </div>
+                  <span className="text-sm font-bold text-orange-600">{unreadNotificationCount}</span>
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <section className="dashboard-bento-card lg:col-span-5 p-5 sm:p-6">
+            <div className="grid grid-cols-2 gap-3">
+              <div className="dashboard-bento-metric p-4">
+                <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#8f6d5a]">Portfolio</p>
+                <p className="mt-2 text-3xl font-bold text-[#221711]">{Vehicles.length}</p>
+                <p className="mt-1 text-sm text-[#6b584b]">{pendingVehicleCount} pending, {verifiedVehicleCount} verified</p>
+              </div>
+              <div className="dashboard-bento-metric p-4">
+                <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#8f6d5a]">Revenue</p>
+                <p className="mt-2 text-3xl font-bold text-[#221711]">₱{Number(analytics.totalRevenue || 0).toLocaleString()}</p>
+                <p className="mt-1 text-sm text-[#6b584b]">Peak month hit ₱{Number(strongestMonthRevenue).toLocaleString()}</p>
+              </div>
+              <div className="dashboard-bento-metric p-4">
+                <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#8f6d5a]">Occupancy</p>
+                <p className="mt-2 text-3xl font-bold text-[#221711]">{Number(analytics.occupancyRate || 0).toFixed(0)}%</p>
+                <p className="mt-1 text-sm text-[#6b584b]">{approvedRentalCount} approved rental{approvedRentalCount === 1 ? '' : 's'}</p>
+              </div>
+              <div className="dashboard-bento-metric p-4">
+                <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#8f6d5a]">Average rating</p>
+                <p className="mt-2 text-3xl font-bold text-[#221711]">{Number(analytics.averageRating || 0).toFixed(1)}</p>
+                <p className="mt-1 text-sm text-[#6b584b]">{reviews.length} verified review{reviews.length === 1 ? '' : 's'}</p>
+              </div>
+            </div>
+
+            <div className="dashboard-bento-metric mt-4 p-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#8f6d5a]">Lead vehicle</p>
+                  <p className="mt-2 text-lg font-bold text-[#221711]">{featuredVehicleTitle}</p>
+                  <p className="mt-1 text-sm text-[#6b584b]">
+                    Keep response times tight on pending requests to turn interest into approved rentals faster.
+                  </p>
+                </div>
+                <button
+                  onClick={onBack}
+                  className="dashboard-bento-pill bg-white text-[#221711] border border-white/80"
+                >
+                  Back
+                </button>
+              </div>
+            </div>
+          </section>
+        </div>
+
         {/* Tabs */}
-        <div className="bg-white rounded-xl sm:rounded-2xl shadow-lg border border-gray-100 p-1 sm:p-2 mb-3 sm:mb-4 md:mb-6">
+        <div className="dashboard-bento-card p-1 sm:p-2 mb-3 sm:mb-4 md:mb-6">
           <div className="flex flex-wrap gap-1">
             <button
-              onClick={() => setActiveTab('properties')}
+              onClick={() => setActiveTab('Vehicles')}
               className={`flex-1 min-w-[120px] px-2 sm:px-3 md:px-6 py-2 sm:py-3 md:py-4 font-semibold rounded-lg sm:rounded-xl transition-all duration-200 text-xs sm:text-sm md:text-base ${
-                activeTab === 'properties'
+                activeTab === 'Vehicles'
                   ? 'bg-orange-600 text-white shadow-lg'
                   : 'text-gray-600 hover:text-gray-800 hover:bg-gray-50'
               }`}
@@ -1745,15 +2759,15 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
                 </svg>
-                <span className="hidden sm:inline">Properties</span>
+                <span className="hidden sm:inline">Vehicles</span>
                 <span className="sm:hidden">Props</span>
-                <span className="hidden md:inline">({properties.length})</span>
+                <span className="hidden md:inline">({Vehicles.length})</span>
               </span>
             </button>
             <button
-              onClick={() => setActiveTab('bookings')}
+              onClick={() => setActiveTab('Rentals')}
               className={`flex-1 min-w-[120px] px-2 sm:px-3 md:px-6 py-2 sm:py-3 md:py-4 font-semibold rounded-lg sm:rounded-xl transition-all duration-200 text-xs sm:text-sm md:text-base ${
-                activeTab === 'bookings'
+                activeTab === 'Rentals'
                   ? 'bg-orange-600 text-white shadow-lg'
                   : 'text-gray-600 hover:text-gray-800 hover:bg-gray-50'
               }`}
@@ -1762,9 +2776,9 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                 <svg className="w-3 h-3 sm:w-4 sm:h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
                 </svg>
-                <span className="hidden sm:inline">Bookings</span>
+                <span className="hidden sm:inline">Rentals</span>
                 <span className="sm:hidden">Books</span>
-                <span className="hidden md:inline">({bookings.filter(b => b.status === 'pending').length})</span>
+                <span className="hidden md:inline">({Rentals.filter(b => b.status === 'pending').length})</span>
               </span>
             </button>
             <button
@@ -1785,61 +2799,72 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
           </div>
         </div>
 
-        {/* Properties Tab */}
-        {activeTab === 'properties' && (
+        {/* Vehicles Tab */}
+        {activeTab === 'Vehicles' && (
           <div>
             <div className="bg-white rounded-2xl shadow-lg border border-gray-100 p-6 mb-6">
               <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
                 <div>
-                  <h2 className="text-2xl font-bold text-gray-900 mb-2">My Properties</h2>
-                  <p className="text-gray-600">Manage and monitor your property listings</p>
+                  <h2 className="text-2xl font-bold text-gray-900 mb-2">My Vehicles</h2>
+                  <p className="text-gray-600">Manage and monitor your vehicle listings</p>
                 </div>
                 <button
-                  onClick={() => setShowAddProperty(true)}
+                  onClick={handleRequestAddvehicle}
                   className="bg-gradient-to-r from-orange-600 to-orange-700 text-white px-6 py-3 rounded-xl hover:from-orange-700 hover:to-orange-800 transition-all duration-200 font-semibold shadow-lg hover:shadow-xl transform hover:-translate-y-0.5 flex items-center space-x-2"
                 >
                   <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
                   </svg>
-                  <span>Add New Property</span>
+                  <span>Add New vehicle</span>
                 </button>
               </div>
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 sm:gap-6">
-              {properties.map((property) => (
+              {dedupeVehiclesById(Vehicles).map((vehicle) => (
                 <div
-                  key={property.id}
+                  key={vehicle.id}
                   className="bg-white rounded-2xl shadow-lg border border-gray-100 overflow-hidden hover:shadow-xl transition-all duration-300 cursor-pointer transform hover:-translate-y-1"
-                  onClick={() => setShowPropertyDetails(property)}
+                  onClick={() => {
+                    setOwnerMapUserGpsDetails(null);
+                    setShowvehicleDetails(vehicle);
+                  }}
                 >
                   <div className="h-56 bg-gradient-to-br from-gray-100 to-gray-200 flex items-center justify-center relative overflow-hidden">
-                    {property.images && property.images[0] ? (
-                      <ImageWithFallback src={property.images[0]} alt={property.title} className="absolute inset-0 w-full h-full object-cover" data-sb-bucket="property-images" data-sb-path={property.images[0]} />
+                    {vehicle.images && vehicle.images[0] ? (
+                      <ImageWithFallback src={vehicle.images[0]} alt={vehicle.title} className="absolute inset-0 w-full h-full object-cover" data-sb-bucket="vehicle-images" data-sb-path={vehicle.images[0]} />
                     ) : (
                     <div className="text-center z-10">
                       <svg className="w-12 h-12 text-gray-400 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
                       </svg>
-                      <span className="text-gray-500 font-medium">Property Image</span>
+                      <span className="text-gray-500 font-medium">vehicle Image</span>
                     </div>
                     )}
                   </div>
                   <div className="p-6">
                     <div className="flex items-start justify-between mb-3">
-                      <h3 className="font-bold text-xl text-gray-900 leading-tight">{property.title}</h3>
+                      <h3 className="font-bold text-xl text-gray-900 leading-tight">{vehicle.title}</h3>
                       <div className="flex flex-col items-end gap-1">
                         <span className={`px-3 py-1 rounded-full text-xs font-semibold ${
-                          property.status === 'active' 
+                          vehicle.status === 'active' || vehicle.status === 'available'
                             ? 'bg-orange-100 text-orange-800' 
-                            : property.status === 'pending'
+                            : vehicle.status === 'pending'
                             ? 'bg-yellow-100 text-yellow-800'
+                            : vehicle.status === 'rented'
+                            ? 'bg-blue-100 text-blue-800'
                             : 'bg-gray-100 text-gray-800'
                         }`}>
-                          {property.status === 'active' ? 'Active' : property.status === 'pending' ? 'Pending Verification' : 'Inactive'}
+                          {vehicle.status === 'active' || vehicle.status === 'available'
+                            ? 'Available'
+                            : vehicle.status === 'pending'
+                              ? 'Pending Verification'
+                              : vehicle.status === 'rented'
+                                ? 'Rented'
+                                : 'Inactive'}
                         </span>
-                        {property.isVerified && (
+                        {vehicle.isVerified && (
                           <span className="px-2 py-1 rounded-full text-xs font-semibold bg-green-100 text-green-800 flex items-center gap-1">
                             <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
                               <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
@@ -1854,33 +2879,54 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" />
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 11a3 3 0 11-6 0 3 3 0 016 0z" />
                       </svg>
-                      <span className="text-sm font-medium">{property.location}</span>
+                      <span className="text-sm font-medium">{vehicle.location}</span>
                     </div>
                     <div className="flex items-center justify-between mb-4">
                       <div>
-                        <span className="text-2xl font-bold text-orange-600">₱{property.price.toLocaleString()}</span>
-                        <span className="text-gray-600 font-medium">/month</span>
+                        <span className="text-2xl font-bold text-orange-600">₱{vehicle.price.toLocaleString()}</span>
+                        <span className="text-gray-600 font-medium">/day</span>
+                        <p className="text-xs text-gray-500 mt-1">Custom hourly, daily, weekly, and monthly rates are saved.</p>
                       </div>
                       <div className="text-right">
-                        <p className="text-sm text-gray-500">Booking Requests</p>
-                        <p className="font-bold text-gray-900">{bookings.filter(b => b.propertyId === property.id).length}</p>
+                        <p className="text-sm text-gray-500">rental Requests</p>
+                        <p className="font-bold text-gray-900">{Rentals.filter(b => b.vehicleId === vehicle.id).length}</p>
                       </div>
                     </div>
-                    <div className="flex flex-wrap gap-2">
-                      {property.amenities.slice(0, 2).map((amenity, index) => (
-                        <span
-                          key={index}
-                          className="bg-gray-100 text-gray-700 text-xs font-medium px-3 py-1 rounded-full"
-                        >
-                          {amenity}
-                        </span>
+                    <div className="grid grid-cols-2 gap-2 mb-4">
+                      {RENTAL_UNITS.map((unit) => (
+                        <div key={unit} className="rounded-xl bg-orange-50 border border-orange-100 px-3 py-2">
+                          <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-orange-700">
+                            {RENTAL_UNIT_LABELS[unit]}
+                          </p>
+                          <p className="text-sm font-bold text-gray-900">
+                            ₱{vehicle.rentalRates[unit].toLocaleString()}
+                          </p>
+                          <p className="text-[11px] text-gray-500">{RENTAL_UNIT_SUFFIXES[unit]}</p>
+                        </div>
                       ))}
-                      {property.amenities.length > 2 && (
-                        <span className="bg-gray-100 text-gray-700 text-xs font-medium px-3 py-1 rounded-full">
-                          +{property.amenities.length - 2} more
-                        </span>
-                      )}
                     </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-2">
+                        <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-600">Boundary</p>
+                        <p className="text-sm font-bold text-slate-900">{vehicle.boundarySizeMeters}m x {vehicle.boundarySizeMeters}m</p>
+                      </div>
+                      <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-2">
+                        <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-600">Tracker</p>
+                        <p className={`text-sm font-bold ${isPointWithinBoundary(vehicle.currentCoordinates, vehicle.boundary) ? 'text-emerald-700' : 'text-red-700'}`}>
+                          {isPointWithinBoundary(vehicle.currentCoordinates, vehicle.boundary) ? 'Inside boundary' : 'Outside boundary'}
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        trackVehicleFromUserDevice(vehicle);
+                      }}
+                      className="mt-3 w-full rounded-xl bg-orange-600 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-orange-700"
+                    >
+                      Track this device and open map
+                    </button>
                   </div>
                 </div>
               ))}
@@ -1888,19 +2934,19 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
         </div>
       )}
 
-        {/* Bookings Tab */}
-        {activeTab === 'bookings' && (
+        {/* Rentals Tab */}
+        {activeTab === 'Rentals' && (
           <div>
             <div className="bg-white rounded-2xl shadow-lg border border-gray-100 p-6 mb-6">
               <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-2">
                 <div>
-              <h2 className="text-2xl font-bold text-gray-900 mb-2">Booking Requests</h2>
-              <p className="text-gray-600">Review and manage incoming booking requests</p>
+              <h2 className="text-2xl font-bold text-gray-900 mb-2">rental Requests</h2>
+              <p className="text-gray-600">Review and manage incoming rental requests</p>
                 </div>
-                {bookings.length > 0 && (
+                {Rentals.length > 0 && (
                   <div className="flex gap-3">
                     <button
-                      onClick={exportBookingsToExcel}
+                      onClick={exportRentalsToExcel}
                       className="bg-gradient-to-r from-orange-600 to-orange-700 text-white px-4 py-2 rounded-xl hover:from-orange-700 hover:to-orange-800 transition-all font-semibold shadow-lg hover:shadow-xl flex items-center gap-2"
                     >
                       <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1909,7 +2955,7 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                       Export Excel
                     </button>
                     <button
-                      onClick={exportBookingsToPDF}
+                      onClick={exportRentalsToPDF}
                       className="bg-gradient-to-r from-red-600 to-red-700 text-white px-4 py-2 rounded-xl hover:from-red-700 hover:to-red-800 transition-all font-semibold shadow-lg hover:shadow-xl flex items-center gap-2"
                     >
                       <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1921,19 +2967,188 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                 )}
               </div>
             </div>
+
+            <div className="bg-white rounded-2xl shadow-lg border border-gray-100 p-6 mb-6">
+              <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4 mb-4">
+                <div>
+                  <h3 className="text-xl font-bold text-gray-900">Reservation calendar</h3>
+                  <p className="text-sm text-gray-600 mt-1">
+                    Pick-up and return dates for each request. Use it before approving to avoid double bookings.
+                  </p>
+                </div>
+                <div className="flex flex-col sm:flex-row gap-3 sm:items-center">
+                  <select
+                    value={reservationCalendarVehicleId}
+                    onChange={(e) => setReservationCalendarVehicleId(e.target.value)}
+                    className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm font-semibold text-gray-800 focus:outline-none focus:ring-2 focus:ring-orange-400"
+                  >
+                    <option value="all">All vehicles</option>
+                    {Vehicles.map((v) => (
+                      <option key={v.id} value={v.id}>
+                        {v.title}
+                      </option>
+                    ))}
+                  </select>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setReservationCalendarMonth(
+                          new Date(
+                            reservationCalendarMonth.getFullYear(),
+                            reservationCalendarMonth.getMonth() - 1,
+                            1
+                          )
+                        )
+                      }
+                      className="rounded-xl border border-gray-200 px-3 py-2 text-sm font-semibold text-gray-700 hover:bg-gray-50"
+                    >
+                      Prev
+                    </button>
+                    <span className="text-sm font-bold text-gray-900 min-w-[10rem] text-center">
+                      {reservationCalendarModel.monthListLabel}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setReservationCalendarMonth(
+                          new Date(
+                            reservationCalendarMonth.getFullYear(),
+                            reservationCalendarMonth.getMonth() + 1,
+                            1
+                          )
+                        )
+                      }
+                      className="rounded-xl border border-gray-200 px-3 py-2 text-sm font-semibold text-gray-700 hover:bg-gray-50"
+                    >
+                      Next
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap gap-4 text-xs font-semibold text-gray-600 mb-4">
+                <span className="flex items-center gap-1.5">
+                  <span className="h-2 w-2 rounded-full bg-amber-500" /> Pending
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span className="h-2 w-2 rounded-full bg-emerald-500" /> Approved
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span className="h-2 w-2 rounded-full bg-slate-400" /> Completed
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span className="h-2 w-2 rounded-full bg-gray-300" /> Cancelled
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span className="h-2 w-2 rounded-full bg-red-500" /> Rejected
+                </span>
+              </div>
+
+              <div className="grid grid-cols-7 gap-1 text-center text-xs font-semibold text-gray-500 mb-2">
+                {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((d) => (
+                  <div key={d} className="py-2">
+                    {d}
+                  </div>
+                ))}
+              </div>
+              <div className="grid grid-cols-7 gap-1">
+                {Array.from({ length: reservationCalendarModel.startWeekday }).map((_, i) => (
+                  <div key={`cal-pad-${i}`} className="min-h-[4.5rem] rounded-lg bg-gray-50/80" />
+                ))}
+                {Array.from({ length: reservationCalendarModel.daysInMonth }, (_, i) => {
+                  const day = i + 1;
+                  const ymd = `${reservationCalendarModel.year}-${String(reservationCalendarModel.month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+                  const dayRentals = Rentals.filter((r) => {
+                    if (reservationCalendarVehicleId !== 'all' && r.vehicleId !== reservationCalendarVehicleId) {
+                      return false;
+                    }
+                    if (!r.checkInDate || !r.checkOutDate) return false;
+                    return ymd >= r.checkInDate && ymd <= r.checkOutDate;
+                  });
+                  const isToday = ymd === reservationCalendarModel.todayYmd;
+                  return (
+                    <div
+                      key={ymd}
+                      className={`min-h-[4.5rem] rounded-lg border p-1.5 text-left ${
+                        isToday ? 'border-orange-400 bg-orange-50/60' : 'border-gray-100 bg-white'
+                      }`}
+                    >
+                      <div className="text-sm font-bold text-gray-900">{day}</div>
+                      <div className="mt-1 flex flex-wrap gap-0.5 items-center">
+                        {dayRentals.slice(0, 4).map((r) => (
+                          <span
+                            key={r.id}
+                            title={`${r.clientName} · ${r.status}${
+                              r.checkInDate && r.checkOutDate
+                                ? ` · ${formatYmdMedium(r.checkInDate)}–${formatYmdMedium(r.checkOutDate)}`
+                                : ''
+                            }`}
+                            className={`h-1.5 w-1.5 rounded-full shrink-0 ${
+                              r.status === 'approved'
+                                ? 'bg-emerald-500'
+                                : r.status === 'pending'
+                                  ? 'bg-amber-500'
+                                  : r.status === 'completed'
+                                    ? 'bg-slate-400'
+                                    : r.status === 'cancelled'
+                                      ? 'bg-gray-300'
+                                      : 'bg-red-500'
+                            }`}
+                          />
+                        ))}
+                        {dayRentals.length > 4 && (
+                          <span className="text-[10px] font-bold text-gray-500">+{dayRentals.length - 4}</span>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {reservationCalendarModel.rentalsInMonth.length === 0 ? (
+                <p className="mt-4 text-sm text-gray-500">
+                  No reservations with dates in this month. Requests with pick-up and return dates will show here.
+                </p>
+              ) : (
+                <div className="mt-6 border-t border-gray-100 pt-4">
+                  <p className="text-sm font-semibold text-gray-900 mb-3">This month</p>
+                  <ul className="space-y-2 max-h-48 overflow-y-auto text-sm">
+                    {reservationCalendarModel.rentalsInMonth.map((r) => (
+                      <li
+                        key={r.id}
+                        className="flex flex-wrap items-baseline justify-between gap-2 rounded-lg bg-gray-50 px-3 py-2"
+                      >
+                        <span className="font-medium text-gray-900">{r.clientName}</span>
+                        <span className="text-gray-600">
+                          {r.checkInDate && r.checkOutDate
+                            ? `${formatYmdMedium(r.checkInDate)} – ${formatYmdMedium(r.checkOutDate)}`
+                            : '—'}
+                        </span>
+                        <span className="text-xs font-bold uppercase text-gray-500">{r.status}</span>
+                        <span className="text-xs text-gray-500 truncate max-w-[12rem]">
+                          {Vehicles.find((v) => v.id === r.vehicleId)?.title || 'vehicle'}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+
             <div className="space-y-6">
-              {bookings.map((booking) => (
-                <div key={booking.id} className="bg-white rounded-2xl shadow-lg border border-gray-100 p-6 hover:shadow-xl transition-shadow duration-300">
+              {Rentals.map((rental) => (
+                <div key={rental.id} className="bg-white rounded-2xl shadow-lg border border-gray-100 p-6 hover:shadow-xl transition-shadow duration-300">
                   <div className="flex flex-col lg:flex-row justify-between items-start lg:items-center mb-6 gap-4">
                     <div className="flex-1">
                       <div className="flex items-center space-x-3 mb-2">
                         <button
                           onClick={async () => {
                             try {
-                              const tenantEmail = booking.clientEmail || booking.tenant_email;
+                              const tenantEmail = rental.clientEmail || rental.tenant_email;
                               
                               // Fetch tenant information from multiple sources
-                              const [userProfileResult, appUserResult, bookingDataResult] = await Promise.all([
+                              const [userProfileResult, appUserResult, rentalDataResult] = await Promise.all([
                                 // Try user_profiles table
                                 supabase
                                   .from('user_profiles')
@@ -1946,57 +3161,60 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                                   .select('phone, address, barangay, city, profile_image_url, id_document_url')
                                   .eq('email', tenantEmail)
                                   .single(),
-                                // Get full booking data
+                                // Get full rental data
                                 supabase
-                                  .from('bookings')
+                                  .from('rentals')
                                   .select('*')
-                                  .eq('id', booking.id)
+                                  .eq('id', rental.id)
                                   .single()
                               ]);
 
                               // Extract data (ignore errors if tables don't exist or no data)
                               const userProfile = userProfileResult.data;
                               const appUser = appUserResult.data;
-                              const bookingData = bookingDataResult.data || booking;
+                              const rentalData = rentalDataResult.data || rental;
 
-                              // Get tenant data from booking or user profiles
+                              // Get tenant data from rental or user profiles
                               const tenantInfo = {
-                                name: booking.clientName || booking.full_name || bookingData?.full_name || 'N/A',
+                                name: rental.clientName || rental.full_name || rentalData?.full_name || 'N/A',
                                 email: tenantEmail,
-                                phone: userProfile?.phone || appUser?.phone || bookingData?.phone || booking.phone || 'N/A',
-                                address: userProfile?.address || appUser?.address || bookingData?.address || booking.address || 'N/A',
-                                barangay: userProfile?.barangay || appUser?.barangay || bookingData?.barangay || booking.barangay || 'N/A',
-                                city: userProfile?.city || appUser?.city || bookingData?.municipality_city || booking.municipality_city || 'N/A',
-                                profileImage: userProfile?.profile_image_url || appUser?.profile_image_url || bookingData?.profile_image_url || null,
-                                idDocument: userProfile?.id_document_url || appUser?.id_document_url || bookingData?.id_document_url || booking.id_document_url || null,
-                                bookingId: booking.id,
+                                phone: userProfile?.phone || appUser?.phone || rentalData?.phone || rental.phone || 'N/A',
+                                address: userProfile?.address || appUser?.address || rentalData?.address || rental.address || 'N/A',
+                                barangay: userProfile?.barangay || appUser?.barangay || rentalData?.barangay || rental.barangay || 'N/A',
+                                city: userProfile?.city || appUser?.city || rentalData?.municipality_city || rental.municipality_city || 'N/A',
+                                profileImage: userProfile?.profile_image_url || appUser?.profile_image_url || rentalData?.profile_image_url || null,
+                                idDocument: userProfile?.id_document_url || appUser?.id_document_url || rentalData?.id_document_url || rental.id_document_url || null,
+                                rentalId: rental.id,
                                 userId: tenantEmail,
-                                gender: bookingData?.gender || booking.gender || 'N/A',
-                                age: bookingData?.age || booking.age || 'N/A',
-                                occupation: bookingData?.occupation_status || booking.occupation_status || 'N/A',
-                                citizenship: bookingData?.citizenship || booking.citizenship || 'N/A'
+                                gender: rentalData?.gender || rental.gender || 'N/A',
+                                age: rentalData?.age || rental.age || 'N/A',
+                                occupation: rentalData?.occupation_status || rental.occupation_status || 'N/A',
+                                citizenship: rentalData?.citizenship || rental.citizenship || 'N/A',
+                                driverLicense:
+                                  rentalData?.driver_license || rental.driver_license || 'N/A'
                               };
 
                               setSelectedTenant(tenantInfo);
                               setShowTenantModal(true);
                             } catch (error) {
                               console.error('Failed to load tenant info:', error);
-                              // Still show modal with available booking data
+                              // Still show modal with available rental data
                               const tenantInfo = {
-                                name: booking.clientName || booking.full_name || 'N/A',
-                                email: booking.clientEmail || booking.tenant_email || 'N/A',
-                                phone: booking.phone || 'N/A',
-                                address: booking.address || 'N/A',
-                                barangay: booking.barangay || 'N/A',
-                                city: booking.municipality_city || 'N/A',
+                                name: rental.clientName || rental.full_name || 'N/A',
+                                email: rental.clientEmail || rental.tenant_email || 'N/A',
+                                phone: rental.phone || 'N/A',
+                                address: rental.address || 'N/A',
+                                barangay: rental.barangay || 'N/A',
+                                city: rental.municipality_city || 'N/A',
                                 profileImage: null,
-                                idDocument: booking.id_document_url || null,
-                                bookingId: booking.id,
-                                userId: booking.clientEmail || booking.tenant_email || 'N/A',
-                                gender: booking.gender || 'N/A',
-                                age: booking.age || 'N/A',
-                                occupation: booking.occupation_status || 'N/A',
-                                citizenship: booking.citizenship || 'N/A'
+                                idDocument: rental.id_document_url || null,
+                                rentalId: rental.id,
+                                userId: rental.clientEmail || rental.tenant_email || 'N/A',
+                                gender: rental.gender || 'N/A',
+                                age: rental.age || 'N/A',
+                                occupation: rental.occupation_status || 'N/A',
+                                citizenship: rental.citizenship || 'N/A',
+                                driverLicense: rental.driver_license || 'N/A'
                               };
                               setSelectedTenant(tenantInfo);
                               setShowTenantModal(true);
@@ -2009,49 +3227,148 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                           </svg>
                         </button>
                         <div>
-                          <h3 className="font-bold text-xl text-gray-900">{booking.clientName}</h3>
-                          <p className="text-gray-600 font-medium">{booking.clientEmail}</p>
+                          <h3 className="font-bold text-xl text-gray-900">{rental.clientName}</h3>
+                          <p className="text-gray-600 font-medium">{rental.clientEmail}</p>
+                          {rental.driver_license ? (
+                            <p className="mt-1 text-sm font-mono text-gray-800">
+                              Driver&apos;s license: {rental.driver_license}
+                            </p>
+                          ) : null}
                         </div>
                       </div>
                       <p className="text-sm text-gray-500 flex items-center">
                         <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
                         </svg>
-                        {booking.createdAt}
+                        {rental.createdAt}
                       </p>
                     </div>
                     <span className={`px-4 py-2 rounded-full text-sm font-semibold ${
-                      booking.status === 'pending' 
+                      rental.status === 'pending' 
                         ? 'bg-yellow-100 text-yellow-800'
-                        : booking.status === 'approved'
+                        : rental.status === 'approved'
                         ? 'bg-orange-100 text-orange-800'
+                        : rental.status === 'completed'
+                        ? 'bg-green-100 text-green-800'
+                        : rental.status === 'cancelled'
+                        ? 'bg-gray-100 text-gray-700'
                         : 'bg-red-100 text-red-800'
                     }`}>
-                      {booking.status.toUpperCase()}
+                      {rental.status.toUpperCase()}
                     </span>
                   </div>
                   
-                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
                     <div>
                       <h4 className="font-bold text-gray-900 mb-2 flex items-center">
                         <svg className="w-4 h-4 mr-2 text-orange-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
                         </svg>
-                        Property
+                        vehicle
                       </h4>
                       <p className="text-gray-700 font-medium">
-                        {properties.find(p => p.id === booking.propertyId)?.title}
+                        {Vehicles.find(p => p.id === rental.vehicleId)?.title}
                       </p>
+                    </div>
+                    <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4">
+                      <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-600 mb-2">Booked User Tracking</p>
+                      <p className="text-lg font-bold text-gray-900">{rental.clientName || 'Unknown renter'}</p>
+                      <p className="mt-1 text-sm text-gray-600 truncate">{rental.clientEmail || rental.tenant_email || 'No email recorded'}</p>
+                      {(() => {
+                        const bookedVehicle = Vehicles.find((vehicle) => vehicle.id === rental.vehicleId);
+                        return (
+                          <div className="mt-4 space-y-3">
+                            <div className="rounded-xl bg-white border border-slate-200 px-3 py-2">
+                              <p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">Tracker</p>
+                              <p className={`mt-1 text-sm font-bold ${bookedVehicle?.trackingEnabled ? 'text-emerald-700' : 'text-slate-700'}`}>
+                                {bookedVehicle?.trackingEnabled ? 'Active on map' : 'Manual map position'}
+                              </p>
+                            </div>
+                            {bookedVehicle?.trackingLastPing && (
+                              <p className="text-xs text-slate-500">
+                                Last ping: {new Date(bookedVehicle.trackingLastPing).toLocaleString()}
+                              </p>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => openRentalTrackerOnMap(rental)}
+                              className="w-full bg-gradient-to-r from-slate-800 to-slate-900 text-white py-2.5 rounded-xl hover:from-slate-900 hover:to-black transition-all font-semibold shadow flex items-center justify-center gap-2"
+                            >
+                              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7" />
+                              </svg>
+                              Track on Map
+                            </button>
+                            <p className="text-[11px] leading-snug text-slate-500">
+                              Requests the renter&apos;s live GPS (RideHub client must be open with location allowed).
+                              Map updates every ~20–30s while the trip is approved.
+                            </p>
+                          </div>
+                        );
+                      })()}
+                    </div>
+                    <div className="bg-orange-50 border border-orange-100 rounded-2xl p-4">
+                      <p className="text-xs font-semibold uppercase tracking-[0.16em] text-orange-700 mb-2">Rent Details</p>
+                      <p className="text-lg font-bold text-gray-900">
+                        {rental.rentalUnit ? RENTAL_UNIT_LABELS[rental.rentalUnit] : 'Plan not specified'}
+                      </p>
+                      <p className="text-sm text-gray-600 mt-1">
+                        {rental.rentalUnit ? `Quoted ${RENTAL_UNIT_SUFFIXES[rental.rentalUnit]}` : 'Older rental record'}
+                      </p>
+                      {rental.totalAmount ? (
+                        <p className="text-xl font-bold text-orange-600 mt-3">₱{Number(rental.totalAmount).toLocaleString()}</p>
+                      ) : (
+                        <p className="text-sm text-gray-500 mt-3">No quoted amount recorded yet.</p>
+                      )}
+                      {rental.checkInDate && rental.checkOutDate && (
+                        <div className="mt-3 rounded-xl border border-orange-200 bg-white/80 px-3 py-2">
+                          <p className="text-xs font-semibold uppercase tracking-[0.14em] text-orange-700">Reservation</p>
+                          <p className="mt-1 text-sm font-semibold text-gray-900">
+                            Pick-up {formatYmdMedium(rental.checkInDate)} → Return {formatYmdMedium(rental.checkOutDate)}
+                          </p>
+                        </div>
+                      )}
+                      <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <div>
+                          <p className="text-xs font-semibold uppercase tracking-[0.14em] text-gray-500">Method</p>
+                          <p className="mt-1 text-sm font-semibold text-gray-800">{rental.paymentMethod || 'Not specified'}</p>
+                        </div>
+                        <div>
+                          <p className="text-xs font-semibold uppercase tracking-[0.14em] text-gray-500">Payment</p>
+                          <span className={`mt-1 inline-flex rounded-full border px-3 py-1 text-xs font-bold ${
+                            PAYMENT_STATUS_CLASSES[rental.paymentStatus || 'pending']
+                          }`}>
+                            {PAYMENT_STATUS_LABELS[rental.paymentStatus || 'pending']}
+                          </span>
+                        </div>
+                      </div>
+                      <label className="mt-4 block text-xs font-semibold uppercase tracking-[0.14em] text-gray-500">
+                        Update Payment Status
+                      </label>
+                      <select
+                        value={rental.paymentStatus || 'pending'}
+                        onChange={(event) => handlePaymentStatusChange(
+                          rental.id,
+                          event.target.value as NonNullable<rentalRequest['paymentStatus']>
+                        )}
+                        className="mt-2 w-full rounded-xl border border-orange-200 bg-white px-3 py-2 text-sm font-semibold text-gray-800 focus:outline-none focus:ring-2 focus:ring-orange-400"
+                      >
+                        {PAYMENT_STATUS_OPTIONS.map((status) => (
+                          <option key={status} value={status}>
+                            {PAYMENT_STATUS_LABELS[status]}
+                          </option>
+                        ))}
+                      </select>
                     </div>
 
 
                   </div>
 
-                  {booking.status === 'pending' && (
+                  {rental.status === 'pending' && (
                     <div className="flex gap-4 pt-4 border-t border-gray-200">
                       <button
-                        onClick={() => handleBookingAction(booking.id, 'approve')}
+                        onClick={() => handlerentalAction(rental.id, 'approve')}
                         className="flex-1 bg-gradient-to-r from-green-600 to-green-700 text-white py-3 rounded-xl hover:from-green-700 hover:to-green-800 transition-all duration-200 font-semibold shadow-lg hover:shadow-xl transform hover:-translate-y-0.5 flex items-center justify-center space-x-2"
                       >
                         <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -2060,7 +3377,7 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                         <span>Approve</span>
                       </button>
                       <button
-                        onClick={() => handleBookingAction(booking.id, 'reject')}
+                        onClick={() => handlerentalAction(rental.id, 'reject')}
                         className="flex-1 bg-gradient-to-r from-red-600 to-red-700 text-white py-3 rounded-xl hover:from-red-700 hover:to-red-800 transition-all duration-200 font-semibold shadow-lg hover:shadow-xl transform hover:-translate-y-0.5 flex items-center justify-center space-x-2"
                       >
                         <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -2070,48 +3387,19 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                       </button>
                     </div>
                   )}
-                  {booking.status === 'approved' && (
+                  {rental.status === 'approved' && (
                     <div className="flex gap-4 pt-4 border-t border-gray-200">
                       <button
-                        onClick={() => openChatForBooking(booking)}
+                        onClick={() => openChatForrental(rental)}
                         className="flex-1 glass-button py-3 rounded-xl transition-all duration-200 font-semibold"
                       >
                         Open Chat
                       </button>
                       <button
-                        onClick={async () => {
-                          try {
-                            // Find the bed associated with this booking
-                            const { data: bedData } = await supabase
-                              .from('beds')
-                              .select('id, status')
-                              .eq('booking_id', booking.id)
-                              .single();
-                            
-                            if (bedData) {
-                              const { error } = await supabase
-                                .from('beds')
-                                .update({ status: 'available', booking_id: null })
-                                .eq('id', bedData.id);
-                              
-                              if (error) throw error;
-                              alert('Bed freed successfully!');
-                              // Reload bookings
-                              window.location.reload();
-                            } else {
-                              alert('No bed associated with this booking.');
-                            }
-                          } catch (error) {
-                            console.error('Failed to free bed:', error);
-                            alert('Failed to free bed');
-                          }
-                        }}
-                        className="flex-1 bg-gradient-to-r from-blue-600 to-blue-700 text-white py-3 rounded-xl hover:from-blue-700 hover:to-blue-800 transition-all duration-200 font-semibold shadow-lg hover:shadow-xl transform hover:-translate-y-0.5 flex items-center justify-center space-x-2"
+                        onClick={() => finishRental(rental)}
+                        className="flex-1 bg-gradient-to-r from-slate-800 to-slate-900 text-white py-3 rounded-xl hover:from-slate-900 hover:to-black transition-all duration-200 font-semibold shadow-lg hover:shadow-xl"
                       >
-                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" />
-                        </svg>
-                        <span>Free Bed</span>
+                        Finish Rent
                       </button>
                     </div>
                   )}
@@ -2128,7 +3416,7 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
               <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-4">
                 <div>
               <h2 className="text-2xl font-bold text-gray-900 mb-2">Analytics Dashboard</h2>
-              <p className="text-gray-600">Track your property performance and business metrics</p>
+              <p className="text-gray-600">Track your vehicle performance and business metrics</p>
                 </div>
                 <div className="flex flex-col sm:flex-row gap-3">
                   <select
@@ -2174,7 +3462,7 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                     <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
                     </svg>
-                    Export Tenant Data
+                    Export Client Data
                   </button>
                   <button
                     onClick={exportAnalyticsToCSV}
@@ -2197,8 +3485,8 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0118.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
                   </svg>
                 </div>
-                <div className="text-3xl font-bold text-orange-600 mb-1">{analytics.totalProperties}</div>
-                <div className="text-sm font-semibold text-orange-800">Properties</div>
+                <div className="text-3xl font-bold text-orange-600 mb-1">{analytics.totalVehicles}</div>
+                <div className="text-sm font-semibold text-orange-800">Vehicles</div>
               </div>
               <div className="bg-gradient-to-br from-orange-50 to-orange-100 rounded-2xl p-6 text-center border border-orange-200">
                 <div className="w-12 h-12 bg-orange-600 rounded-full flex items-center justify-center mx-auto mb-3">
@@ -2206,8 +3494,8 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
                   </svg>
                 </div>
-                <div className="text-3xl font-bold text-orange-600 mb-1">{analytics.totalBookings}</div>
-                <div className="text-sm font-semibold text-orange-800">Total Bookings</div>
+                <div className="text-3xl font-bold text-orange-600 mb-1">{analytics.totalRentals}</div>
+                <div className="text-sm font-semibold text-orange-800">Total Rentals</div>
               </div>
               <div className="bg-gradient-to-br from-yellow-50 to-yellow-100 rounded-2xl p-6 text-center border border-yellow-200">
                 <div className="w-12 h-12 bg-yellow-600 rounded-full flex items-center justify-center mx-auto mb-3">
@@ -2239,7 +3527,7 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                   </svg>
                 </div>
                 <div className="text-3xl font-bold text-purple-600 mb-1">{analytics.revenueByStatus.find(s => s.status === 'approved')?.count || 0}</div>
-                <div className="text-sm font-semibold text-purple-800">Approved Bookings</div>
+                <div className="text-sm font-semibold text-purple-800">Approved Rentals</div>
               </div>
               <div className="bg-gradient-to-br from-indigo-50 to-indigo-100 rounded-2xl p-6 text-center border border-indigo-200">
                 <div className="w-12 h-12 bg-indigo-600 rounded-full flex items-center justify-center mx-auto mb-3">
@@ -2248,7 +3536,7 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                   </svg>
                 </div>
                 <div className="text-3xl font-bold text-indigo-600 mb-1">{analytics.revenueByStatus.find(s => s.status === 'pending')?.count || 0}</div>
-                <div className="text-sm font-semibold text-indigo-800">Pending Bookings</div>
+                <div className="text-sm font-semibold text-indigo-800">Pending Rentals</div>
               </div>
               <div className="bg-gradient-to-br from-pink-50 to-pink-100 rounded-2xl p-6 text-center border border-pink-200">
                 <div className="w-12 h-12 bg-pink-600 rounded-full flex items-center justify-center mx-auto mb-3">
@@ -2257,21 +3545,21 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                   </svg>
                 </div>
                 <div className="text-3xl font-bold text-pink-600 mb-1">{analytics.revenueByStatus.find(s => s.status === 'rejected')?.count || 0}</div>
-                <div className="text-sm font-semibold text-pink-800">Rejected Bookings</div>
+                <div className="text-sm font-semibold text-pink-800">Rejected Rentals</div>
               </div>
             </div>
 
             {/* Charts */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
               <div className="bg-white rounded-2xl shadow-lg border border-gray-100 p-6">
-                <h3 className="text-xl font-bold text-gray-900 mb-6">Booking Trends (30 days)</h3>
+                <h3 className="text-xl font-bold text-gray-900 mb-6">rental Trends (30 days)</h3>
                 <div className="h-64">
                   <Bar
                     data={{
-                      labels: analytics.bookingTrends.map(t => t.date.slice(5)),
+                      labels: analytics.rentalTrends.map(t => t.date.slice(5)),
                       datasets: [{
-                        label: 'Bookings',
-                        data: analytics.bookingTrends.map(t => t.bookings),
+                        label: 'Rentals',
+                        data: analytics.rentalTrends.map(t => t.Rentals),
                         backgroundColor: 'rgba(59,130,246,0.8)',
                         borderColor: 'rgba(59,130,246,1)',
                         borderWidth: 1,
@@ -2295,13 +3583,13 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
               </div>
 
               <div className="bg-white rounded-2xl shadow-lg border border-gray-100 p-6">
-                <h3 className="text-xl font-bold text-gray-900 mb-6">Revenue Trends (30 days)</h3>
+                <h3 className="text-xl font-bold text-gray-900 mb-6">Sales Trends (30 days)</h3>
                 <div className="h-64">
                   <Line
                     data={{
                       labels: analytics.revenueTrends.map(t => t.date.slice(5)),
                       datasets: [{
-                        label: 'Revenue',
+                        label: 'Sales',
                         data: analytics.revenueTrends.map(t => t.revenue),
                         backgroundColor: 'rgba(34,197,94,0.2)',
                         borderColor: 'rgba(34,197,94,1)',
@@ -2330,7 +3618,7 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
               </div>
 
               <div className="bg-white rounded-2xl shadow-lg border border-gray-100 p-6">
-                <h3 className="text-xl font-bold text-gray-900 mb-6">Monthly Revenue (Last 6 Months)</h3>
+                <h3 className="text-xl font-bold text-gray-900 mb-6">Monthly Sales (Last 6 Months)</h3>
                 <div className="h-64">
                   <Bar
                     data={{
@@ -2339,7 +3627,7 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                         return new Date(parseInt(year), parseInt(month) - 1).toLocaleDateString('en-US', { month: 'short', year: '2-digit' });
                       }),
                       datasets: [{
-                        label: 'Revenue',
+                        label: 'Sales',
                         data: analytics.monthlyRevenue.map(m => m.revenue),
                         backgroundColor: 'rgba(139,92,246,0.8)',
                         borderColor: 'rgba(139,92,246,1)',
@@ -2366,16 +3654,16 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
               </div>
 
               <div className="bg-white rounded-2xl shadow-lg border border-gray-100 p-6">
-                <h3 className="text-xl font-bold text-gray-900 mb-6">Top Performing Properties</h3>
+                <h3 className="text-xl font-bold text-gray-900 mb-6">Top Performing Vehicles</h3>
                 <div className="h-64">
                   <Bar
                     data={{
-                      labels: analytics.topPerformingProperties.map(p => 
-                        p.propertyTitle.length > 15 ? p.propertyTitle.substring(0, 15) + '...' : p.propertyTitle
+                      labels: analytics.topPerformingVehicles.map(p => 
+                        p.vehicleTitle.length > 15 ? p.vehicleTitle.substring(0, 15) + '...' : p.vehicleTitle
                       ),
                       datasets: [{
-                        label: 'Revenue',
-                        data: analytics.topPerformingProperties.map(p => p.revenue),
+                        label: 'Sales',
+                        data: analytics.topPerformingVehicles.map(p => p.revenue),
                         backgroundColor: 'rgba(234,179,8,0.8)',
                         borderColor: 'rgba(234,179,8,1)',
                         borderWidth: 1,
@@ -2401,33 +3689,33 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
               </div>
             </div>
 
-            {/* Property Performance */}
+            {/* vehicle Performance */}
             <div className="bg-white rounded-2xl shadow-lg border border-gray-100 p-6">
-              <h3 className="text-xl font-bold text-gray-900 mb-6">Property Performance</h3>
+              <h3 className="text-xl font-bold text-gray-900 mb-6">vehicle Performance</h3>
               <div className="overflow-x-auto">
                 <table className="w-full">
                   <thead className="bg-gray-50">
                     <tr>
-                      <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Property</th>
-                      <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Bookings</th>
+                      <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">vehicle</th>
+                      <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Rentals</th>
                       <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Rating</th>
                       <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Permit</th>
                       <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Reviews & Comments</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-gray-200">
-                    {analytics.propertyPerformance.map((property) => {
-                      const propertyReviews = reviews.filter(r => r.propertyId === property.propertyId);
+                    {analytics.vehiclePerformance.map((vehicle) => {
+                      const vehicleReviews = reviews.filter(r => r.vehicleId === vehicle.vehicleId);
                       return (
-                        <tr key={property.propertyId} className="hover:bg-gray-50">
+                        <tr key={vehicle.vehicleId} className="hover:bg-gray-50">
                           <td className="px-6 py-4 whitespace-nowrap">
                             <div className="flex items-center gap-3">
                               {(() => {
-                                const fullProperty = properties.find(p => p.id === property.propertyId);
-                                return fullProperty?.images?.[0] ? (
+                                const fullvehicle = Vehicles.find(p => p.id === vehicle.vehicleId);
+                                return fullvehicle?.images?.[0] ? (
                                   <img 
-                                    src={fullProperty.images[0]} 
-                                    alt={property.propertyTitle}
+                                    src={fullvehicle.images[0]} 
+                                    alt={vehicle.vehicleTitle}
                                     className="w-10 h-10 object-cover rounded-lg flex-shrink-0"
                                   />
                                 ) : (
@@ -2438,13 +3726,13 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                                   </div>
                                 );
                               })()}
-                              <span className="font-semibold text-gray-900">{property.propertyTitle}</span>
+                              <span className="font-semibold text-gray-900">{vehicle.vehicleTitle}</span>
                             </div>
                           </td>
-                          <td className="px-6 py-4 whitespace-nowrap text-gray-600">{property.bookings}</td>
+                          <td className="px-6 py-4 whitespace-nowrap text-gray-600">{vehicle.Rentals}</td>
                           <td className="px-6 py-4 whitespace-nowrap">
                             {(() => {
-                              const ratingValue = property.rating || 0;
+                              const ratingValue = vehicle.rating || 0;
                               if (ratingValue > 0) {
                                 return (
                                   <div className="flex items-center">
@@ -2475,10 +3763,10 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                           </td>
                           <td className="px-6 py-4 whitespace-nowrap">
                             {(() => {
-                              const fullProperty = properties.find(p => p.id === property.propertyId);
-                              return fullProperty?.business_permit_url ? (
+                              const fullvehicle = Vehicles.find(p => p.id === vehicle.vehicleId);
+                              return fullvehicle?.business_permit_url ? (
                                 <button
-                                  onClick={() => window.open(fullProperty.business_permit_url, '_blank')}
+                                  onClick={() => window.open(fullvehicle.business_permit_url, '_blank')}
                                   className="text-blue-600 hover:text-blue-800 text-xs font-semibold underline"
                                 >
                                   View Permit
@@ -2489,11 +3777,11 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                             })()}
                           </td>
                           <td className="px-6 py-4">
-                            {propertyReviews.length > 0 ? (
+                            {vehicleReviews.length > 0 ? (
                               <div className="max-w-md">
-                                <div className="text-sm text-gray-600 mb-2">{propertyReviews.length} review{propertyReviews.length !== 1 ? 's' : ''}</div>
+                                <div className="text-sm text-gray-600 mb-2">{vehicleReviews.length} review{vehicleReviews.length !== 1 ? 's' : ''}</div>
                                 <div className="space-y-2 max-h-32 overflow-y-auto">
-                                  {propertyReviews.map((review) => (
+                                  {vehicleReviews.map((review) => (
                                     <div key={review.id} className="bg-gray-50 rounded-lg p-3 border border-gray-200">
                                       <div className="flex items-center justify-between mb-1">
                                         <span className="text-sm font-semibold text-gray-900">{review.clientName}</span>
@@ -2531,26 +3819,17 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
         )}
 
 
-      {/* Add Property Modal */}
-      {showAddProperty && (
+      {/* Add vehicle Modal */}
+      {showAddvehicle && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-3 sm:p-4 z-50">
           <div className="bg-white rounded-xl sm:rounded-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto">
             <div className="p-4 sm:p-6">
               <div className="flex justify-between items-start mb-4">
-                <h2 className="text-2xl font-bold">Add New Property</h2>
+                <h2 className="text-2xl font-bold">Add New vehicle</h2>
                 <button
                   onClick={() => {
-                    setShowAddProperty(false);
-                    // Reset form when closing
-                    setNewProperty({
-                      title: '',
-                      description: '',
-                      price: '',
-                      location: 'Catbalogan City, Samar',
-                      amenities: [],
-                      coordinates: { lat: 11.7778, lng: 124.8847 },
-                      images: []
-                    });
+                    setShowAddvehicle(false);
+                    resetNewvehicleForm();
                   }}
                   className="text-gray-500 hover:text-gray-700"
                 >
@@ -2561,14 +3840,14 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
               <div className="space-y-4">
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-2">
-                    Property Title
+                    vehicle Title
                   </label>
                   <input
                     type="text"
-                    value={newProperty.title}
-                    onChange={(e) => setNewProperty(prev => ({ ...prev, title: e.target.value }))}
+                    value={newvehicle.title}
+                    onChange={(e) => setNewvehicle(prev => ({ ...prev, title: e.target.value }))}
                     className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
-                    placeholder="Enter property title"
+                    placeholder="Enter vehicle title"
                   />
                 </div>
 
@@ -2577,151 +3856,491 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                     Description
                   </label>
                   <textarea
-                    value={newProperty.description}
-                    onChange={(e) => setNewProperty(prev => ({ ...prev, description: e.target.value }))}
+                    value={newvehicle.description}
+                    onChange={(e) => setNewvehicle(prev => ({ ...prev, description: e.target.value }))}
                     className="w-full h-24 px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
-                    placeholder="Describe your property"
+                    placeholder="Describe your vehicle"
                   />
                 </div>
 
-                <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
-                      Monthly Rent (₱)
-                    </label>
-                    <input
-                      type="number"
-                      value={newProperty.price}
-                      onChange={(e) => setNewProperty(prev => ({ ...prev, price: e.target.value }))}
-                      className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
-                      placeholder="15000"
-                    />
-                  </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {RENTAL_UNITS.map((unit) => (
+                    <div key={unit}>
+                      <label className="block text-sm font-medium text-gray-700 mb-2">
+                        {RENTAL_UNIT_LABELS[unit]} Rate (₱)
+                      </label>
+                      <input
+                        type="number"
+                        min="1"
+                        value={newvehicle.rates[unit]}
+                        onChange={(e) =>
+                          setNewvehicle((prev) => ({
+                            ...prev,
+                            rates: {
+                              ...prev.rates,
+                              [unit]: e.target.value,
+                            },
+                          }))
+                        }
+                        className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+                        placeholder={unit === 'hour' ? '500' : unit === 'day' ? '15000' : unit === 'week' ? '90000' : '300000'}
+                      />
+                    </div>
+                  ))}
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-2">
                       Location
                     </label>
                     <input
                       type="text"
-                      value={newProperty.location}
-                      onChange={(e) => setNewProperty(prev => ({ ...prev, location: e.target.value }))}
+                      value={newvehicle.location}
+                      onChange={(e) => setNewvehicle(prev => ({ ...prev, location: e.target.value }))}
                       className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
                       placeholder="Catbalogan City, Samar"
                     />
                   </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      Boundary Square Size (meters)
+                    </label>
+                    <input
+                      type="number"
+                      min="50"
+                      value={newvehicle.boundarySizeMeters}
+                      onChange={(e) =>
+                        setNewvehicle((prev) => ({
+                          ...prev,
+                          boundarySizeMeters: e.target.value,
+                          boundaryPlacementMode: 'center_square',
+                          boundaryCornerFirst: null,
+                          boundaryCornerSecond: null,
+                          boundaryFourCorners: [...EMPTY_FOUR_CORNERS],
+                        }))
+                      }
+                      className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+                      placeholder="200"
+                    />
+                    <p className="text-xs text-gray-500 mt-2">
+                      {newvehicle.boundaryPlacementMode === 'draw_four_corners' &&
+                      newvehicle.boundaryFourCorners.every((c) => c != null) ? (
+                        <>Box from four corner taps — size below matches the drawn rectangle.</>
+                      ) : newvehicle.boundaryPlacementMode === 'draw_two_corners' &&
+                        newvehicle.boundaryCornerFirst &&
+                        newvehicle.boundaryCornerSecond ? (
+                        <>Box from map taps — size below matches the drawn rectangle.</>
+                      ) : (
+                        <>
+                          Square coverage:{' '}
+                          {normalizeBoundarySize(Number(newvehicle.boundarySizeMeters)).toLocaleString()}m x{' '}
+                          {normalizeBoundarySize(Number(newvehicle.boundarySizeMeters)).toLocaleString()}m (
+                          {getSquareArea(Number(newvehicle.boundarySizeMeters)).toLocaleString()} sq m)
+                        </>
+                      )}
+                    </p>
+                  </div>
                 </div>
 
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">
-                    Amenities
+                <div className="rounded-xl border border-amber-100 bg-amber-50/90 p-4">
+                  <label className="block text-sm font-medium text-gray-800 mb-2" htmlFor="new-vehicle-boundary-penalty">
+                    Out-of-boundary penalty (₱)
                   </label>
-                  
-                  {/* Predefined Amenities */}
-                  <div className="mb-4">
-                    <p className="text-sm text-gray-600 mb-2">Select from common amenities:</p>
-                    <div className="grid grid-cols-2 gap-2">
-                      {['Gas', 'Electricity', 'Water', 'Parking Area', 'Wi-Fi', 'Laundry Area'].map((amenity) => (
-                        <label key={amenity} className="flex items-center space-x-2">
-                          <input
-                            type="checkbox"
-                            checked={newProperty.amenities.includes(amenity)}
-                            onChange={() => toggleAmenity(amenity)}
-                            className="text-blue-600 focus:ring-orange-500"
-                          />
-                          <span className="text-sm text-gray-700">{amenity}</span>
-                        </label>
-                      ))}
-                    </div>
-                  </div>
-
-                  {/* Custom Amenities */}
-                  <div className="mb-4">
-                    <p className="text-sm text-gray-600 mb-2">Add custom amenities:</p>
-                    <div className="flex gap-2">
-                      <input
-                        type="text"
-                        value={customAmenity}
-                        onChange={(e) => setCustomAmenity(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter') {
-                            e.preventDefault();
-                            addCustomAmenity();
-                          }
-                        }}
-                        className="flex-1 px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500 text-sm"
-                        placeholder="Enter custom amenity (e.g., Swimming Pool, Gym, Garden)"
-                      />
-                      <button
-                        type="button"
-                        onClick={addCustomAmenity}
-                        className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors text-sm font-medium"
-                      >
-                        Add
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Selected Amenities Display */}
-                  {newProperty.amenities.length > 0 && (
-                    <div>
-                      <p className="text-sm text-gray-600 mb-2">Selected amenities:</p>
-                      <div className="flex flex-wrap gap-2">
-                        {newProperty.amenities.map((amenity, index) => (
-                          <span
-                            key={index}
-                            className="inline-flex items-center gap-1 px-3 py-1 bg-blue-100 text-blue-800 rounded-full text-sm"
-                          >
-                            {amenity}
-                            <button
-                              type="button"
-                              onClick={() => removeAmenity(amenity)}
-                              className="ml-1 text-blue-600 hover:text-blue-800"
-                            >
-                              ×
-                            </button>
-                          </span>
-                        ))}
-                      </div>
-                    </div>
-                  )}
+                  <input
+                    id="new-vehicle-boundary-penalty"
+                    type="number"
+                    min="0"
+                    step="1"
+                    value={newvehicle.outOfBoundaryPenaltyPhp}
+                    onChange={(e) =>
+                      setNewvehicle((prev) => ({ ...prev, outOfBoundaryPenaltyPhp: e.target.value }))
+                    }
+                    className="w-full max-w-xs px-4 py-3 border border-amber-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 bg-white"
+                    placeholder="0"
+                  />
+                  <p className="text-xs text-amber-900/80 mt-2 leading-relaxed">
+                    If the renter drives outside the allowed GPS zone during the rental, this is the PHP penalty you
+                    list (e.g. per incident or per day outside—renters see it on the listing). Use 0 if you do not
+                    charge a fee.
+                  </p>
                 </div>
 
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-2">
-                    Property Images
+                    vehicle Images
                   </label>
                     <ImageUpload
-                    onImagesChange={(images) => setNewProperty(prev => ({ ...prev, images }))}
+                    onImagesChange={(images) => setNewvehicle(prev => ({ ...prev, images }))}
                       maxImages={5}
                   />
+                </div>
+
+                <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+                  <label className="block text-sm font-bold text-gray-900 mb-1">
+                    Vehicle Features
+                  </label>
+                  <p className="text-xs text-gray-600 mb-3">
+                    Select the features renters can use to filter and compare this vehicle.
+                  </p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    {VEHICLE_FEATURE_OPTIONS.map((feature) => (
+                      <label
+                        key={feature}
+                        className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-gray-700"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={newvehicle.amenities.includes(feature)}
+                          onChange={(event) =>
+                            setNewvehicle((prev) => ({
+                              ...prev,
+                              amenities: event.target.checked
+                                ? [...prev.amenities, feature]
+                                : prev.amenities.filter((item) => item !== feature),
+                            }))
+                          }
+                          className="h-4 w-4 rounded border-gray-300 text-orange-600 focus:ring-orange-500"
+                        />
+                        <span>{feature}</span>
+                      </label>
+                    ))}
+                  </div>
                 </div>
 
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-2">
                     Location on Map
                   </label>
-                  <div className="relative">
+                  <div className="mb-4 rounded-2xl border border-orange-100 bg-orange-50 p-4">
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                      <div>
+                        <p className="text-sm font-bold text-gray-900">Tracking Device</p>
+                        <p className="mt-1 text-xs text-gray-600">Enable this when the vehicle has a GPS tracker or when you want to update its tracked map position from this device.</p>
+                      </div>
+                      <label className="inline-flex items-center gap-2 text-sm font-semibold text-gray-800">
+                        <input
+                          type="checkbox"
+                          checked={newvehicle.trackingEnabled}
+                          onChange={(e) => setNewvehicle((prev) => ({ ...prev, trackingEnabled: e.target.checked }))}
+                          className="h-4 w-4 rounded border-gray-300 text-orange-600 focus:ring-orange-500"
+                        />
+                        Active
+                      </label>
+                    </div>
+                    <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div>
+                        <label className="block text-xs font-medium text-gray-600 mb-1">Device ID</label>
+                        <input
+                          value={newvehicle.trackingDeviceId}
+                          onChange={(e) => setNewvehicle((prev) => ({ ...prev, trackingDeviceId: e.target.value }))}
+                          className="w-full px-4 py-2 border border-orange-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+                          placeholder="GPS-001 or plate tracker code"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-medium text-gray-600 mb-1">Provider</label>
+                        <input
+                          value={newvehicle.trackingProvider}
+                          onChange={(e) => setNewvehicle((prev) => ({ ...prev, trackingProvider: e.target.value }))}
+                          className="w-full px-4 py-2 border border-orange-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+                          placeholder="Manual GPS"
+                        />
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        try {
+                          const position = await getBrowserPosition();
+                          setNewvehicle((prev) => ({
+                            ...prev,
+                            currentCoordinates: position,
+                            trackingEnabled: true,
+                          }));
+                        } catch (error: any) {
+                          alert(error?.message || 'Unable to read current GPS location.');
+                        }
+                      }}
+                      className="mt-3 w-full sm:w-auto bg-orange-600 text-white px-4 py-2 rounded-xl hover:bg-orange-700 transition-colors text-sm font-semibold"
+                    >
+                      Use this device GPS as tracker position
+                    </button>
+                  </div>
+                  <div className="mb-3 flex flex-col gap-2">
+                    <p className="text-sm font-semibold text-gray-900">How do you want to set the allowed map area?</p>
+                    <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setNewvehicle((prev) => ({
+                            ...prev,
+                            boundaryPlacementMode: 'center_square',
+                            boundaryCornerFirst: null,
+                            boundaryCornerSecond: null,
+                            boundaryFourCorners: [...EMPTY_FOUR_CORNERS],
+                          }))
+                        }
+                        className={`min-h-[48px] flex-1 rounded-xl px-4 py-3 text-sm font-semibold transition-all sm:min-w-[10rem] ${
+                          newvehicle.boundaryPlacementMode === 'center_square'
+                            ? 'bg-blue-600 text-white shadow-md'
+                            : 'border-2 border-gray-200 bg-white text-gray-800 hover:border-blue-300'
+                        }`}
+                      >
+                        Pin center + size
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setNewvehicle((prev) => ({
+                            ...prev,
+                            boundaryPlacementMode: 'draw_two_corners',
+                            boundaryCornerFirst: null,
+                            boundaryCornerSecond: null,
+                            boundaryFourCorners: [...EMPTY_FOUR_CORNERS],
+                          }))
+                        }
+                        className={`min-h-[48px] flex-1 rounded-xl px-4 py-3 text-sm font-semibold transition-all sm:min-w-[10rem] ${
+                          newvehicle.boundaryPlacementMode === 'draw_two_corners'
+                            ? 'bg-blue-600 text-white shadow-md'
+                            : 'border-2 border-gray-200 bg-white text-gray-800 hover:border-blue-300'
+                        }`}
+                      >
+                        Tap 2 corners (touch-friendly)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setNewvehicle((prev) => ({
+                            ...prev,
+                            boundaryPlacementMode: 'draw_four_corners',
+                            boundaryCornerFirst: null,
+                            boundaryCornerSecond: null,
+                            boundaryFourCorners: [...EMPTY_FOUR_CORNERS],
+                          }))
+                        }
+                        className={`min-h-[48px] flex-1 rounded-xl px-4 py-3 text-sm font-semibold transition-all sm:min-w-[10rem] ${
+                          newvehicle.boundaryPlacementMode === 'draw_four_corners'
+                            ? 'bg-blue-600 text-white shadow-md'
+                            : 'border-2 border-gray-200 bg-white text-gray-800 hover:border-blue-300'
+                        }`}
+                      >
+                        Tap 4 corners (TR→TL→BR→BL)
+                      </button>
+                    </div>
+                    <p className="text-sm leading-relaxed text-gray-700">
+                      {newvehicle.boundaryPlacementMode === 'center_square' ? (
+                        <>
+                          <strong>Left / Right / Top / Bottom</strong> follow a square from the pin: tap the map to
+                          move the center, then adjust <strong>meters</strong> below. Works with finger or mouse.
+                        </>
+                      ) : newvehicle.boundaryPlacementMode === 'draw_four_corners' ? (
+                        (() => {
+                          const nextIdx = newvehicle.boundaryFourCorners.findIndex((c) => c == null);
+                          const done = nextIdx === -1;
+                          if (done) {
+                            return (
+                              <>
+                                Box set. Tap the map again to <strong>restart</strong> from TR, or use{' '}
+                                <strong>Clear corners</strong>.
+                              </>
+                            );
+                          }
+                          return (
+                            <>
+                              <strong>
+                                Step {nextIdx + 1} of 4 ({BOUNDARY_FOUR_CORNER_SHORT[nextIdx]}):
+                              </strong>{' '}
+                              Tap <strong>{BOUNDARY_FOUR_CORNER_HINT[nextIdx]}</strong> of the rental zone.
+                            </>
+                          );
+                        })()
+                      ) : !newvehicle.boundaryCornerFirst ? (
+                        <>
+                          <strong>Step 1 of 2:</strong> Tap one corner of the rental zone — for example where{' '}
+                          <strong>Left</strong> and <strong>Bottom</strong> meet.
+                        </>
+                      ) : !newvehicle.boundaryCornerSecond ? (
+                        <>
+                          <strong>Step 2 of 2:</strong> Tap the <strong>opposite</strong> corner —{' '}
+                          <strong>Right</strong> and <strong>Top</strong>. The blue box fills between the two taps.
+                        </>
+                      ) : (
+                        <>
+                          Box set. Tap the map again to <strong>redraw</strong> from a new first corner, or use{' '}
+                          <strong>Clear corners</strong>.
+                        </>
+                      )}
+                    </p>
+                    {newvehicle.boundaryPlacementMode === 'draw_two_corners' && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setNewvehicle((prev) => ({
+                            ...prev,
+                            boundaryCornerFirst: null,
+                            boundaryCornerSecond: null,
+                          }))
+                        }
+                        className="self-start rounded-lg border border-orange-200 bg-orange-50 px-4 py-2 text-sm font-semibold text-orange-900 min-h-[44px]"
+                      >
+                        Clear corners
+                      </button>
+                    )}
+                    {newvehicle.boundaryPlacementMode === 'draw_four_corners' && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setNewvehicle((prev) => ({
+                            ...prev,
+                            boundaryFourCorners: [...EMPTY_FOUR_CORNERS],
+                          }))
+                        }
+                        className="self-start rounded-lg border border-orange-200 bg-orange-50 px-4 py-2 text-sm font-semibold text-orange-900 min-h-[44px]"
+                      >
+                        Clear corners
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="relative touch-manipulation">
                   <GoogleMap
-                    center={newProperty.coordinates || { lat: 11.7778, lng: 124.8847 }}
+                    center={newvehicle.coordinates}
                     zoom={14}
                     satellite={true}
                     preferLeaflet={true}
-                    markers={[{
-                      position: newProperty.coordinates || { lat: 11.7778, lng: 124.8847 },
-                      title: newProperty.title || 'New Property'
-                    }]}
+                    markers={[
+                      {
+                        position: newvehicle.coordinates,
+                        title: newvehicle.title || 'Listing center',
+                      },
+                      {
+                        position: newvehicle.currentCoordinates,
+                        title: 'Current vehicle position',
+                      },
+                      ...(ownerMapUserGpsAdd
+                        ? [
+                            {
+                              position: ownerMapUserGpsAdd,
+                              title: 'Your GPS (this device)',
+                              info: `${ownerMapUserGpsAdd.lat.toFixed(6)}, ${ownerMapUserGpsAdd.lng.toFixed(6)}`,
+                            },
+                          ]
+                        : []),
+                      ...(newvehicle.boundaryPlacementMode === 'draw_four_corners'
+                        ? newvehicle.boundaryFourCorners.flatMap((c, i) =>
+                            c
+                              ? [
+                                  {
+                                    position: c,
+                                    title: `${BOUNDARY_FOUR_CORNER_SHORT[i]} — ${BOUNDARY_FOUR_CORNER_HINT[i]}`,
+                                  },
+                                ]
+                              : []
+                          )
+                        : newvehicle.boundaryPlacementMode === 'draw_two_corners' &&
+                            newvehicle.boundaryCornerFirst &&
+                            !newvehicle.boundaryCornerSecond
+                          ? [
+                              {
+                                position: newvehicle.boundaryCornerFirst,
+                                title: 'First corner — tap opposite next',
+                              },
+                            ]
+                          : []),
+                    ]}
+                    polygons={[
+                      {
+                        path: getSquareBoundaryPath(newVehicleMapBoundary),
+                        strokeColor: '#2563eb',
+                        strokeWeight: 2,
+                        fillColor: '#60a5fa',
+                        fillOpacity: 0.08,
+                      },
+                    ]}
                     onMapClick={(lat, lng) => {
-                      console.log('Map clicked at:', lat, lng);
-                      setNewProperty(prev => ({ ...prev, coordinates: { lat, lng } }));
+                      const point = { lat, lng };
+                      if (newvehicle.boundaryPlacementMode === 'draw_four_corners') {
+                        setNewvehicle((prev) => {
+                          if (prev.boundaryPlacementMode !== 'draw_four_corners') return prev;
+                          const corners: [LatLng | null, LatLng | null, LatLng | null, LatLng | null] = [
+                            ...prev.boundaryFourCorners,
+                          ];
+                          const firstEmpty = corners.findIndex((c) => c == null);
+                          if (firstEmpty === -1) {
+                            return {
+                              ...prev,
+                              boundaryFourCorners: [point, null, null, null],
+                              boundaryCornerFirst: null,
+                              boundaryCornerSecond: null,
+                            };
+                          }
+                          corners[firstEmpty] = point;
+                          const filled = corners.filter((c): c is LatLng => c != null);
+                          const rect =
+                            filled.length >= 2 ? buildAxisAlignedBoundaryFromPoints(filled) : null;
+                          const base = {
+                            ...prev,
+                            boundaryFourCorners: corners,
+                            boundaryCornerFirst: null,
+                            boundaryCornerSecond: null,
+                          };
+                          if (rect) {
+                            const center = getBoundaryCenter(rect);
+                            return {
+                              ...base,
+                              coordinates: center,
+                              boundarySizeMeters: String(rect.sizeMeters),
+                            };
+                          }
+                          return base;
+                        });
+                      } else if (newvehicle.boundaryPlacementMode === 'draw_two_corners') {
+                        setNewvehicle((prev) => {
+                          if (!prev.boundaryCornerFirst) {
+                            return { ...prev, boundaryCornerFirst: point, boundaryCornerSecond: null };
+                          }
+                          if (!prev.boundaryCornerSecond) {
+                            const rect = buildRectangleBoundaryFromTwoCorners(prev.boundaryCornerFirst, point);
+                            const center = getBoundaryCenter(rect);
+                            return {
+                              ...prev,
+                              boundaryCornerSecond: point,
+                              coordinates: center,
+                              boundarySizeMeters: String(rect.sizeMeters),
+                            };
+                          }
+                          return {
+                            ...prev,
+                            boundaryCornerFirst: point,
+                            boundaryCornerSecond: null,
+                          };
+                        });
+                      } else {
+                        setNewvehicle((prev) => ({
+                          ...prev,
+                          coordinates: point,
+                          currentCoordinates: point,
+                          boundaryCornerFirst: null,
+                          boundaryCornerSecond: null,
+                          boundaryFourCorners: [...EMPTY_FOUR_CORNERS],
+                        }));
+                      }
+                      refreshOwnerDeviceGpsMarker(setOwnerMapUserGpsAdd);
                     }}
-                    className="h-64 w-full rounded-lg"
+                    className="h-72 w-full min-h-[288px] rounded-lg sm:h-80"
                   />
-                    <div className="absolute top-2 left-2 bg-blue-600 text-white px-3 py-1.5 rounded-lg shadow-lg text-xs font-semibold z-10">
-                      📍 Click on map to set location
+                    <div className="pointer-events-none absolute bottom-2 left-2 right-2 z-10 rounded-lg bg-gray-900/75 px-3 py-2 text-center text-xs font-semibold text-white sm:text-sm">
+                      {newvehicle.boundaryPlacementMode === 'center_square'
+                        ? 'Tap map — pin & square; your GPS marker updates from this device'
+                        : newvehicle.boundaryPlacementMode === 'draw_four_corners'
+                          ? 'Tap corners TR→TL→BR→BL; your GPS shows from this device'
+                          : 'Tap twice for box; your GPS shows from this device'}
                     </div>
                   </div>
                   <p className="text-sm text-gray-500 mt-2">
-                    Click anywhere on the map above to set the exact location of your property
+                    Blue corners show <strong>Left</strong>, <strong>Right</strong>, <strong>Top</strong>, and{' '}
+                    <strong>Bottom</strong> limits for renters and alerts.
                   </p>
 
                   <div className="mt-3 grid grid-cols-2 gap-4">
@@ -2730,11 +4349,14 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                       <input
                         type="number"
                         step="any"
-                        value={newProperty.coordinates.lat}
+                        value={newvehicle.coordinates.lat}
                         onChange={(e) => {
                           const lat = parseFloat(e.target.value);
                           if (!Number.isNaN(lat)) {
-                            setNewProperty(prev => ({ ...prev, coordinates: { lat, lng: prev.coordinates.lng } }));
+                            setNewvehicle(prev => ({
+                              ...prev,
+                              coordinates: { lat, lng: prev.coordinates.lng },
+                            }));
                           }
                         }}
                         className="w-full px-4 py-2 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
@@ -2746,11 +4368,14 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                       <input
                         type="number"
                         step="any"
-                        value={newProperty.coordinates.lng}
+                        value={newvehicle.coordinates.lng}
                         onChange={(e) => {
                           const lng = parseFloat(e.target.value);
                           if (!Number.isNaN(lng)) {
-                            setNewProperty(prev => ({ ...prev, coordinates: { lat: prev.coordinates.lat, lng } }));
+                            setNewvehicle(prev => ({
+                              ...prev,
+                              coordinates: { lat: prev.coordinates.lat, lng },
+                            }));
                           }
                         }}
                         className="w-full px-4 py-2 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
@@ -2758,35 +4383,80 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                       />
                     </div>
                   </div>
-                  <p className="text-xs text-gray-500 mt-2">Selected: {newProperty.coordinates.lat.toFixed(6)}, {newProperty.coordinates.lng.toFixed(6)}</p>
+                  <div className="mt-3 grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-xs font-medium text-gray-600 mb-1">Current Vehicle Latitude</label>
+                      <input
+                        type="number"
+                        step="any"
+                        value={newvehicle.currentCoordinates.lat}
+                        onChange={(e) => {
+                          const lat = parseFloat(e.target.value);
+                          if (!Number.isNaN(lat)) {
+                            setNewvehicle((prev) => ({
+                              ...prev,
+                              currentCoordinates: { lat, lng: prev.currentCoordinates.lng },
+                            }));
+                          }
+                        }}
+                        className="w-full px-4 py-2 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+                        placeholder="Current latitude"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-gray-600 mb-1">Current Vehicle Longitude</label>
+                      <input
+                        type="number"
+                        step="any"
+                        value={newvehicle.currentCoordinates.lng}
+                        onChange={(e) => {
+                          const lng = parseFloat(e.target.value);
+                          if (!Number.isNaN(lng)) {
+                            setNewvehicle((prev) => ({
+                              ...prev,
+                              currentCoordinates: { lat: prev.currentCoordinates.lat, lng },
+                            }));
+                          }
+                        }}
+                        className="w-full px-4 py-2 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+                        placeholder="Current longitude"
+                      />
+                    </div>
+                  </div>
+                  <p className="text-xs text-gray-500 mt-2">
+                    Center: {newvehicle.coordinates.lat.toFixed(6)}, {newvehicle.coordinates.lng.toFixed(6)} | Current: {newvehicle.currentCoordinates.lat.toFixed(6)}, {newvehicle.currentCoordinates.lng.toFixed(6)}
+                  </p>
                 </div>
 
                 <div className="flex gap-3 pt-4">
                   <button
-                    onClick={() => setShowAddProperty(false)}
+                    onClick={() => {
+                      setShowAddvehicle(false);
+                      resetNewvehicleForm();
+                    }}
                     className="flex-1 bg-gray-200 text-gray-800 py-3 rounded-xl hover:bg-gray-300 transition-colors"
                   >
                     Cancel
                   </button>
                   <button
-                    onClick={handleAddProperty}
-                    disabled={isAddingProperty}
+                    onClick={handleAddvehicle}
+                    disabled={isAddingvehicle}
                     className={`flex-1 py-3 rounded-xl transition-colors flex items-center justify-center ${
-                      isAddingProperty 
+                      isAddingvehicle 
                         ? 'bg-gray-400 text-gray-200 cursor-not-allowed' 
                         : 'bg-blue-600 text-white hover:bg-blue-700'
                     }`}
                   >
-                    {isAddingProperty ? (
+                    {isAddingvehicle ? (
                       <>
                         <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
                           <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
                           <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                         </svg>
-                        Adding Property...
+                        Adding vehicle...
                       </>
                     ) : (
-                      'Add Property'
+                      'Add vehicle'
                     )}
                   </button>
                 </div>
@@ -2796,19 +4466,18 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
         </div>
       )}
 
-      {/* Property Details Modal */}
-      {showPropertyDetails && (
+      {/* vehicle Details Modal */}
+      {showvehicleDetails && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-3 sm:p-4 z-50">
           <div className="bg-white rounded-xl sm:rounded-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto">
             <div className="p-4 sm:p-6">
               <div className="flex justify-between items-start mb-4">
-                <h2 className="text-2xl font-bold">{showPropertyDetails.title}</h2>
+                <h2 className="text-2xl font-bold">{showvehicleDetails.title}</h2>
                 <button
                   onClick={async () => {
-                    setShowPropertyDetails(null);
-                    setRooms([]);
-                    setBeds([]);
-                    setPropertyPermit(null);
+                    setOwnerMapUserGpsDetails(null);
+                    setShowvehicleDetails(null);
+                    setvehiclePermit(null);
                   }}
                   className="text-gray-500 hover:text-gray-700"
                 >
@@ -2819,11 +4488,11 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
               <div className="space-y-4">
                 {/* Image Carousel */}
                 <div className="h-64 sm:h-80 md:h-96">
-                  {showPropertyDetails.images && showPropertyDetails.images.length > 0 ? (
+                  {showvehicleDetails.images && showvehicleDetails.images.length > 0 ? (
                     <ImageCarousel 
-                      images={showPropertyDetails.images} 
-                      alt={showPropertyDetails.title}
-                      bucket="property-images"
+                      images={showvehicleDetails.images} 
+                      alt={showvehicleDetails.title}
+                      bucket="vehicle-images"
                       showThumbnails={true}
                     />
                   ) : (
@@ -2835,103 +4504,125 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
 
                 <div>
                   <h3 className="font-semibold text-lg mb-2">Description</h3>
-                  <p className="text-gray-600">{showPropertyDetails.description}</p>
+                  <p className="text-gray-600">{showvehicleDetails.description}</p>
                 </div>
 
                 <div>
                   <h3 className="font-semibold text-lg mb-2">Location</h3>
-                  <p className="text-gray-600">{showPropertyDetails.location}</p>
+                  <p className="text-gray-600">{showvehicleDetails.location}</p>
                   <div className="mt-2">
                     <GoogleMap
-                      center={showPropertyDetails.coordinates || { lat: 11.7778, lng: 124.8847 }}
+                      center={showvehicleDetails.coordinates}
                       zoom={15}
                       satellite={true}
                       preferLeaflet={true}
-                      markers={[{
-                        position: showPropertyDetails.coordinates || { lat: 11.7778, lng: 124.8847 },
-                        title: showPropertyDetails.title,
-                        info: showPropertyDetails.description
+                      markers={[
+                        {
+                          position: showvehicleDetails.coordinates,
+                          title: `${showvehicleDetails.title} boundary center`,
+                          info: showvehicleDetails.description
+                        },
+                        {
+                          position: showvehicleDetails.currentCoordinates,
+                          title: `${showvehicleDetails.title} current position`,
+                          info: 'Current tracked vehicle position'
+                        },
+                        ...(ownerMapUserGpsDetails
+                          ? [
+                              {
+                                position: ownerMapUserGpsDetails,
+                                title: 'Your GPS (this device)',
+                                info: `${ownerMapUserGpsDetails.lat.toFixed(6)}, ${ownerMapUserGpsDetails.lng.toFixed(6)}`,
+                              },
+                            ]
+                          : []),
+                      ]}
+                      polygons={[{
+                        path: getSquareBoundaryPath(showvehicleDetails.boundary),
+                        strokeColor: '#2563eb',
+                        strokeWeight: 2,
+                        fillColor: '#60a5fa',
+                        fillOpacity: 0.08,
                       }]}
+                      onMapClick={() => refreshOwnerDeviceGpsMarker(setOwnerMapUserGpsDetails)}
                       className="h-64 w-full rounded-lg"
                     />
+                    <p className="text-xs text-gray-500 mt-2">
+                      Tap the map to show your current GPS position on this device (permission may be required).
+                    </p>
                   </div>
                 </div>
 
                 <div>
-                  <h3 className="font-semibold text-lg mb-2">Amenities</h3>
-                  <div className="flex flex-wrap gap-2">
-                    {showPropertyDetails.amenities.map((amenity, index) => (
-                      <span
-                        key={index}
-                        className="bg-orange-100 text-orange-800 px-3 py-1 rounded-full text-sm"
-                      >
-                        {amenity}
-                      </span>
-                    ))}
+                  <h3 className="font-semibold text-lg mb-2">Boundary Square</h3>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    <div className="rounded-2xl bg-blue-50 border border-blue-100 p-4">
+                      <p className="text-xs font-semibold uppercase tracking-[0.16em] text-blue-700">Square Size</p>
+                      <p className="text-lg font-bold text-gray-900 mt-2">
+                        {showvehicleDetails.boundarySizeMeters.toLocaleString()}m x {showvehicleDetails.boundarySizeMeters.toLocaleString()}m
+                      </p>
+                    </div>
+                    <div className="rounded-2xl bg-blue-50 border border-blue-100 p-4">
+                      <p className="text-xs font-semibold uppercase tracking-[0.16em] text-blue-700">Coverage</p>
+                      <p className="text-lg font-bold text-gray-900 mt-2">
+                        {getSquareArea(showvehicleDetails.boundarySizeMeters).toLocaleString()} sq m
+                      </p>
+                    </div>
+                    <div className="rounded-2xl bg-blue-50 border border-blue-100 p-4">
+                      <p className="text-xs font-semibold uppercase tracking-[0.16em] text-blue-700">Tracking Status</p>
+                      <p className={`text-lg font-bold mt-2 ${isPointWithinBoundary(showvehicleDetails.currentCoordinates, showvehicleDetails.boundary) ? 'text-emerald-700' : 'text-red-700'}`}>
+                        {isPointWithinBoundary(showvehicleDetails.currentCoordinates, showvehicleDetails.boundary) ? 'Inside boundary' : 'Outside boundary'}
+                      </p>
+                    </div>
+                    <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 md:col-span-3">
+                      <p className="text-xs font-semibold uppercase tracking-[0.16em] text-amber-800">Out-of-boundary penalty</p>
+                      <p className="text-lg font-bold text-gray-900 mt-2">
+                        {(showvehicleDetails.outOfBoundaryPenaltyPhp ?? 0) > 0
+                          ? `₱${showvehicleDetails.outOfBoundaryPenaltyPhp.toLocaleString()}`
+                          : 'None (₱0)'}
+                      </p>
+                      <p className="text-xs text-amber-900/80 mt-1">
+                        Shown to renters when leaving the allowed GPS zone during a booking.
+                      </p>
+                    </div>
                   </div>
+                  <p className="text-xs text-gray-500 mt-3">
+                    Center: {showvehicleDetails.coordinates.lat.toFixed(6)}, {showvehicleDetails.coordinates.lng.toFixed(6)} | Current: {showvehicleDetails.currentCoordinates.lat.toFixed(6)}, {showvehicleDetails.currentCoordinates.lng.toFixed(6)}
+                  </p>
                 </div>
 
-                {/* Rooms Management */}
-                <div className="border-t pt-4">
-                  <div className="flex justify-between items-center mb-4">
-                    <h3 className="font-semibold text-lg">Rooms</h3>
-                    <button
-                      onClick={async () => {
-                        // Load existing rooms
-                        try {
-                          const { data: roomsData } = await supabase
-                            .from('rooms')
-                            .select('*')
-                            .eq('boarding_house_id', showPropertyDetails.id)
-                            .order('room_number', { ascending: true });
-                          setRooms(roomsData || []);
-                        } catch (error) {
-                          console.error('Failed to load rooms:', error);
-                          setRooms([]);
-                        }
-                        setShowAddRoom(true);
-                      }}
-                      className="glass-button px-4 py-2 rounded-lg text-sm font-semibold"
-                    >
-                      + Add Room
-                    </button>
-                            </div>
-                  <div className="space-y-2">
-                    {rooms.length > 0 ? (
-                      rooms.map((room: any) => (
-                        <div key={room.id} className="bg-gray-50 p-3 rounded-lg flex justify-between items-center">
-                            <div>
-                            <p className="font-semibold">Room {room.room_number} - {room.room_name || 'Unnamed'}</p>
-                            <p className="text-sm text-gray-600">Max Beds: {room.max_beds} | Price per Bed: ₱{room.price_per_bed || 0}</p>
-                            <p className="text-xs text-gray-500">Status: {room.status}</p>
-                          </div>
-                          <button
-                            onClick={async () => {
-                              setSelectedRoomForBed(room.id);
-                              try {
-                                const { data: bedsData } = await supabase
-                                  .from('beds')
-                                  .select('*')
-                                  .eq('room_id', room.id)
-                                  .order('bed_number', { ascending: true });
-                                setBeds(bedsData || []);
-                              } catch (error) {
-                                console.error('Failed to load beds:', error);
-                                setBeds([]);
-                              }
-                              setShowAddBed(true);
-                            }}
-                            className="text-orange-600 hover:text-orange-700 text-sm font-semibold"
-                          >
-                            Manage Beds
-                          </button>
-                                      </div>
-                      ))
-                    ) : (
-                      <p className="text-gray-500 text-sm">No rooms added yet. Click "Add Room" to get started.</p>
-                          )}
-                        </div>
+                <div className="rounded-2xl bg-orange-50 border border-orange-100 p-4">
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                      <p className="text-xs font-semibold uppercase tracking-[0.16em] text-orange-700">Tracking Device</p>
+                      <p className="mt-2 text-lg font-bold text-gray-900">
+                        {showvehicleDetails.trackingEnabled ? 'Active' : 'Inactive'}
+                      </p>
+                      <p className="mt-1 text-sm text-gray-600">
+                        {showvehicleDetails.trackingDeviceId || 'No device ID assigned'} · {showvehicleDetails.trackingProvider || 'Manual GPS'}
+                      </p>
+                      {showvehicleDetails.trackingLastPing && (
+                        <p className="mt-1 text-xs text-gray-500">
+                          Last update: {new Date(showvehicleDetails.trackingLastPing).toLocaleString()}
+                        </p>
+                      )}
                     </div>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        try {
+                          const position = await getBrowserPosition();
+                          await trackVehicleFromUserDevice(showvehicleDetails);
+                        } catch (error: any) {
+                          alert(error?.message || 'Unable to update tracked position.');
+                        }
+                      }}
+                      className="bg-orange-600 text-white px-4 py-2 rounded-xl hover:bg-orange-700 transition-colors text-sm font-semibold"
+                    >
+                      Update tracker from this device
+                    </button>
+                  </div>
+                </div>
 
                 {/* Permits Section */}
                 <div className="border-t pt-4">
@@ -2941,11 +4632,11 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                       onClick={async () => {
                         try {
                           const { data: permitData } = await supabase
-                            .from('properties')
+                            .from('vehicles')
                             .select('business_permit_url')
-                            .eq('id', showPropertyDetails.id)
+                            .eq('id', showvehicleDetails.id)
                             .single();
-                          setPropertyPermit(permitData?.business_permit_url || null);
+                          setvehiclePermit(permitData?.business_permit_url || null);
                         } catch (error) {
                           console.error('Failed to load permit:', error);
                         }
@@ -2953,32 +4644,55 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                       }}
                       className="glass-button px-4 py-2 rounded-lg text-sm font-semibold"
                     >
-                      {propertyPermit ? 'View/Update Permit' : 'Upload Permit'}
+                      {vehiclePermit ? 'View/Update Permit' : 'Upload Permit'}
                     </button>
                   </div>
-                  {propertyPermit && (
+                  {vehiclePermit && (
                     <div className="bg-gray-50 p-3 rounded-lg">
-                      <a href={propertyPermit} target="_blank" rel="noopener noreferrer" className="text-orange-600 hover:text-orange-700 text-sm font-semibold">
+                      <a href={vehiclePermit} target="_blank" rel="noopener noreferrer" className="text-orange-600 hover:text-orange-700 text-sm font-semibold">
                         View Business Permit →
                       </a>
                     </div>
                   )}
                 </div>
 
+                <div className="border-t pt-4">
+                  <h3 className="font-semibold text-lg mb-4">Rent Plan Preview</h3>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                    {RENTAL_UNITS.map((unit) => (
+                      <div key={unit} className="rounded-2xl bg-orange-50 border border-orange-100 p-4">
+                        <p className="text-xs font-semibold uppercase tracking-[0.16em] text-orange-700">
+                          {RENTAL_UNIT_LABELS[unit]}
+                        </p>
+                        <p className="text-lg font-bold text-gray-900 mt-2">
+                          ₱{showvehicleDetails.rentalRates[unit].toLocaleString()}
+                        </p>
+                        <p className="text-xs text-gray-500 mt-1">{RENTAL_UNIT_SUFFIXES[unit]}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
                 <div className="flex justify-between items-center pt-4 border-t">
                   <div>
                     <p className="text-2xl font-bold text-orange-600">
-                      ₱{showPropertyDetails.price.toLocaleString()}/month
+                      ₱{showvehicleDetails.price.toLocaleString()}/day
                     </p>
                     <p className="text-sm text-gray-500">
-                      Status: {showPropertyDetails.status}
+                      Status: {showvehicleDetails.status}
                     </p>
                   </div>
                   <div className="flex gap-2">
-                    <button onClick={() => setEditingProperty(showPropertyDetails)} className="glass-button px-4 py-2 rounded-lg font-semibold">
+                    <button
+                      onClick={() => {
+                        setOwnerMapUserGpsEdit(null);
+                        setEditingvehicle(showvehicleDetails);
+                      }}
+                      className="glass-button px-4 py-2 rounded-lg font-semibold"
+                    >
                       Edit
                     </button>
-                    <button onClick={() => handleDeleteProperty(showPropertyDetails.id)} className="bg-red-600 text-white px-4 py-2 rounded-lg hover:bg-red-700 transition-colors font-semibold">
+                    <button onClick={() => handleDeletevehicle(showvehicleDetails.id)} className="bg-red-600 text-white px-4 py-2 rounded-lg hover:bg-red-700 transition-colors font-semibold">
                       Delete
                     </button>
                   </div>
@@ -2989,292 +4703,107 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
         </div>
       )}
 
-      {/* Add Room Modal */}
-      {showAddRoom && showPropertyDetails && (
+      {showOwnerRequirementsModal && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-          <div className="bg-white rounded-2xl max-w-md w-full p-6">
-            <div className="flex justify-between items-center mb-4">
-              <h2 className="text-2xl font-bold text-gray-900">Add Room</h2>
-              <button onClick={() => { setShowAddRoom(false); setNewRoom({ room_number: '', room_name: '', max_beds: '', price_per_bed: '', status: 'available' }); }} className="text-gray-500 hover:text-gray-700 text-2xl font-bold">×</button>
+          <div className="bg-white rounded-2xl max-w-2xl w-full shadow-2xl overflow-hidden">
+            <div className="bg-gradient-to-r from-orange-500 to-orange-600 px-6 py-5 text-white">
+              <h2 className="text-2xl font-bold">Complete Owner Requirements</h2>
+              <p className="mt-2 text-sm text-orange-50">
+                Submit your profile details, ID, and permit before adding a vehicle listing.
+              </p>
             </div>
-            <div className="space-y-4">
-              <div>
-                <label className="block text-sm font-semibold text-gray-700 mb-2">Room Number *</label>
-                <input type="text" value={newRoom.room_number} onChange={(e) => setNewRoom({ ...newRoom, room_number: e.target.value })} className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500" placeholder="e.g., 101" required />
-              </div>
-              <div>
-                <label className="block text-sm font-semibold text-gray-700 mb-2">Room Name</label>
-                <input type="text" value={newRoom.room_name} onChange={(e) => setNewRoom({ ...newRoom, room_name: e.target.value })} className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500" placeholder="e.g., Master Bedroom" />
-              </div>
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-sm font-semibold text-gray-700 mb-2">Max Beds *</label>
-                  <input type="number" value={newRoom.max_beds} onChange={(e) => setNewRoom({ ...newRoom, max_beds: e.target.value })} className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500" placeholder="2" min="1" required />
-                </div>
-                <div>
-                  <label className="block text-sm font-semibold text-gray-700 mb-2">Price per Bed (₱) *</label>
-                  <input type="number" value={newRoom.price_per_bed} onChange={(e) => setNewRoom({ ...newRoom, price_per_bed: e.target.value })} className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500" placeholder="5000" min="0" required />
-                </div>
-              </div>
-              <div>
-                <label className="block text-sm font-semibold text-gray-700 mb-2">Status</label>
-                <select value={newRoom.status} onChange={(e) => setNewRoom({ ...newRoom, status: e.target.value })} className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500">
-                  <option value="available">Available</option>
-                  <option value="full">Full</option>
-                  <option value="maintenance">Maintenance</option>
-                </select>
-              </div>
-              <div className="flex gap-3 pt-4">
-                <button onClick={() => { setShowAddRoom(false); setNewRoom({ room_number: '', room_name: '', max_beds: '', price_per_bed: '', status: 'available' }); }} className="flex-1 px-4 py-3 bg-gray-200 text-gray-800 rounded-xl hover:bg-gray-300 transition-colors font-semibold">Cancel</button>
-                <button onClick={async () => {
-                  if (!newRoom.room_number || !newRoom.max_beds || !newRoom.price_per_bed) {
-                    alert('Please fill in all required fields');
-                    return;
-                  }
-                  try {
-                    const { error } = await supabase.from('rooms').insert([{
-                      boarding_house_id: showPropertyDetails.id,
-                      room_number: newRoom.room_number,
-                      room_name: newRoom.room_name || null,
-                      max_beds: parseInt(newRoom.max_beds),
-                      price_per_bed: parseFloat(newRoom.price_per_bed),
-                      status: newRoom.status,
-                      current_occupancy: 0
-                    }]);
-                    if (error) throw error;
-                    alert('Room added successfully!');
-                    // Reload rooms
-                    const { data: roomsData } = await supabase.from('rooms').select('*').eq('boarding_house_id', showPropertyDetails.id).order('room_number', { ascending: true });
-                    setRooms(roomsData || []);
-                    setShowAddRoom(false);
-                    setNewRoom({ room_number: '', room_name: '', max_beds: '', price_per_bed: '', status: 'available' });
-                  } catch (error: any) {
-                    console.error('Failed to add room:', error);
-                    alert(`Failed to add room: ${error.message || 'Unknown error'}`);
-                  }
-                }} className="flex-1 glass-button px-4 py-3 rounded-xl font-semibold">Add Room</button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
 
-      {/* Add Bed Modal */}
-      {showAddBed && selectedRoomForBed && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-          <div className="bg-white rounded-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto p-6">
-            <div className="flex justify-between items-center mb-4">
-              <h2 className="text-2xl font-bold text-gray-900">Manage Beds</h2>
-              <button onClick={() => { setShowAddBed(false); setSelectedRoomForBed(''); setNewBed({ bed_number: '', bed_type: 'single', deck_position: 'lower', status: 'available', price: '' }); }} className="text-gray-500 hover:text-gray-700 text-2xl font-bold">×</button>
-            </div>
-            
-            {/* Existing Beds */}
-            <div className="mb-6">
-              <h3 className="font-semibold text-lg mb-3">Existing Beds</h3>
-              {beds.length > 0 ? (
-                <div className="space-y-2">
-                  {beds.map((bed: any) => (
-                    <div key={bed.id} className="bg-gray-50 p-3 rounded-lg flex justify-between items-center">
-                      <div>
-                        <p className="font-semibold">Bed {bed.bed_number} - {bed.bed_type} ({bed.deck_position})</p>
-                        <p className="text-sm text-gray-600">Status: {bed.status} | Price: ₱{bed.price || 0}</p>
-                      </div>
-                      <button onClick={async () => {
-                        if (confirm('Are you sure you want to delete this bed?')) {
-                          try {
-                            const { error } = await supabase.from('beds').delete().eq('id', bed.id);
-                            if (error) throw error;
-                            const { data: bedsData } = await supabase.from('beds').select('*').eq('room_id', selectedRoomForBed).order('bed_number', { ascending: true });
-                            setBeds(bedsData || []);
-                          } catch (error: any) {
-                            alert(`Failed to delete bed: ${error.message}`);
-                          }
-                        }
-                      }} className="text-red-600 hover:text-red-700 text-sm font-semibold">Delete</button>
-                    </div>
+            <div className="p-6 space-y-5">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="rounded-xl border border-orange-100 bg-orange-50 p-4">
+                  <p className="text-xs font-semibold uppercase tracking-[0.16em] text-orange-700">Government ID</p>
+                  <p className="mt-2 text-sm font-semibold text-gray-900">
+                    {ownerRequirements.hasIdDocument ? 'Uploaded' : 'Still needed'}
+                  </p>
+                </div>
+                <div className="rounded-xl border border-orange-100 bg-orange-50 p-4">
+                  <p className="text-xs font-semibold uppercase tracking-[0.16em] text-orange-700">Permit Submission</p>
+                  <p className="mt-2 text-sm font-semibold text-gray-900">
+                    {ownerRequirements.hasPermit ? 'Submitted' : 'Still needed'}
+                  </p>
+                </div>
+              </div>
+
+              <div className="rounded-xl border border-gray-200 bg-gray-50 p-4">
+                <h3 className="text-lg font-bold text-gray-900 mb-3">Missing items</h3>
+                <ul className="space-y-2">
+                  {ownerRequirements.missingItems.map((item) => (
+                    <li key={item} className="flex items-center gap-3 text-sm text-gray-700">
+                      <span className="flex h-6 w-6 items-center justify-center rounded-full bg-orange-100 text-orange-700 font-bold">!</span>
+                      <span>{item}</span>
+                    </li>
                   ))}
-                </div>
-              ) : (
-                <p className="text-gray-500 text-sm">No beds added yet.</p>
-              )}
+                </ul>
+              </div>
             </div>
 
-            {/* Add New Bed Form */}
-            <div className="border-t pt-4">
-              <h3 className="font-semibold text-lg mb-4">Add New Bed</h3>
-              <div className="space-y-4">
-                <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-sm font-semibold text-gray-700 mb-2">Bed Number *</label>
-                    <input type="text" value={newBed.bed_number} onChange={(e) => setNewBed({ ...newBed, bed_number: e.target.value })} className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500" placeholder="e.g., 1" required />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-semibold text-gray-700 mb-2">Bed Type *</label>
-                    <select value={newBed.bed_type} onChange={(e) => setNewBed({ ...newBed, bed_type: e.target.value })} className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500">
-                      <option value="single">Single</option>
-                      <option value="double">Double</option>
-                      <option value="bunk">Bunk</option>
-                    </select>
-                  </div>
-                </div>
-                <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-sm font-semibold text-gray-700 mb-2">Deck Position</label>
-                    <select value={newBed.deck_position} onChange={(e) => setNewBed({ ...newBed, deck_position: e.target.value })} className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500">
-                      <option value="lower">Lower</option>
-                      <option value="upper">Upper</option>
-                      <option value="single">Single</option>
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-sm font-semibold text-gray-700 mb-2">Price (₱)</label>
-                    <input type="number" value={newBed.price} onChange={(e) => setNewBed({ ...newBed, price: e.target.value })} className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500" placeholder="5000" min="0" />
-                  </div>
-                </div>
-                <div>
-                  <label className="block text-sm font-semibold text-gray-700 mb-2">Status</label>
-                  <select value={newBed.status} onChange={(e) => setNewBed({ ...newBed, status: e.target.value })} className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500">
-                    <option value="available">Available</option>
-                    <option value="occupied">Occupied</option>
-                    <option value="maintenance">Maintenance</option>
-                  </select>
-                </div>
-                <div className="flex gap-3 pt-4">
-                  <button onClick={() => { setShowAddBed(false); setSelectedRoomForBed(''); setNewBed({ bed_number: '', bed_type: 'single', deck_position: 'lower', status: 'available', price: '' }); }} className="flex-1 px-4 py-3 bg-gray-200 text-gray-800 rounded-xl hover:bg-gray-300 transition-colors font-semibold">Cancel</button>
-                  <button onClick={async () => {
-                    if (!newBed.bed_number) {
-                      alert('Please fill in bed number');
-                      return;
-                    }
-                    try {
-                      const { error } = await supabase.from('beds').insert([{
-                        room_id: selectedRoomForBed,
-                        bed_number: newBed.bed_number,
-                        bed_type: newBed.bed_type,
-                        deck_position: newBed.deck_position,
-                        status: newBed.status,
-                        price: newBed.price ? parseFloat(newBed.price) : null
-                      }]);
-                      if (error) throw error;
-                      alert('Bed added successfully!');
-                      const { data: bedsData } = await supabase.from('beds').select('*').eq('room_id', selectedRoomForBed).order('bed_number', { ascending: true });
-                      setBeds(bedsData || []);
-                      setNewBed({ bed_number: '', bed_type: 'single', deck_position: 'lower', status: 'available', price: '' });
-                    } catch (error: any) {
-                      console.error('Failed to add bed:', error);
-                      alert(`Failed to add bed: ${error.message || 'Unknown error'}`);
-                    }
-                  }} className="flex-1 glass-button px-4 py-3 rounded-xl font-semibold">Add Bed</button>
-                </div>
-              </div>
+            <div className="border-t border-gray-200 bg-white px-6 py-4 flex flex-col sm:flex-row gap-3 sm:justify-end">
+              <button
+                onClick={async () => {
+                  setShowOwnerRequirementsModal(false);
+                  await openOwnerProfileEditor();
+                }}
+                className="px-5 py-3 rounded-xl bg-orange-500 text-white font-semibold hover:bg-orange-600 transition-colors"
+              >
+                Complete Profile & ID
+              </button>
+              <button
+                onClick={() => {
+                  setShowOwnerRequirementsModal(false);
+                  setShowPermits(true);
+                }}
+                className="px-5 py-3 rounded-xl bg-blue-600 text-white font-semibold hover:bg-blue-700 transition-colors"
+              >
+                Upload Permit
+              </button>
+              <button
+                onClick={() => setShowOwnerRequirementsModal(false)}
+                className="px-5 py-3 rounded-xl bg-gray-200 text-gray-800 font-semibold hover:bg-gray-300 transition-colors"
+              >
+                Later
+              </button>
             </div>
           </div>
         </div>
       )}
 
       {/* Permits Modal */}
-      {showPermits && showPropertyDetails && (
+      {showPermits && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-          <div className="bg-white rounded-2xl max-w-2xl w-full p-6">
+          <div className="bg-white rounded-2xl max-w-4xl w-full p-6">
             <div className="flex justify-between items-center mb-4">
-              <h2 className="text-2xl font-bold text-gray-900">Business Permit</h2>
-              <button onClick={() => { setShowPermits(false); setPermitFile(null); setPermitPreview(null); }} className="text-gray-500 hover:text-gray-700 text-2xl font-bold">×</button>
+              <h2 className="text-2xl font-bold text-gray-900">Business & Owner Car Permits</h2>
+              <button onClick={() => { setShowPermits(false); }} className="text-gray-500 hover:text-gray-700 text-2xl font-bold">×</button>
             </div>
-            <div className="space-y-4">
-              {propertyPermit && (
-                <div className="mb-4">
-                  <h3 className="font-semibold mb-2">Current Permit</h3>
-                  <a href={propertyPermit} target="_blank" rel="noopener noreferrer" className="block">
-                    <ImageWithFallback src={propertyPermit} alt="Business Permit" className="w-full h-auto rounded-lg border-2 border-gray-200" />
-                  </a>
-                </div>
-              )}
-              <div>
-                <label className="block text-sm font-semibold text-gray-700 mb-2">Upload Business Permit</label>
-                <input type="file" accept="image/*,.pdf" onChange={(e) => {
-                  const file = e.target.files?.[0];
-                  if (file) {
-                    if (file.size > 10 * 1024 * 1024) {
-                      alert('File size must be less than 10MB');
-                      return;
-                    }
-                    setPermitFile(file);
-                    if (file.type.startsWith('image/')) {
-                      const reader = new FileReader();
-                      reader.onloadend = () => {
-                        setPermitPreview(reader.result as string);
-                      };
-                      reader.readAsDataURL(file);
-                    } else {
-                      setPermitPreview(null);
-                    }
-                  }
-                }} className="hidden" id="permit-upload" />
-                <label htmlFor="permit-upload" className="glass-button px-6 py-3 rounded-xl cursor-pointer inline-block text-sm font-semibold">
-                  {permitFile ? 'Change File' : 'Choose File'}
-                </label>
-                {permitFile && <p className="text-sm text-gray-600 mt-2">{permitFile.name}</p>}
-              </div>
-              {permitPreview && (
-                <div>
-                  <h3 className="font-semibold mb-2">Preview</h3>
-                  <ImageWithFallback src={permitPreview} alt="Permit Preview" className="w-full h-auto rounded-lg border-2 border-gray-200" />
-                </div>
-              )}
-              <div className="flex gap-3 pt-4">
-                <button onClick={() => { setShowPermits(false); setPermitFile(null); setPermitPreview(null); }} className="flex-1 px-4 py-3 bg-gray-200 text-gray-800 rounded-xl hover:bg-gray-300 transition-colors font-semibold">Cancel</button>
-                <button onClick={async () => {
-                  if (!permitFile) {
-                    alert('Please select a file to upload');
-                    return;
-                  }
-                  try {
-                    const fileExt = permitFile.name.split('.').pop();
-                    const fileName = `permit-${showPropertyDetails.id}.${fileExt}`;
-                    const filePath = `permits/${fileName}`;
-                    
-                    const { error: uploadError } = await supabase.storage
-                      .from('property-images')
-                      .upload(filePath, permitFile, { cacheControl: '3600', upsert: true });
-                    
-                    if (uploadError) throw uploadError;
-                    
-                    const { data: { publicUrl } } = supabase.storage
-                      .from('property-images')
-                      .getPublicUrl(filePath);
-                    
-                    const { error: updateError } = await supabase
-                      .from('properties')
-                      .update({ business_permit_url: publicUrl })
-                      .eq('id', showPropertyDetails.id);
-                    
-                    if (updateError) throw updateError;
-                    
-                    alert('Permit uploaded successfully!');
-                    setPropertyPermit(publicUrl);
-                    setShowPermits(false);
-                    setPermitFile(null);
-                    setPermitPreview(null);
-                  } catch (error: any) {
-                    console.error('Failed to upload permit:', error);
-                    alert(`Failed to upload permit: ${error.message || 'Unknown error'}`);
-                  }
-                }} className="flex-1 glass-button px-4 py-3 rounded-xl font-semibold">Upload Permit</button>
-              </div>
-            </div>
+            <PermitUpload
+              ownerId={ownerRequirements.ownerProfileId || undefined}
+              vehicleId={showvehicleDetails?.id}
+              onUploadComplete={async () => {
+                setShowPermits(false);
+                await refreshOwnerRequirements(user, ownerEmail || user?.email);
+              }}
+            />
           </div>
         </div>
       )}
 
-      {/* Edit Property Modal */}
-      {editingProperty && (
+      {/* Edit vehicle Modal */}
+      {editingvehicle && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-3 sm:p-4 z-50">
             <div className="bg-white rounded-xl sm:rounded-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto">
                 <div className="p-4 sm:p-6">
                     <div className="flex justify-between items-start mb-4">
-                        <h2 className="text-2xl font-bold">Edit Property</h2>
+                        <h2 className="text-2xl font-bold">Edit vehicle</h2>
                         <button
-                            onClick={() => setEditingProperty(null)}
+                            onClick={() => {
+                              setOwnerMapUserGpsEdit(null);
+                              setEditingvehicle(null);
+                            }}
                             className="text-gray-500 hover:text-gray-700"
                         >
                             ✕
@@ -3284,14 +4813,14 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                     <div className="space-y-4">
                         <div>
                             <label className="block text-sm font-medium text-gray-700 mb-2">
-                                Property Title
+                                vehicle Title
                             </label>
                             <input
                                 type="text"
-                                value={editingProperty.title}
-                                onChange={(e) => setEditingProperty({ ...editingProperty, title: e.target.value })}
+                                value={editingvehicle.title}
+                                onChange={(e) => setEditingvehicle({ ...editingvehicle, title: e.target.value })}
                                 className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
-                                placeholder="Enter property title"
+                                placeholder="Enter vehicle title"
                             />
                         </div>
 
@@ -3300,132 +4829,427 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                                 Description
                             </label>
                             <textarea
-                                value={editingProperty.description}
-                                onChange={(e) => setEditingProperty({ ...editingProperty, description: e.target.value })}
+                                value={editingvehicle.description}
+                                onChange={(e) => setEditingvehicle({ ...editingvehicle, description: e.target.value })}
                                 className="w-full h-24 px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
-                                placeholder="Describe your property"
+                                placeholder="Describe your vehicle"
                             />
                         </div>
 
-                        <div className="grid grid-cols-2 gap-4">
-                            <div>
-                                <label className="block text-sm font-medium text-gray-700 mb-2">
-                                    Monthly Rent (₱)
-                                </label>
-                                <input
-                                    type="number"
-                                    value={editingProperty.price}
-                                    onChange={(e) => setEditingProperty({ ...editingProperty, price: parseInt(e.target.value) })}
-                                    className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
-                                    placeholder="15000"
-                                />
-                            </div>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            {RENTAL_UNITS.map((unit) => (
+                                <div key={unit}>
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        {RENTAL_UNIT_LABELS[unit]} Rate (₱)
+                                    </label>
+                                    <input
+                                        type="number"
+                                        min="1"
+                                        value={editingvehicle.rentalRates[unit]}
+                                        onChange={(e) => {
+                                            const parsed = Number(e.target.value);
+                                            setEditingvehicle({
+                                                ...editingvehicle,
+                                                rentalRates: {
+                                                    ...editingvehicle.rentalRates,
+                                                    [unit]: Number.isFinite(parsed) ? parsed : 0,
+                                                },
+                                                price: unit === 'day' && Number.isFinite(parsed) ? parsed : editingvehicle.price,
+                                            });
+                                        }}
+                                        className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+                                        placeholder={unit === 'hour' ? '500' : unit === 'day' ? '15000' : unit === 'week' ? '90000' : '300000'}
+                                    />
+                                </div>
+                            ))}
+                        </div>
+
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                             <div>
                                 <label className="block text-sm font-medium text-gray-700 mb-2">
                                     Location
                                 </label>
                                 <input
                                     type="text"
-                                    value={editingProperty.location}
-                                    onChange={(e) => setEditingProperty({ ...editingProperty, location: e.target.value })}
+                                    value={editingvehicle.location}
+                                    onChange={(e) => setEditingvehicle({ ...editingvehicle, location: e.target.value })}
                                     className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
                                     placeholder="Catbalogan City, Samar"
                                 />
                             </div>
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-2">
+                                    Boundary Square Size (meters)
+                                </label>
+                                <input
+                                    type="number"
+                                    min="50"
+                                    value={editingvehicle.boundarySizeMeters}
+                                    onChange={(e) => {
+                                        const parsed = Number(e.target.value);
+                                        setEditingvehicle({
+                                            ...editingvehicle,
+                                            boundarySizeMeters: Number.isFinite(parsed) ? parsed : editingvehicle.boundarySizeMeters,
+                                            boundary: buildSquareBoundary(
+                                                editingvehicle.coordinates,
+                                                Number.isFinite(parsed) ? parsed : editingvehicle.boundarySizeMeters
+                                            ),
+                                        });
+                                    }}
+                                    className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+                                    placeholder="200"
+                                />
+                                <p className="text-xs text-gray-500 mt-2">
+                                    Square coverage: {editingvehicle.boundarySizeMeters.toLocaleString()}m x {editingvehicle.boundarySizeMeters.toLocaleString()}m
+                                    {' '}({getSquareArea(editingvehicle.boundarySizeMeters).toLocaleString()} sq m)
+                                </p>
+                            </div>
+                        </div>
+
+                        <div className="rounded-xl border border-amber-100 bg-amber-50/90 p-4">
+                            <label className="block text-sm font-medium text-gray-800 mb-2" htmlFor="edit-vehicle-boundary-penalty">
+                                Out-of-boundary penalty (₱)
+                            </label>
+                            <input
+                                id="edit-vehicle-boundary-penalty"
+                                type="number"
+                                min="0"
+                                step="1"
+                                value={editingvehicle.outOfBoundaryPenaltyPhp}
+                                onChange={(e) => {
+                                    const v = parseOutOfBoundaryPenaltyPeso(e.target.value);
+                                    setEditingvehicle({ ...editingvehicle, outOfBoundaryPenaltyPhp: v });
+                                }}
+                                className="w-full max-w-xs px-4 py-3 border border-amber-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 bg-white"
+                            />
+                            <p className="text-xs text-amber-900/80 mt-2 leading-relaxed">
+                                Shown to renters with the boundary. 0 means no listed penalty.
+                            </p>
                         </div>
 
                         <div>
                             <label className="block text-sm font-medium text-gray-700 mb-2">
-                                Amenities
+                                Current tracked vehicle position
                             </label>
-                            
-                            {/* Predefined Amenities */}
-                            <div className="mb-4">
-                                <p className="text-sm text-gray-600 mb-2">Select from common amenities:</p>
-                                <div className="grid grid-cols-2 gap-2">
-                                    {['Gas', 'Electricity', 'Water', 'Parking Area', 'Wi-Fi', 'Laundry Area'].map((amenity) => (
-                                        <label key={amenity} className="flex items-center space-x-2">
-                                            <input
-                                                type="checkbox"
-                                                checked={editingProperty.amenities.includes(amenity)}
-                                                onChange={() => {
-                                                    const updatedAmenities = editingProperty.amenities.includes(amenity)
-                                                        ? editingProperty.amenities.filter(a => a !== amenity)
-                                                        : [...editingProperty.amenities, amenity];
-                                                    setEditingProperty({ ...editingProperty, amenities: updatedAmenities });
-                                                }}
-                                                className="text-blue-600 focus:ring-orange-500"
-                                            />
-                                            <span className="text-sm text-gray-700">{amenity}</span>
-                                        </label>
-                                    ))}
+                            <div className="mb-4 rounded-2xl border border-orange-100 bg-orange-50 p-4">
+                                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                                    <div>
+                                        <p className="text-sm font-bold text-gray-900">Tracking Device</p>
+                                        <p className="mt-1 text-xs text-gray-600">Assign the GPS device and update the tracked marker shown on the map.</p>
+                                    </div>
+                                    <label className="inline-flex items-center gap-2 text-sm font-semibold text-gray-800">
+                                        <input
+                                            type="checkbox"
+                                            checked={Boolean(editingvehicle.trackingEnabled)}
+                                            onChange={(e) => setEditingvehicle({ ...editingvehicle, trackingEnabled: e.target.checked })}
+                                            className="h-4 w-4 rounded border-gray-300 text-orange-600 focus:ring-orange-500"
+                                        />
+                                        Active
+                                    </label>
                                 </div>
-                            </div>
-
-                            {/* Custom Amenities */}
-                            <div className="mb-4">
-                                <p className="text-sm text-gray-600 mb-2">Add custom amenities:</p>
-                                <div className="flex gap-2">
-                                    <input
-                                        type="text"
-                                        value={editCustomAmenity}
-                                        onChange={(e) => setEditCustomAmenity(e.target.value)}
-                                        onKeyDown={(e) => {
-                                            if (e.key === 'Enter') {
-                                                e.preventDefault();
-                                                addEditCustomAmenity();
-                                            }
-                                        }}
-                                        className="flex-1 px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500 text-sm"
-                                        placeholder="Enter custom amenity (e.g., Swimming Pool, Gym, Garden)"
-                                    />
-                                    <button
-                                        type="button"
-                                        onClick={addEditCustomAmenity}
-                                        className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors text-sm font-medium"
-                                    >
-                                        Add
-                                    </button>
-                                </div>
-                            </div>
-
-                            {/* Selected Amenities Display */}
-                            {editingProperty.amenities.length > 0 && (
-                                <div>
-                                    <p className="text-sm text-gray-600 mb-2">Selected amenities:</p>
-                                    <div className="flex flex-wrap gap-2">
-                                        {editingProperty.amenities.map((amenity, index) => (
-                                            <span
-                                                key={index}
-                                                className="inline-flex items-center gap-1 px-3 py-1 bg-blue-100 text-blue-800 rounded-full text-sm"
-                                            >
-                                                {amenity}
-                                                <button
-                                                    type="button"
-                                                    onClick={() => removeEditAmenity(amenity)}
-                                                    className="ml-1 text-blue-600 hover:text-blue-800"
-                                                >
-                                                    ×
-                                                </button>
-                                            </span>
-                                        ))}
+                                <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                    <div>
+                                        <label className="block text-xs font-medium text-gray-600 mb-1">Device ID</label>
+                                        <input
+                                            value={editingvehicle.trackingDeviceId || ''}
+                                            onChange={(e) => setEditingvehicle({ ...editingvehicle, trackingDeviceId: e.target.value })}
+                                            className="w-full px-4 py-2 border border-orange-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+                                            placeholder="GPS-001 or plate tracker code"
+                                        />
+                                    </div>
+                                    <div>
+                                        <label className="block text-xs font-medium text-gray-600 mb-1">Provider</label>
+                                        <input
+                                            value={editingvehicle.trackingProvider || 'Manual GPS'}
+                                            onChange={(e) => setEditingvehicle({ ...editingvehicle, trackingProvider: e.target.value })}
+                                            className="w-full px-4 py-2 border border-orange-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+                                            placeholder="Manual GPS"
+                                        />
                                     </div>
                                 </div>
-                            )}
+                                <button
+                                    type="button"
+                                    onClick={async () => {
+                                        try {
+                                            const position = await getBrowserPosition();
+                                            setEditingvehicle({
+                                                ...editingvehicle,
+                                                currentCoordinates: position,
+                                                trackingEnabled: true,
+                                            });
+                                        } catch (error: any) {
+                                            alert(error?.message || 'Unable to read current GPS location.');
+                                        }
+                                    }}
+                                    className="mt-3 w-full sm:w-auto bg-orange-600 text-white px-4 py-2 rounded-xl hover:bg-orange-700 transition-colors text-sm font-semibold"
+                                >
+                                    Use this device GPS as tracker position
+                                </button>
+                            </div>
+                            <div className="mb-3 flex flex-col gap-2">
+                                <p className="text-sm font-semibold text-gray-900">Map tap mode (touch or click)</p>
+                                <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
+                                    <button
+                                        type="button"
+                                        onClick={() => {
+                                            setEditingBoundaryMapMode('tracker');
+                                            setEditingBoxFirstCorner(null);
+                                        }}
+                                        className={`min-h-[48px] flex-1 rounded-xl px-3 py-3 text-sm font-semibold sm:min-w-[8.5rem] ${
+                                            editingBoundaryMapMode === 'tracker'
+                                                ? 'bg-emerald-600 text-white shadow-md'
+                                                : 'border-2 border-gray-200 bg-white text-gray-800 hover:border-emerald-300'
+                                        }`}
+                                    >
+                                        Move GPS dot
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => {
+                                            setEditingBoundaryMapMode('center_pin');
+                                            setEditingBoxFirstCorner(null);
+                                        }}
+                                        className={`min-h-[48px] flex-1 rounded-xl px-3 py-3 text-sm font-semibold sm:min-w-[8.5rem] ${
+                                            editingBoundaryMapMode === 'center_pin'
+                                                ? 'bg-blue-600 text-white shadow-md'
+                                                : 'border-2 border-gray-200 bg-white text-gray-800 hover:border-blue-300'
+                                        }`}
+                                    >
+                                        Set boundary center
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => {
+                                            setEditingBoundaryMapMode('draw_box');
+                                            setEditingBoxFirstCorner(null);
+                                        }}
+                                        className={`min-h-[48px] flex-1 rounded-xl px-3 py-3 text-sm font-semibold sm:min-w-[8.5rem] ${
+                                            editingBoundaryMapMode === 'draw_box'
+                                                ? 'bg-blue-600 text-white shadow-md'
+                                                : 'border-2 border-gray-200 bg-white text-gray-800 hover:border-blue-300'
+                                        }`}
+                                    >
+                                        Draw box (2 taps)
+                                    </button>
+                                </div>
+                                <p className="text-sm text-gray-700">
+                                    {editingBoundaryMapMode === 'tracker' && (
+                                        <>Tap to move the <strong>green tracker</strong> only. Boundary stays until you change it below.</>
+                                    )}
+                                    {editingBoundaryMapMode === 'center_pin' && (
+                                        <>Tap to move the <strong>listing center</strong>; the square uses &quot;Boundary size&quot; (Left/Right/Top/Bottom).</>
+                                    )}
+                                    {editingBoundaryMapMode === 'draw_box' &&
+                                        !editingBoxFirstCorner &&
+                                        'Step 1: Tap one corner (e.g. Left & Bottom meeting point).'}
+                                    {editingBoundaryMapMode === 'draw_box' &&
+                                        editingBoxFirstCorner &&
+                                        'Step 2: Tap the opposite corner (Right & Top).'}
+                                </p>
+                                {editingBoundaryMapMode === 'draw_box' && (
+                                    <button
+                                        type="button"
+                                        onClick={() => setEditingBoxFirstCorner(null)}
+                                        className="self-start rounded-lg border border-orange-200 bg-orange-50 px-4 py-2 text-sm font-semibold text-orange-900 min-h-[44px]"
+                                    >
+                                        Clear first corner
+                                    </button>
+                                )}
+                            </div>
+
+                            <div className="relative touch-manipulation">
+                                <GoogleMap
+                                    center={editingvehicle.coordinates}
+                                    zoom={14}
+                                    satellite={true}
+                                    preferLeaflet={true}
+                                    markers={[
+                                        {
+                                            position: editingvehicle.coordinates,
+                                            title: `${editingvehicle.title} boundary center`,
+                                            info: 'Boundary center',
+                                        },
+                                        {
+                                            position: editingvehicle.currentCoordinates,
+                                            title: `${editingvehicle.title} current position`,
+                                            info: 'Current tracked position',
+                                        },
+                                        ...(ownerMapUserGpsEdit
+                                            ? [
+                                                {
+                                                    position: ownerMapUserGpsEdit,
+                                                    title: 'Your GPS (this device)',
+                                                    info: `${ownerMapUserGpsEdit.lat.toFixed(6)}, ${ownerMapUserGpsEdit.lng.toFixed(6)}`,
+                                                },
+                                              ]
+                                            : []),
+                                        ...(editingBoundaryMapMode === 'draw_box' && editingBoxFirstCorner
+                                            ? [
+                                                {
+                                                    position: editingBoxFirstCorner,
+                                                    title: 'First corner',
+                                                },
+                                              ]
+                                            : []),
+                                    ]}
+                                    polygons={[
+                                        {
+                                            path: getSquareBoundaryPath(editingvehicle.boundary),
+                                            strokeColor: '#2563eb',
+                                            strokeWeight: 2,
+                                            fillColor: '#60a5fa',
+                                            fillOpacity: 0.08,
+                                        },
+                                    ]}
+                                    onMapClick={(lat, lng) => {
+                                        const point = { lat, lng };
+                                        if (editingBoundaryMapMode === 'tracker') {
+                                            setEditingvehicle({
+                                                ...editingvehicle,
+                                                currentCoordinates: point,
+                                            });
+                                        } else if (editingBoundaryMapMode === 'center_pin') {
+                                            const nextBoundary = buildSquareBoundary(
+                                                point,
+                                                editingvehicle.boundarySizeMeters
+                                            );
+                                            setEditingvehicle({
+                                                ...editingvehicle,
+                                                coordinates: point,
+                                                boundary: nextBoundary,
+                                            });
+                                        } else {
+                                            if (!editingBoxFirstCorner) {
+                                                setEditingBoxFirstCorner(point);
+                                            } else {
+                                                const rect = buildRectangleBoundaryFromTwoCorners(
+                                                    editingBoxFirstCorner,
+                                                    point
+                                                );
+                                                const center = getBoundaryCenter(rect);
+                                                setEditingvehicle({
+                                                    ...editingvehicle,
+                                                    coordinates: center,
+                                                    boundary: rect,
+                                                    boundarySizeMeters: rect.sizeMeters,
+                                                });
+                                                setEditingBoxFirstCorner(null);
+                                            }
+                                        }
+                                        refreshOwnerDeviceGpsMarker(setOwnerMapUserGpsEdit);
+                                    }}
+                                    className="h-72 w-full min-h-[288px] rounded-lg sm:h-80"
+                                />
+                                <div className="pointer-events-none absolute bottom-2 left-2 right-2 z-10 rounded-lg bg-gray-900/75 px-3 py-2 text-center text-xs font-semibold text-white">
+                                    {editingBoundaryMapMode === 'tracker' && 'Tap: move tracker · your GPS from device'}
+                                    {editingBoundaryMapMode === 'center_pin' && 'Tap: move boundary center · your GPS from device'}
+                                    {editingBoundaryMapMode === 'draw_box' && 'Tap: L/B then R/T · your GPS from device'}
+                                </div>
+                            </div>
+                            <p className="text-sm text-gray-500 mt-2">
+                                Blue corners = <strong>Left</strong>, <strong>Right</strong>, <strong>Top</strong>,{' '}
+                                <strong>Bottom</strong> of the allowed zone.
+                            </p>
+                            <div className="mt-3 grid grid-cols-2 gap-4">
+                                <div>
+                                    <label className="block text-xs font-medium text-gray-600 mb-1">Boundary Center Latitude</label>
+                                    <input
+                                        type="number"
+                                        step="any"
+                                        value={editingvehicle.coordinates.lat}
+                                        onChange={(e) => {
+                                            const lat = parseFloat(e.target.value);
+                                            if (!Number.isNaN(lat)) {
+                                                const coordinates = { lat, lng: editingvehicle.coordinates.lng };
+                                                setEditingvehicle({
+                                                    ...editingvehicle,
+                                                    coordinates,
+                                                    boundary: buildSquareBoundary(coordinates, editingvehicle.boundarySizeMeters),
+                                                });
+                                            }
+                                        }}
+                                        className="w-full px-4 py-2 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="block text-xs font-medium text-gray-600 mb-1">Boundary Center Longitude</label>
+                                    <input
+                                        type="number"
+                                        step="any"
+                                        value={editingvehicle.coordinates.lng}
+                                        onChange={(e) => {
+                                            const lng = parseFloat(e.target.value);
+                                            if (!Number.isNaN(lng)) {
+                                                const coordinates = { lat: editingvehicle.coordinates.lat, lng };
+                                                setEditingvehicle({
+                                                    ...editingvehicle,
+                                                    coordinates,
+                                                    boundary: buildSquareBoundary(coordinates, editingvehicle.boundarySizeMeters),
+                                                });
+                                            }
+                                        }}
+                                        className="w-full px-4 py-2 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+                                    />
+                                </div>
+                            </div>
+                            <div className="mt-3 grid grid-cols-2 gap-4">
+                                <div>
+                                    <label className="block text-xs font-medium text-gray-600 mb-1">Current Vehicle Latitude</label>
+                                    <input
+                                        type="number"
+                                        step="any"
+                                        value={editingvehicle.currentCoordinates.lat}
+                                        onChange={(e) => {
+                                            const lat = parseFloat(e.target.value);
+                                            if (!Number.isNaN(lat)) {
+                                                setEditingvehicle({
+                                                    ...editingvehicle,
+                                                    currentCoordinates: { lat, lng: editingvehicle.currentCoordinates.lng },
+                                                });
+                                            }
+                                        }}
+                                        className="w-full px-4 py-2 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="block text-xs font-medium text-gray-600 mb-1">Current Vehicle Longitude</label>
+                                    <input
+                                        type="number"
+                                        step="any"
+                                        value={editingvehicle.currentCoordinates.lng}
+                                        onChange={(e) => {
+                                            const lng = parseFloat(e.target.value);
+                                            if (!Number.isNaN(lng)) {
+                                                setEditingvehicle({
+                                                    ...editingvehicle,
+                                                    currentCoordinates: { lat: editingvehicle.currentCoordinates.lat, lng },
+                                                });
+                                            }
+                                        }}
+                                        className="w-full px-4 py-2 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+                                    />
+                                </div>
+                            </div>
+                            <p className="text-xs text-gray-500 mt-2">
+                                Status: {isPointWithinBoundary(editingvehicle.currentCoordinates, buildSquareBoundary(editingvehicle.coordinates, editingvehicle.boundarySizeMeters)) ? 'Inside boundary' : 'Outside boundary'}
+                            </p>
                         </div>
 
                         <div className="flex gap-3 pt-4">
                             <button
-                                onClick={() => setEditingProperty(null)}
+                                onClick={() => {
+                                  setOwnerMapUserGpsEdit(null);
+                                  setEditingvehicle(null);
+                                }}
                                 className="flex-1 bg-gray-200 text-gray-800 py-3 rounded-xl hover:bg-gray-300 transition-colors"
                             >
                                 Cancel
                             </button>
                             <button
-                                onClick={handleUpdateProperty}
+                                onClick={handleUpdatevehicle}
                                 className="flex-1 py-3 rounded-xl transition-colors bg-blue-600 text-white hover:bg-blue-700"
                             >
-                                Update Property
+                                Update vehicle
                             </button>
                         </div>
                     </div>
@@ -3443,7 +5267,7 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                 </div>
                 <div>
                   <h3 className="text-lg font-bold text-gray-900">{activeConversation.client_email}</h3>
-                  <p className="text-xs text-gray-500">Property: {properties.find(p => p.id === activeConversation.property_id)?.title || activeConversation.property_id}</p>
+                  <p className="text-xs text-gray-500">vehicle: {Vehicles.find(p => p.id === activeConversation.vehicle_id)?.title || activeConversation.vehicle_id}</p>
                 </div>
               </div>
               <button onClick={closeChat} className="text-gray-500 hover:text-gray-700">✕</button>
@@ -3452,24 +5276,27 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
               {chatLoading ? (
                 <div className="text-gray-500">Loading messages...</div>
               ) : (
-                chatMessages.map((m) => (
-                  <div key={m.id} className={`flex ${m.sender_email === activeConversation.owner_email ? 'justify-end' : 'justify-start'} items-end gap-2`}>
-                    {m.sender_email !== activeConversation.owner_email && (
+                chatMessages.map((m) => {
+                  const fromOwner = emailsMatchCaseInsensitive(m.sender_email, activeConversation.owner_email);
+                  return (
+                  <div key={m.id} className={`flex ${fromOwner ? 'justify-end' : 'justify-start'} items-end gap-2`}>
+                    {!fromOwner && (
                       <div className="w-7 h-7 rounded-full bg-gray-300 text-gray-700 flex items-center justify-center text-xs font-semibold">
                         {(activeConversation.client_email || 'U').charAt(0).toUpperCase()}
                       </div>
                     )}
-                    <div className={`${m.sender_email === activeConversation.owner_email ? 'bg-blue-600 text-white rounded-2xl rounded-br-sm' : 'bg-gray-100 text-gray-900 rounded-2xl rounded-bl-sm'} px-4 py-2 max-w-[75%] shadow-sm` }>
+                    <div className={`${fromOwner ? 'bg-blue-600 text-white rounded-2xl rounded-br-sm' : 'bg-gray-100 text-gray-900 rounded-2xl rounded-bl-sm'} px-4 py-2 max-w-[75%] shadow-sm` }>
                       <div className="text-sm whitespace-pre-wrap leading-relaxed">{m.content}</div>
-                      <div className={`text-[10px] mt-1 ${m.sender_email === activeConversation.owner_email ? 'text-blue-100' : 'text-gray-500'}`}>{new Date(m.created_at).toLocaleString()}</div>
+                      <div className={`text-[10px] mt-1 ${fromOwner ? 'text-blue-100' : 'text-gray-500'}`}>{new Date(m.created_at).toLocaleString()}</div>
                     </div>
-                    {m.sender_email === activeConversation.owner_email && (
+                    {fromOwner && (
                       <div className="w-7 h-7 rounded-full bg-blue-600 text-white flex items-center justify-center text-xs font-semibold">
                         {(activeConversation.owner_email || 'O').charAt(0).toUpperCase()}
                       </div>
                     )}
                   </div>
-                ))
+                  );
+                })
               )}
               <div ref={messagesEndRef} />
             </div>
@@ -3500,12 +5327,12 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
         </button>
       )}
 
-      {/* Tenant Information Modal */}
+      {/* Client Information Modal */}
       {showTenantModal && selectedTenant && (
         <div className="fixed inset-0 bg-black bg-opacity-60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
           <div className="bg-white rounded-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto shadow-2xl">
             <div className="sticky top-0 bg-white border-b border-gray-200 p-6 flex justify-between items-center z-10">
-              <h2 className="text-2xl font-bold text-gray-900">Tenant Information</h2>
+              <h2 className="text-2xl font-bold text-gray-900">Client Information</h2>
               <button
                 onClick={() => {
                   setShowTenantModal(false);
@@ -3576,6 +5403,15 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                     <label className="text-sm font-semibold text-gray-600">Citizenship</label>
                     <p className="text-gray-900 font-medium mt-1">{selectedTenant.citizenship}</p>
                   </div>
+
+                  <div className="md:col-span-2">
+                    <label className="text-sm font-semibold text-gray-600">Driver&apos;s license</label>
+                    <p className="text-gray-900 font-medium mt-1 font-mono text-sm">
+                      {selectedTenant.driverLicense && selectedTenant.driverLicense !== 'N/A'
+                        ? selectedTenant.driverLicense
+                        : 'N/A'}
+                    </p>
+                  </div>
                 </div>
 
                 {/* Address */}
@@ -3590,14 +5426,14 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                 </div>
               </div>
 
-              {/* Booking Information */}
+              {/* rental Information */}
               <div className="bg-gray-50 rounded-xl p-6 space-y-4">
-                <h3 className="text-xl font-bold text-gray-900 mb-4">Booking Information</h3>
+                <h3 className="text-xl font-bold text-gray-900 mb-4">rental Information</h3>
                 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div>
-                    <label className="text-sm font-semibold text-gray-600">Booking ID</label>
-                    <p className="text-gray-900 font-medium mt-1 font-mono text-sm">{selectedTenant.bookingId}</p>
+                    <label className="text-sm font-semibold text-gray-600">rental ID</label>
+                    <p className="text-gray-900 font-medium mt-1 font-mono text-sm">{selectedTenant.rentalId}</p>
                   </div>
 
                   <div>
@@ -3634,7 +5470,7 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                     </svg>
                     <p className="text-gray-500 font-medium">No ID document uploaded</p>
-                    <p className="text-xs text-gray-400 mt-1">ID document not available for this tenant</p>
+                    <p className="text-xs text-gray-400 mt-1">ID document not available for this client</p>
                   </div>
                 )}
               </div>
@@ -3721,6 +5557,37 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                   </p>
                 </div>
               </div>
+
+              <div className="bg-gray-50 rounded-xl p-6">
+                <h3 className="text-xl font-bold text-gray-900 mb-4">ID Document</h3>
+                {viewProfileData.id_document_url ? (
+                  <>
+                    <div className="flex justify-center">
+                      <a
+                        href={viewProfileData.id_document_url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="block max-w-md"
+                      >
+                        <ImageWithFallback
+                          src={viewProfileData.id_document_url}
+                          alt="Owner ID Document"
+                          className="w-full h-auto rounded-lg shadow-lg border-2 border-gray-200 hover:border-orange-400 transition-colors cursor-pointer"
+                        />
+                      </a>
+                    </div>
+                    <p className="text-xs text-gray-500 text-center mt-2">Click to view full size</p>
+                  </>
+                ) : (
+                  <div className="flex flex-col items-center justify-center py-8">
+                    <svg className="w-16 h-16 text-gray-300 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                    </svg>
+                    <p className="text-gray-500 font-medium">No ID document uploaded</p>
+                    <p className="text-xs text-gray-400 mt-1">Upload an ID to unlock vehicle listing.</p>
+                  </div>
+                )}
+              </div>
             </div>
 
             <div className="sticky bottom-0 bg-white border-t border-gray-200 p-6 flex justify-end gap-3">
@@ -3733,51 +5600,7 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
               <button
                 onClick={async () => {
                   setShowViewProfile(false);
-                  // Load profile data for editing
-                  try {
-                    const email = ownerEmail || user?.email;
-                    if (!email) {
-                      alert('Email not found');
-                      return;
-                    }
-
-                    const { data: landlordProfile } = await supabase
-                      .from('landlord_profiles')
-                      .select('*')
-                      .eq('email', email)
-                      .single();
-
-                    const { data: appUser } = await supabase
-                      .from('app_users')
-                      .select('*')
-                      .eq('email', email)
-                      .single();
-
-                    const profile = landlordProfile || appUser;
-                    setProfileData({
-                      full_name: profile?.full_name || user?.user_metadata?.full_name || '',
-                      email: email,
-                      phone: profile?.phone || '',
-                      address: profile?.address || '',
-                      barangay: profile?.barangay || '',
-                      city: profile?.city || '',
-                      profile_image_url: profile?.profile_image_url || ''
-                    });
-                    setProfileImagePreview(profile?.profile_image_url || null);
-                    setShowEditProfile(true);
-                  } catch (error) {
-                    console.error('Failed to load profile:', error);
-                    setProfileData({
-                      full_name: user?.user_metadata?.full_name || '',
-                      email: ownerEmail || user?.email || '',
-                      phone: '',
-                      address: '',
-                      barangay: '',
-                      city: '',
-                      profile_image_url: ''
-                    });
-                    setShowEditProfile(true);
-                  }
+                  await openOwnerProfileEditor();
                 }}
                 className="glass-button px-6 py-3 rounded-xl font-semibold"
               >
@@ -3799,6 +5622,8 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                   setShowEditProfile(false);
                   setProfileImageFile(null);
                   setProfileImagePreview(null);
+                  setIdDocumentFile(null);
+                  setIdDocumentPreview(null);
                 }}
                 className="text-gray-500 hover:text-gray-700 text-2xl font-bold"
               >
@@ -3846,10 +5671,10 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                         }
                       }}
                       className="hidden"
-                      id="profile-image-upload-landlord"
+                      id="profile-image-upload-vehicle owner"
                     />
                     <label
-                      htmlFor="profile-image-upload-landlord"
+                      htmlFor="profile-image-upload-vehicle owner"
                       className="bg-orange-500 hover:bg-orange-600 text-white px-6 py-3 rounded-xl cursor-pointer inline-block text-sm font-semibold transition-colors shadow-md"
                     >
                       {profileImagePreview ? 'Change Photo' : 'Upload Photo'}
@@ -3926,6 +5751,64 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                   placeholder="Enter your city"
                 />
               </div>
+
+              <div className="bg-gray-50 rounded-xl p-6">
+                <h3 className="text-xl font-bold text-gray-900 mb-4">Government ID</h3>
+
+                {(idDocumentPreview || profileData.id_document_url) && (
+                  <div className="mb-4">
+                    <div className="flex justify-center">
+                      <a
+                        href={idDocumentPreview || profileData.id_document_url || '#'}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="block max-w-md"
+                      >
+                        <ImageWithFallback
+                          src={idDocumentPreview || profileData.id_document_url || ''}
+                          alt="Owner ID Document"
+                          className="w-full h-auto rounded-lg shadow-lg border-2 border-gray-200 hover:border-orange-400 transition-colors cursor-pointer"
+                        />
+                      </a>
+                    </div>
+                    <p className="text-xs text-gray-500 text-center mt-2">Click to view full size</p>
+                  </div>
+                )}
+
+                <div className="text-center">
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      if (file) {
+                        if (file.size > 5 * 1024 * 1024) {
+                          alert('Image size must be less than 5MB');
+                          return;
+                        }
+                        setIdDocumentFile(file);
+                        const reader = new FileReader();
+                        reader.onloadend = () => {
+                          setIdDocumentPreview(reader.result as string);
+                        };
+                        reader.readAsDataURL(file);
+                      }
+                    }}
+                    className="hidden"
+                    id="owner-id-document-upload"
+                  />
+                  <label
+                    htmlFor="owner-id-document-upload"
+                    className="bg-orange-500 hover:bg-orange-600 text-white px-6 py-3 rounded-xl cursor-pointer inline-block text-sm font-semibold transition-colors shadow-md"
+                  >
+                    {idDocumentPreview || profileData.id_document_url ? 'Change ID Document' : 'Upload ID Document'}
+                  </label>
+                  <p className="text-xs text-gray-500 mt-2">Max 5MB, Image files only</p>
+                  {idDocumentFile && (
+                    <p className="text-xs text-green-600 mt-1">✓ ID document ready to upload</p>
+                  )}
+                </div>
+              </div>
             </div>
 
             <div className="sticky bottom-0 bg-white border-t border-gray-200 p-6 flex justify-end gap-3">
@@ -3934,6 +5817,8 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                   setShowEditProfile(false);
                   setProfileImageFile(null);
                   setProfileImagePreview(null);
+                  setIdDocumentFile(null);
+                  setIdDocumentPreview(null);
                 }}
                 className="px-6 py-3 bg-gray-200 text-gray-800 rounded-xl hover:bg-gray-300 transition-colors font-semibold"
               >
@@ -3951,6 +5836,26 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                     }
 
                     let profileImageUrl = profileData.profile_image_url;
+                    let idDocumentUrl = profileData.id_document_url;
+
+                    if (idDocumentFile) {
+                      try {
+                        const fileExt = idDocumentFile.name.split('.').pop();
+                        const userId = user?.id || email.replace(/[^a-zA-Z0-9]/g, '_');
+                        const filePath = `id-documents/id-${userId}.${fileExt}`;
+                        const uploadResult = await uploadFileWithBucketFallback({
+                          buckets: REGISTER_ID_DOCUMENT_BUCKETS,
+                          path: filePath,
+                          file: idDocumentFile,
+                          upsert: true,
+                        });
+
+                        idDocumentUrl = uploadResult.publicUrl;
+                      } catch (uploadErr: any) {
+                        console.error('ID document upload failed:', uploadErr);
+                        alert(`Could not upload ID document: ${uploadErr.message || 'Unknown error'}. The profile will be saved without the ID document update.`);
+                      }
+                    }
 
                     // Upload profile image if new file selected
                     if (profileImageFile) {
@@ -3993,7 +5898,7 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                       }
                     }
 
-                    // Update landlord_profiles table
+                    // Update vehicle_owner_profiles table
                     let profileError = null;
                     try {
                       const upsertData: any = {
@@ -4011,16 +5916,16 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                       }
 
                       const { error } = await supabase
-                        .from('landlord_profiles')
+                        .from('vehicle_owner_profiles')
                         .upsert(upsertData, {
                           onConflict: 'email'
                         });
                       if (error) {
-                        console.error('landlord_profiles update error:', error);
+                        console.error('vehicle_owner_profiles update error:', error);
                         profileError = error;
                       }
                     } catch (err: any) {
-                      console.warn('landlord_profiles update failed:', err);
+                      console.warn('vehicle_owner_profiles update failed:', err);
                       profileError = err;
                     }
 
@@ -4047,7 +5952,8 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                             address: profileData.address || null,
                             barangay: profileData.barangay || null,
                             city: profileData.city || null,
-                            profile_image_url: profileImageUrl || null
+                            profile_image_url: profileImageUrl || null,
+                            id_document_url: idDocumentUrl || null
                           });
                         if (insertError) {
                           throw insertError;
@@ -4062,7 +5968,8 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                           address: profileData.address || null,
                           barangay: profileData.barangay || null,
                           city: profileData.city || null,
-                          profile_image_url: profileImageUrl || null
+                          profile_image_url: profileImageUrl || null,
+                          id_document_url: idDocumentUrl || null
                         })
                         .eq('email', email);
                       appUserError = error;
@@ -4071,24 +5978,29 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
                       appUserError = err;
                     }
 
-                    // Critical: If landlord_profiles failed, we must report it because View Profile relies on it.
+                    // Critical: If vehicle_owner_profiles failed, we must report it because View Profile relies on it.
                     if (profileError) {
-                      throw new Error(`Failed to update landlord profile: ${profileError.message || 'Unknown error'}`);
+                      throw new Error(`Failed to update vehicle owner profile: ${profileError.message || 'Unknown error'}`);
                     }
 
                     if (appUserError) {
-                      console.warn('App user update failed, but landlord profile saved:', appUserError);
-                      // We might choose not to throw here if landlord_profiles succeeded, 
+                      console.warn('App user update failed, but vehicle owner profile saved:', appUserError);
+                      // We might choose not to throw here if vehicle_owner_profiles succeeded, 
                       // but it's better to be consistent.
                     }
 
                     alert('Profile updated successfully!');
                     setShowEditProfile(false);
                     setProfileImageFile(null);
+                    setIdDocumentFile(null);
+                    setProfileImagePreview(profileImageUrl || null);
+                    setIdDocumentPreview(idDocumentUrl || null);
+                    await refreshOwnerRequirements(user, email);
                     // Update profile data with the new image URL
                     setProfileData(prev => ({
                       ...prev,
-                      profile_image_url: profileImageUrl
+                      profile_image_url: profileImageUrl,
+                      id_document_url: idDocumentUrl
                     }));
                   } catch (error: any) {
                     console.error('Failed to save profile:', error);
@@ -4120,3 +6032,4 @@ export default function OwnerDashboard({ onBack }: OwnerDashboardProps) {
     </div>
   );
 }
+

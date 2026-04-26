@@ -1,12 +1,12 @@
--- Test script to check if properties table exists and has data
+﻿-- Test script to check if Vehicles table exists and has data
 -- Run this in your Supabase SQL editor to diagnose the issue
 
--- 1. Check if the properties table exists
+-- 1. Check if the Vehicles table exists
 SELECT 
   table_name, 
   table_schema 
 FROM information_schema.tables 
-WHERE table_name = 'properties';
+WHERE table_name = 'Vehicles';
 
 -- 2. Check table structure
 SELECT 
@@ -15,13 +15,13 @@ SELECT
   is_nullable, 
   column_default
 FROM information_schema.columns 
-WHERE table_name = 'properties' 
+WHERE table_name = 'Vehicles' 
 ORDER BY ordinal_position;
 
--- 3. Check if there are any properties
-SELECT COUNT(*) as total_properties FROM properties;
+-- 3. Check if there are any Vehicles
+SELECT COUNT(*) as total_Vehicles FROM Vehicles;
 
--- 4. Check properties with their status
+-- 4. Check Vehicles with their status
 SELECT 
   id, 
   title, 
@@ -29,17 +29,17 @@ SELECT
   price, 
   location,
   created_at
-FROM properties 
+FROM Vehicles 
 ORDER BY created_at DESC;
 
--- 5. Check only available properties
+-- 5. Check only available Vehicles
 SELECT 
   id, 
   title, 
   status, 
   price, 
   location
-FROM properties 
+FROM Vehicles 
 WHERE status = 'available'
 ORDER BY created_at DESC;
 
@@ -54,10 +54,10 @@ SELECT
   qual,
   with_check
 FROM pg_policies 
-WHERE tablename = 'properties';
+WHERE tablename = 'Vehicles';
 
--- 7. Test basic insert (if you want to add a test property)
--- INSERT INTO properties (
+-- 7. Test basic insert (if you want to add a test vehicle)
+-- INSERT INTO Vehicles (
 --   title, 
 --   description, 
 --   price, 
@@ -69,8 +69,8 @@ WHERE tablename = 'properties';
 --   status, 
 --   owner_email
 -- ) VALUES (
---   'Test Property',
---   'This is a test property to verify the table is working',
+--   'Test vehicle',
+--   'This is a test vehicle to verify the table is working',
 --   10000,
 --   'Test Location',
 --   ARRAY['WiFi', 'Parking'],
@@ -80,4 +80,5 @@ WHERE tablename = 'properties';
 --   'available',
 --   'test@example.com'
 -- );
+
 

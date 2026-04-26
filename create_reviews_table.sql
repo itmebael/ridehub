@@ -1,4 +1,4 @@
--- Create the missing reviews table
+﻿-- Create the missing reviews table
 -- Run this in your Supabase SQL Editor
 
 -- First, check if the table already exists
@@ -10,7 +10,7 @@ AND table_name = 'reviews';
 -- Create the reviews table if it doesn't exist
 CREATE TABLE IF NOT EXISTS public.reviews (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    property_id UUID REFERENCES properties(id) ON DELETE CASCADE,
+    vehicle_id UUID REFERENCES Vehicles(id) ON DELETE CASCADE,
     client_email VARCHAR(255) NOT NULL,
     client_name VARCHAR(255) NOT NULL,
     rating INTEGER CHECK (rating >= 1 AND rating <= 5) NOT NULL,
@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS public.reviews (
 );
 
 -- Create indexes for better performance
-CREATE INDEX IF NOT EXISTS idx_reviews_property_id ON reviews(property_id);
+CREATE INDEX IF NOT EXISTS idx_reviews_vehicle_id ON reviews(vehicle_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_rating ON reviews(rating);
 CREATE INDEX IF NOT EXISTS idx_reviews_created_at ON reviews(created_at);
 
@@ -33,13 +33,13 @@ ALTER TABLE reviews ENABLE ROW LEVEL SECURITY;
 CREATE POLICY "Reviews are viewable by everyone" ON reviews
     FOR SELECT USING (is_verified = true);
 
--- Property owners can see all reviews for their properties
-CREATE POLICY "Property owners can see all reviews" ON reviews
+-- vehicle owners can see all reviews for their Vehicles
+CREATE POLICY "vehicle owners can see all reviews" ON reviews
     FOR SELECT USING (
         EXISTS (
-            SELECT 1 FROM properties 
-            WHERE properties.id = reviews.property_id 
-            AND properties.owner_email = auth.jwt() ->> 'email'
+            SELECT 1 FROM Vehicles 
+            WHERE Vehicles.id = reviews.vehicle_id 
+            AND Vehicles.owner_email = auth.jwt() ->> 'email'
         )
     );
 
@@ -69,35 +69,35 @@ CREATE TRIGGER update_reviews_updated_at
     FOR EACH ROW
     EXECUTE FUNCTION update_reviews_updated_at();
 
--- Create function to update property rating when reviews change
-CREATE OR REPLACE FUNCTION update_property_rating_from_reviews()
+-- Create function to update vehicle rating when reviews change
+CREATE OR REPLACE FUNCTION update_vehicle_rating_from_reviews()
 RETURNS TRIGGER AS $$
 BEGIN
-    -- Update the property's rating and total_reviews
-    UPDATE properties SET
+    -- Update the vehicle's rating and total_reviews
+    UPDATE Vehicles SET
         rating = (
             SELECT ROUND(AVG(rating::numeric), 2)
             FROM reviews 
-            WHERE property_id = COALESCE(NEW.property_id, OLD.property_id)
+            WHERE vehicle_id = COALESCE(NEW.vehicle_id, OLD.vehicle_id)
             AND is_verified = true
         ),
         total_reviews = (
             SELECT COUNT(*)
             FROM reviews 
-            WHERE property_id = COALESCE(NEW.property_id, OLD.property_id)
+            WHERE vehicle_id = COALESCE(NEW.vehicle_id, OLD.vehicle_id)
             AND is_verified = true
         )
-    WHERE id = COALESCE(NEW.property_id, OLD.property_id);
+    WHERE id = COALESCE(NEW.vehicle_id, OLD.vehicle_id);
     
     RETURN COALESCE(NEW, OLD);
 END;
 $$ LANGUAGE plpgsql;
 
--- Create trigger to automatically update property ratings
-CREATE TRIGGER trigger_update_property_rating_from_reviews
+-- Create trigger to automatically update vehicle ratings
+CREATE TRIGGER trigger_update_vehicle_rating_from_reviews
     AFTER INSERT OR UPDATE OR DELETE ON reviews
     FOR EACH ROW
-    EXECUTE FUNCTION update_property_rating_from_reviews();
+    EXECUTE FUNCTION update_vehicle_rating_from_reviews();
 
 -- Verify the table was created
 SELECT 
@@ -111,13 +111,14 @@ AND table_schema = 'public'
 ORDER BY ordinal_position;
 
 -- Test insert a sample review (optional)
--- INSERT INTO reviews (property_id, client_email, client_name, rating, review_text, is_verified)
+-- INSERT INTO reviews (vehicle_id, client_email, client_name, rating, review_text, is_verified)
 -- VALUES (
---     (SELECT id FROM properties LIMIT 1),
+--     (SELECT id FROM Vehicles LIMIT 1),
 --     'test@example.com',
 --     'Test User',
 --     5,
 --     'This is a test review',
 --     true
 -- );
+
 

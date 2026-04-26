@@ -33,11 +33,11 @@ export default function CreateAccountScreen({
   const [emailSent, setEmailSent] = useState(false);
   const [pendingUser, setPendingUser] = useState<any>(null);
   
-  // ID upload states (only for tenants)
+  // ID upload states (only for renters)
   const [idFile, setIdFile] = useState<File | null>(null);
   const [idPreview, setIdPreview] = useState<string | null>(null);
   
-  // Profile image upload states (only for tenants)
+  // Profile image upload states (only for renters)
   const [profileFile, setProfileFile] = useState<File | null>(null);
   const [profilePreview, setProfilePreview] = useState<string | null>(null);
 
@@ -54,7 +54,7 @@ export default function CreateAccountScreen({
     // Determine role: default to client unless explicitly owner; admin not allowed here
     const role: 'client' | 'owner' = userType === 'owner' ? 'owner' : 'client';
     
-    // Validate ID for tenants
+    // Validate ID for renters
     if (role === 'client') {
       if (!idFile) {
         setError('Please upload a valid ID document.');
@@ -255,7 +255,7 @@ export default function CreateAccountScreen({
           console.log('✅ Session exists after verification');
         }
 
-        // Upload ID and Profile for tenants
+        // Upload ID and Profile for renters
         let idUrl: string | null = null;
         let profileUrl: string | null = null;
         
@@ -301,7 +301,7 @@ export default function CreateAccountScreen({
           throw insertError;
         }
 
-        // Create user_profile entry with ID, phone, and profile image for tenants
+        // Create user_profile entry with ID, phone, and profile image for renters
         if (pendingUser.role === 'client' && idUrl) {
           console.log('Creating user_profile with ID document, phone, and profile image...');
           const profileData: any = {
@@ -513,7 +513,10 @@ export default function CreateAccountScreen({
   };
 
   return (
-    <div className="glass-strong rounded-3xl p-8 text-center relative overflow-hidden">
+    <div className="min-h-screen p-8">
+      {/* Background overlay */}
+      <div className="absolute inset-0 bg-black/20"></div>
+      
       {/* Glassmorphism shine effect */}
       <div className="absolute inset-0 bg-gradient-to-br from-primary-50/50 via-primary-100/50 to-primary-200/50 pointer-events-none"></div>
       <div className="absolute inset-0 bg-gradient-to-t from-transparent via-white/25 to-white/35 pointer-events-none"></div>
@@ -521,22 +524,27 @@ export default function CreateAccountScreen({
       {/* Back Button */}
       <button
         onClick={onBack}
-        className="absolute top-4 left-4 text-gray-700 hover:text-gray-900 z-10"
+        className="absolute top-4 left-4 text-white/80 hover:text-white glass-button rounded-full w-10 h-10 flex items-center justify-center z-10"
       >
         ←
       </button>
       
-      {/* Illustration */}
-      <div className="mb-8 flex justify-center relative z-10">
-        <div className="glass rounded-2xl flex items-center justify-center overflow-hidden shadow-2xl p-4">
-          <img src="/door.png" alt="Door" className="max-w-full max-h-32 object-contain" />
+      {/* Logo and City Seal */}
+      <div className="mb-6 flex justify-center items-center space-x-4 relative z-10">
+        <div className="glass rounded-2xl flex items-center justify-center overflow-hidden shadow-2xl p-2">
+          <img src="/logo.png" alt="RIDEHUB Logo" className="max-w-full max-h-12 object-contain" />
+        </div>
+        <div className="glass rounded-2xl flex items-center justify-center overflow-hidden shadow-2xl p-2">
+          <img src="/Catbalogan_City_Seal.png" alt="Catbalogan City Seal" className="max-w-full max-h-12 object-contain" />
         </div>
       </div>
       
       {/* Title */}
-      <h1 className="text-4xl font-bold text-gray-900 mb-8 relative z-10 drop-shadow-lg">
-        Create Account
-      </h1>
+      <div className="bg-white/90 backdrop-blur-sm rounded-2xl p-4 mb-8 relative z-10 shadow-lg">
+        <h1 className="text-4xl font-bold text-gray-900 text-center">
+          Create Account
+        </h1>
+      </div>
       
       {error && (
         <div className="mb-4 text-sm text-red-800 glass-card rounded-lg px-3 py-2 border-red-300/50 relative z-10">{error}</div>
@@ -631,7 +639,7 @@ export default function CreateAccountScreen({
           </button>
         </div>
         
-        {/* Phone Number and Profile - Only for Tenants */}
+        {/* Phone Number and Profile - Only for Renters */}
         {userType === 'client' && !emailSent && (
           <>
             <div className="border-t border-gray-200 pt-6 mt-6">
@@ -829,4 +837,3 @@ export default function CreateAccountScreen({
     </div>
   );
 }
-

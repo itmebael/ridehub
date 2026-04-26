@@ -1,5 +1,14 @@
 import React, { useState } from 'react';
 import { supabase } from '../lib/supabase';
+import {
+  DEFAULT_EMAIL_COOLDOWN_SECONDS,
+  formatCooldownDuration,
+  getEmailCooldownMessage,
+  getEmailCooldownRemaining,
+  isEmailRateLimitMessage,
+  parseEmailCooldownSeconds,
+  setEmailCooldown,
+} from '../lib/emailCooldown';
 
 interface ResetPasswordScreenProps {
   userType: 'client' | 'owner' | 'admin' | null;
@@ -16,20 +25,61 @@ export default function ResetPasswordScreen({ userType, onBack, onSuccess }: Res
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
   const [step, setStep] = useState<'email' | 'token' | 'password'>('email');
+  const [resetCooldown, setResetCooldown] = useState(0);
+
+  React.useEffect(() => {
+    const updateCooldown = () => {
+      setResetCooldown(getEmailCooldownRemaining('password-reset', email));
+    };
+
+    updateCooldown();
+
+    if (!email.trim()) {
+      return;
+    }
+
+    const intervalId = window.setInterval(updateCooldown, 1000);
+    return () => window.clearInterval(intervalId);
+  }, [email]);
 
   const handleSendToken = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    setInfo(null);
     setSubmitting(true);
 
     try {
+      const remainingResetCooldown = getEmailCooldownRemaining('password-reset', email);
+
+      if (remainingResetCooldown > 0) {
+        throw new Error(getEmailCooldownMessage(remainingResetCooldown, 'reset email'));
+      }
+
       const { error: resetError } = await supabase.auth.resetPasswordForEmail(email, {
         redirectTo: `${window.location.origin}/?type=recovery`,
       });
 
-      if (resetError) throw resetError;
+      if (resetError) {
+        if (isEmailRateLimitMessage(resetError.message)) {
+          const cooldownSeconds = parseEmailCooldownSeconds(
+            resetError.message,
+            DEFAULT_EMAIL_COOLDOWN_SECONDS
+          );
+          setEmailCooldown('password-reset', email, cooldownSeconds);
+          setResetCooldown(cooldownSeconds);
+          throw new Error(getEmailCooldownMessage(cooldownSeconds, 'reset email'));
+        }
 
+        throw resetError;
+      }
+
+      setEmailCooldown('password-reset', email, DEFAULT_EMAIL_COOLDOWN_SECONDS);
+      setResetCooldown(DEFAULT_EMAIL_COOLDOWN_SECONDS);
+      setInfo(
+        `Reset email sent to ${email}. Check your inbox for the token or link. You can request another reset email again in ${formatCooldownDuration(DEFAULT_EMAIL_COOLDOWN_SECONDS)}.`
+      );
       setStep('token');
     } catch (err: any) {
       setError(err.message || 'Failed to send reset email.');
@@ -177,26 +227,34 @@ export default function ResetPasswordScreen({ userType, onBack, onSuccess }: Res
   // Step 1: Enter Email
   if (step === 'email') {
     return (
-      <div className="bg-white rounded-3xl shadow-xl p-8 text-center relative">
+      <div className="min-h-screen p-8">
+        {/* Background overlay */}
+        <div className="absolute inset-0 bg-black/50"></div>
+        
+        {/* Glassmorphism shine effect */}
+        <div className="absolute inset-0 bg-gradient-to-br from-primary-50/50 via-primary-100/50 to-primary-200/50 pointer-events-none"></div>
+        <div className="absolute inset-0 bg-gradient-to-t from-transparent via-white/25 to-white/35 pointer-events-none"></div>
+        
         {/* Back Button */}
         <button
           onClick={onBack}
-          className="absolute top-4 left-4 text-gray-500 hover:text-gray-700"
+          className="absolute top-4 left-4 text-white/80 hover:text-white glass-button rounded-full w-10 h-10 flex items-center justify-center z-10"
         >
           ←
         </button>
 
-        {/* Illustration */}
-        <div className="mb-8 flex justify-center">
-          <div className="w-32 h-32 bg-blue-100 rounded-2xl flex items-center justify-center overflow-hidden">
-            <svg className="w-16 h-16 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 8l7.89 4.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
-            </svg>
+        {/* Logo and City Seal */}
+        <div className="mb-6 flex justify-center items-center space-x-4 relative z-10">
+          <div className="glass rounded-2xl flex items-center justify-center overflow-hidden shadow-2xl p-2">
+            <img src="/logo.png" alt="RIDEHUB Logo" className="max-w-full max-h-12 object-contain" />
+          </div>
+          <div className="glass rounded-2xl flex items-center justify-center overflow-hidden shadow-2xl p-2">
+            <img src="/Catbalogan_City_Seal.png" alt="Catbalogan City Seal" className="max-w-full max-h-12 object-contain" />
           </div>
         </div>
 
         {/* Title */}
-        <h1 className="text-4xl font-bold text-gray-800 mb-4">
+        <h1 className="text-4xl font-bold text-white mb-4 relative z-10 drop-shadow-lg">
           Reset Password
         </h1>
 
@@ -207,6 +265,9 @@ export default function ResetPasswordScreen({ userType, onBack, onSuccess }: Res
 
         {error && (
           <div className="mb-4 text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2">{error}</div>
+        )}
+        {info && (
+          <div className="mb-4 text-sm text-blue-700 bg-blue-50 border border-blue-200 rounded-lg px-3 py-2">{info}</div>
         )}
 
         {/* Email Form */}
@@ -224,11 +285,20 @@ export default function ResetPasswordScreen({ userType, onBack, onSuccess }: Res
 
           <button
             type="submit"
-            disabled={submitting}
+            disabled={submitting || resetCooldown > 0}
             className="w-full bg-blue-600 text-white text-lg font-semibold py-3 px-6 rounded-xl hover:bg-blue-700 transition-colors duration-200 focus:outline-none focus:ring-4 focus:ring-blue-300 disabled:opacity-60"
           >
-            {submitting ? 'Sending...' : 'Send Token'}
+            {submitting
+              ? 'Sending...'
+              : resetCooldown > 0
+                ? `Wait ${formatCooldownDuration(resetCooldown)} to Send Token`
+                : 'Send Token'}
           </button>
+          {resetCooldown > 0 && (
+            <p className="text-center text-xs text-gray-500">
+              You can request another reset email in {formatCooldownDuration(resetCooldown)}.
+            </p>
+          )}
         </form>
 
         {/* Back to Login */}
@@ -277,6 +347,9 @@ export default function ResetPasswordScreen({ userType, onBack, onSuccess }: Res
 
         {error && (
           <div className="mb-4 text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2">{error}</div>
+        )}
+        {info && (
+          <div className="mb-4 text-sm text-blue-700 bg-blue-50 border border-blue-200 rounded-lg px-3 py-2">{info}</div>
         )}
 
         {/* Token Form */}

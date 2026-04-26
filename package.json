@@ -1,13 +1,14 @@
 {
-  "name": "boardinghub",
+  "name": "secure-mobility",
   "version": "1.0.0",
-  "description": "A modern boarding house discovery application",
+  "description": "A Web-Based Car and Motorcycle Rental Platform for Catbalogan, Samar featuring Real-Time GPS Tracking and User Authentication",
   "main": "index.js",
   "engines": {
-    "node": "18.x",
+    "node": "24.x",
     "npm": ">=8.0.0"
   },
   "scripts": {
+    "dev": "react-scripts start",
     "start": "react-scripts start",
     "build": "react-scripts build",
     "test": "react-scripts test",
